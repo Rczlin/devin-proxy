@@ -1,15 +1,10 @@
 services:
   devin-proxy:
     image: ghcr.io/rczlin/devin-proxy:latest
-    build: .                      # or build locally if the image isn't published yet
     container_name: devin-proxy
+    env_file: .env
     ports:
       - "127.0.0.1:8317:8317"     # drop 127.0.0.1 to expose on LAN — set DEVIN_PROXY_KEY first
-    environment:
-      DEVIN_SESSION_TOKEN: ${DEVIN_SESSION_TOKEN}   # required: your Devin session token
-      DEVIN_PROXY_DB: /data/devin-proxy.db
-      # DEVIN_PROXY_KEY: change-me  # master key: locks /v1 AND the admin console
-      # DEVIN_PROXY_MAX_ROWS: "50000"
     volumes:
       - devin-proxy-data:/data    # persists request log + API keys
     restart: unless-stopped
