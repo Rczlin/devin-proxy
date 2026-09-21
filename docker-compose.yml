@@ -1,7 +1,6 @@
 services:
   devin-proxy:
-    # after the GitHub Action publishes, replace OWNER with your GitHub user/org:
-    image: ghcr.io/OWNER/devin-proxy:latest
+    image: ghcr.io/rczlin/devin-proxy:latest
     build: .                      # or build locally if the image isn't published yet
     container_name: devin-proxy
     ports:
