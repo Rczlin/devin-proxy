@@ -1,0 +1,13 @@
+.git
+.github
+__pycache__
+*.pyc
+*.log
+*.err
+proxy.db
+*.db
+.venv
+venv
+.env
+Dockerfile
+docker-compose.yml
