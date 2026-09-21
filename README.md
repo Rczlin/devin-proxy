@@ -44,6 +44,33 @@ python -m devin_proxy --api-key my-secret
 
 `--api-key` also locks the admin console (enter the key to log in).
 
+## Docker / GHCR
+
+`.github/workflows/docker.yml` builds and pushes
+`ghcr.io/<owner>/devin-proxy` on every push to the default branch
+(`latest` tag, `v*` tags, and commit sha) — no secrets to configure,
+it uses `GITHUB_TOKEN` with `packages: write`. Multi-arch
+(amd64 + arm64).
+
+```bash
+# push this repo to GitHub, the Action publishes the image automatically
+git remote add origin git@github.com:<you>/devin-proxy.git
+git push -u origin main
+```
+
+Production deploy — compose only, no local build:
+
+```bash
+cp .env.example .env   # fill in DEVIN_SESSION_TOKEN (+ DEVIN_PROXY_KEY)
+docker compose up -d
+```
+
+`docker-compose.yml` pulls `ghcr.io/rczlin/devin-proxy:latest` (built by
+the Action), loads `.env` via `env_file`, and mounts `/data` so the
+request log + API keys survive restarts. Get `DEVIN_SESSION_TOKEN` from
+`%APPDATA%\devin\credentials.toml` (`windsurf_api_key`) on a machine
+where the Devin CLI is signed in.
+
 ## Admin console
 
 Open `http://127.0.0.1:8317/admin` — a persistent dashboard backed by
