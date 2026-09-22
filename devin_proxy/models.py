@@ -433,6 +433,14 @@ def apply_effort(uid, effort):
     return cand if (not known or cand in known) else uid
 
 
+def max_output_for(uid):
+    """Catalog max_output for a resolved uid, or None when unknown."""
+    for e in entries(include_hidden=True):
+        if e["uid"] == uid:
+            return e.get("max_output")
+    return None
+
+
 def grouped(include_hidden=False):
     """entries() grouped by family -> [{prefix,label,vendor,desc,models}].
 

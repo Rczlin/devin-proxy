@@ -389,14 +389,49 @@ def create_app(api_key=None):
                         "name": (tc.get("function") or {}).get("name", ""),
                         "arguments": (tc.get("function") or {}).get("arguments", "")}
                        for tc in m.get("tool_calls") or []]
+                # reasoning_content is not forwarded: without the thinking
+                # signature upstream providers reject replayed thinking.
                 prompts.append(upstream.make_prompt(
-                    "assistant", text, tool_calls=tcs,
-                    thinking=m.get("reasoning_content")))
+                    "assistant", text, tool_calls=tcs))
             elif role == "tool":
                 text, _ = msg_parts(m.get("content"))
                 prompts.append(upstream.make_prompt(
                     "tool", text, tool_call_id=m.get("tool_call_id", "")))
-        return "\n\n".join(system) or None, prompts
+        # Codex-style inputs arrive as runs of same-role items (e.g. several
+        # consecutive user messages); model providers reject non-alternating
+        # roles, so coalesce adjacent user/assistant prompts. Tool results
+        # keep their own prompt — each carries a distinct tool_call_id.
+        merged = []
+        for p in prompts:
+            last = merged[-1] if merged else None
+            if (last is not None and p.source == last.source
+                    and p.source in (upstream.SOURCE["user"],
+                                     upstream.SOURCE["assistant"])):
+                if p.prompt:
+                    last.prompt = (last.prompt + "\n\n" + p.prompt
+                                   if last.prompt else p.prompt)
+                last.num_tokens = max(1, len(last.prompt) // 4)
+                last.images.extend(p.images)
+                last.tool_calls.extend(p.tool_calls)
+                if p.thinking:
+                    last.thinking = (last.thinking + "\n" + p.thinking
+                                     if last.thinking else p.thinking)
+            else:
+                merged.append(p)
+        prompts = [p for p in merged
+                   if p.prompt or len(p.images) or len(p.tool_calls)
+                   or p.thinking or p.tool_call_id]
+        # drop tool results whose call was dropped/unmapped — a tool_result
+        # without a matching tool_use is a provider-side 400.
+        seen, out = set(), []
+        for p in prompts:
+            if p.source == upstream.SOURCE["assistant"]:
+                seen.update(tc.id for tc in p.tool_calls)
+            elif p.source == upstream.SOURCE["tool"] and p.tool_call_id \
+                    and p.tool_call_id not in seen:
+                continue
+            out.append(p)
+        return "\n\n".join(system) or None, out
 
     def map_tools(tools):
         return [{"name": (t.get("function") or {}).get("name", ""),
@@ -422,10 +457,14 @@ def create_app(api_key=None):
             tools = []
         jwt = upstream.get_user_jwt(app.state.http, acct.api_server_url,
                                     acct.token)
+        max_tokens = (body.get("max_tokens") or body.get("max_output_tokens")
+                      or body.get("max_completion_tokens"))
+        cap = models_mod.max_output_for(model)
+        if cap:
+            max_tokens = min(max_tokens or cap, cap)
         return upstream.build_request(
             acct.token, jwt, model, system, prompts, tools,
-            max_tokens=body.get("max_tokens") or body.get("max_output_tokens")
-            or body.get("max_completion_tokens"),
+            max_tokens=max_tokens,
             temperature=body.get("temperature"), top_p=body.get("top_p"))
 
     def iter_chat(body, session_key=None, force_account=None, stream=True,
