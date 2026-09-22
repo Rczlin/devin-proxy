@@ -156,15 +156,17 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   context-window / vision / thinking / credit / pricing badges and shows
   how many accounts advertise each model. Scheduling uses this too: a
   request only goes to accounts that actually advertised the model.
-  Settings: default model, default effort (auto-applied to
-  family/alias requests that don't pin a variant), per-family default
-  variants (click a variant chip to make it the family's default,
-  ✕ hides it — hidden variants are skipped by `/v1/models`, family
-  defaults and effort remapping but explicit uid requests still pass
-  through), custom aliases (`alias=uid`, optionally `alias=uid@effort`
-  for a per-alias default effort; ✕ deletes user aliases and hides
-  builtin/remote ones — both restorable), and an extra JSON catalog
-  URL (`DEVIN_PROXY_MODELS_URL`) merged into the list
+  Settings: default model, global default effort (auto-applied to
+  family/alias requests that don't pin a variant), a per-family
+  默认思考 dropdown on each family card (requests without an effort
+  are rewritten to that variant — or click a variant chip to the same
+  effect; ✕ hides a variant — hidden variants are skipped by
+  `/v1/models`, family defaults and effort remapping but explicit uid
+  requests still pass through), custom aliases (`alias=uid`,
+  optionally `alias=uid@effort` for a per-alias default effort;
+  ✕ deletes user aliases and hides builtin/remote ones — both
+  restorable), and an extra JSON catalog URL
+  (`DEVIN_PROXY_MODELS_URL`) merged into the list
 - **Playground** — test any model streaming or not, straight from the UI;
   optionally pin to a specific account
 - **API Keys** — mint `sk-dp-…` keys for callers (SHA-256 hashed in the
@@ -207,7 +209,8 @@ name resolves to the family's default variant; `reasoning.effort` /
 `reasoning_effort` (`minimal|none|low|medium|high|xhigh|max`) then
 auto-applies the matching variant by remapping the uid's effort suffix.
 When a request doesn't specify an effort, the per-alias `@effort`
-setting wins, else the admin's default effort — names that already pin
+setting wins, then the family's configured 默认思考, else the admin's
+global default effort — names that already pin
 a variant (`…-high`, or an alias whose target does) are left alone.
 Unknown names pass through to upstream as-is.
 

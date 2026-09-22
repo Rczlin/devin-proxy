@@ -234,6 +234,7 @@ one = next(m for m in d["data"] if m["id"] == "claude-sonnet-5")
 assert one["owned_by"] == "Anthropic" and one["capabilities"]["thinking"]
 assert one["context_window"] == 400000 and one["source"] == "remote"
 assert "medium" in one["efforts"] and "high" in one["efforts"]
+assert one["default_effort"] == "medium"
 al = next(m for m in d["data"] if m["id"] == "sonnet")
 assert al["alias_of"] == "claude-sonnet-5-medium"
 print("/v1/models OK:", len(d["data"]), "entries")
@@ -265,9 +266,21 @@ r = tc.patch("/admin/api/models/settings", headers=H,
              json={"family_efforts": {"swe-2": "high"}}).json()
 assert r["family_efforts"] == {"swe-2": "high"}
 assert M.auto_effort("swe-2") == "high"
+fams = {f["prefix"]: f for f in M.grouped()}
+assert fams["swe-2"]["default"] == "high"               # family override
+assert fams["swe-2"]["default_override"] == "high"
+assert fams["claude-sonnet-5"]["default"] == "medium"   # builtin pref
+assert fams["claude-sonnet-5"]["default_override"] is None
 r = tc.patch("/admin/api/models/settings", headers=H,
              json={"family_efforts": {"swe-2": ""}}).json()
 assert r["family_efforts"] == {}
+# global default folds into the family's effective default when the
+# variant exists; families without it fall back to builtin pref
+store.meta_set("default_effort", "high")
+fams = {f["prefix"]: f for f in M.grouped()}
+assert fams["claude-sonnet-5"]["default"] == "high"
+assert fams["kimi-k3"]["default"] == "medium"
+store.meta_set("default_effort", "")
 r = tc.patch("/admin/api/models/settings", headers=H,
              json={"family_efforts": {"swe-2": "bogus"}})
 assert r.status_code == 400
