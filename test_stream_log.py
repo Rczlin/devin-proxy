@@ -219,4 +219,37 @@ assert ov["cached_tokens"] >= 3108 and ov["cache_hit_pct"] > 0, ov
 print("7. cache+tps persist   OK  cached=%d tps=%s hit=%s%%"
       % (row["cached_tokens"], row["tps"], ov["cache_hit_pct"]))
 
+# --- 8. upstream read must be incremental ----------------------------------
+# Regression: resp.iter_bytes(65536) made httpx repackage the body into 64KB
+# pieces, so every upstream frame sat in an internal buffer until the stream
+# ended — downstream "streaming" collapsed into one dump. The mock body feeds
+# one frame per network chunk; the first upstream message must surface after
+# consuming exactly one chunk, not the whole body.
+fed = {"n": 0}
+def trickle(req):
+    if req.url.path.endswith("GetUserJwt"):
+        return httpx.Response(
+            200, content=proto.GetUserJwtResponse(jwt="x.y.z").SerializeToString())
+    def body():
+        for i in range(5):
+            fed["n"] += 1
+            yield frame(msg(delta_text=f"part{i}"))
+        yield trailer()
+    return httpx.Response(200, content=body(),
+                          headers={"Content-Type": "application/connect+proto"})
+app.state.http = httpx.Client(transport=httpx.MockTransport(trickle))
+acct = app.state.pool.accounts()[0]
+ureq = upstream.build_request(acct.token, "jwt", "claude-sonnet-5-medium",
+                              None, [upstream.make_prompt("user", "hi")])
+gen = upstream.stream_chat(app.state.http, acct.api_server_url,
+                           acct.token, ureq)
+first = next(gen)
+assert first.delta_text == "part0", first
+assert fed["n"] == 1, \
+    f"first frame required {fed['n']} body chunks — upstream reads buffered"
+rest = [e.delta_text for e in gen if not isinstance(e, dict)]
+assert fed["n"] == 5 and rest == ["part1", "part2", "part3", "part4"], \
+    (fed, rest)
+print("8. incremental read    OK  first frame after 1 network chunk")
+
 print("\nAll tests passed.")

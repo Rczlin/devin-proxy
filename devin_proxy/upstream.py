@@ -297,7 +297,11 @@ def stream_chat(client, base_url, api_key, request, timeout=None):
             yield {"kind": "http_error", "http_error": resp.status_code,
                    "message": body.decode("utf-8", "replace")[:2000]}
             return
-        for chunk in resp.iter_bytes(65536):
+        # iter_bytes(n) asks httpx to repackage the body into n-byte pieces —
+        # it buffers internally until n bytes accumulate, so upstream frames
+        # would only surface in rare 64KB bursts (or all at once at stream
+        # end). No arg = each network read is yielded as it arrives.
+        for chunk in resp.iter_bytes():
             pending += chunk
             while len(pending) >= 5:
                 flags = pending[0]
