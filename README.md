@@ -45,8 +45,8 @@ from the admin console (**账号池** page):
 - **OAuth login** — "生成登录链接" starts the same PKCE flow as
   `devin auth login --force-manual-token-flow`: open the link, sign in at
   app.devin.ai, paste the shown code back — the proxy exchanges it for a
-  session token (`ExchangePKCEAuthorizationCode`, with `/auth/cli/token`
-  fallback) and fetches the account identity/plan. Works headless/SSH.
+  session token (`/auth/cli/token`, with `ExchangePKCEAuthorizationCode`
+  as fallback) and fetches the account identity/plan. Works headless/SSH.
 - **手动添加** — paste a `devin-session-token$…` / api key directly.
 - **从本机导入** — scans env vars, token files, Devin CLI
   `credentials.toml` and Devin Desktop state DBs; imports every distinct
