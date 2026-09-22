@@ -129,6 +129,7 @@ def make_router(app):
                 "user_aliases": models_mod.user_aliases(),
                 "default_model": models_mod.default_uid(),
                 "default_effort": models_mod.default_effort(),
+                "family_efforts": models_mod.family_efforts(),
                 "sync": models_mod.sync_info(),
                 "stats": store.list_models()}
 
@@ -142,6 +143,7 @@ def make_router(app):
         default_effort: Optional[str] = None
         models_url: Optional[str] = None
         aliases: Optional[str] = None     # "alias=uid[@effort]" per line, or JSON
+        family_efforts: Optional[dict] = None   # {family: effort|""} merged
 
     @router.patch("/api/models/settings", dependencies=[Depends(admin_key)])
     def models_settings(body: ModelSettings):
@@ -183,8 +185,22 @@ def make_router(app):
                 if "@" in v and eff not in models_mod.EFFORT_SUFFIX:
                     raise HTTPException(400, f"{k}: unknown effort @{eff}")
             store.meta_set("model_aliases", json.dumps(parsed))
+        if body.family_efforts is not None:
+            cur = models_mod.family_efforts()
+            for k, v in body.family_efforts.items():
+                fam, e = str(k).strip(), str(v).strip().lower()
+                if not fam:
+                    continue
+                if not e:
+                    cur.pop(fam.replace(".", "-"), None)
+                elif e in models_mod.EFFORT_SUFFIX:
+                    cur[fam.replace(".", "-")] = e
+                else:
+                    raise HTTPException(400, f"{fam}: unknown effort")
+            store.meta_set("family_efforts", json.dumps(cur))
         return {"ok": True, "default_model": models_mod.default_uid(),
                 "default_effort": models_mod.default_effort(),
+                "family_efforts": models_mod.family_efforts(),
                 "aliases": models_mod.aliases(),
                 "models_url": models_mod.models_url()}
 
