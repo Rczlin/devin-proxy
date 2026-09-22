@@ -28,6 +28,7 @@ COOLDOWN_MAX = 900
 SESSION_TTL = 86400       # pinned sessions pruned after this much idle time
 RESPONSE_TTL = 86400
 MAX_ATTEMPTS = 4          # accounts tried per request (bounded by pool size)
+PIN_FLUSH_S = 30          # dirty pin `updated` stamps batch-flushed this often
 
 
 class Account:
@@ -132,9 +133,14 @@ class Pool:
     def __init__(self):
         self._lock = threading.Lock()
         self._accs = {}
+        self._pins = {}          # session_key -> [account_id, updated]
+        self._pins_dirty = set() # keys whose `updated` needs flushing to db
         self.reload()
         store.prune_pins(SESSION_TTL)
         store.prune_responses(RESPONSE_TTL)
+        for r in store.list_pins():
+            self._pins[r["session_key"]] = [r["account_id"], r["updated"] or 0]
+        threading.Thread(target=self._pin_flush_loop, daemon=True).start()
 
     def reload(self):
         with self._lock:
@@ -194,6 +200,9 @@ class Pool:
         store.delete_account(aid)
         with self._lock:
             self._accs.pop(aid, None)
+            for k in [k for k, v in self._pins.items() if v[0] == aid]:
+                self._pins.pop(k, None)
+                self._pins_dirty.discard(k)
 
     def update(self, aid, **fields):
         store.update_account(aid, **fields)
@@ -217,10 +226,12 @@ class Pool:
             if not avail:
                 return None
             if session_key:
-                a = self._accs.get(store.get_pin(session_key))
+                ent = self._pins.get(session_key)
+                a = self._accs.get(ent[0]) if ent else None
                 if a in avail and a.cooldown_until <= now:
                     a.in_flight += 1
-                    store.touch_pin(session_key)
+                    ent[1] = now
+                    self._pins_dirty.add(session_key)
                     return a
             ready = [a for a in avail if a.cooldown_until <= now]
             cands = ready or avail          # all cooling -> least-bad anyway
@@ -259,14 +270,57 @@ class Pool:
         acct.persist()
 
     def pin(self, session_key, acct):
-        if session_key and acct:
-            store.set_pin(session_key, acct.id)
+        if not (session_key and acct):
+            return
+        now = time.time()
+        with self._lock:
+            ent = self._pins.get(session_key)
+            if ent and ent[0] == acct.id:
+                ent[1] = now
+                self._pins_dirty.add(session_key)
+                return
+            self._pins[session_key] = [acct.id, now]
+            self._pins_dirty.discard(session_key)
+        store.set_pin(session_key, acct.id)
 
     def sessions(self):
-        return store.list_pins()
+        with self._lock:
+            rows = []
+            for k, (aid, ts) in self._pins.items():
+                a = self._accs.get(aid)
+                rows.append({"session_key": k, "account_id": aid,
+                             "updated": ts,
+                             "aname": a.name if a else None,
+                             "email": a.email if a else None})
+            rows.sort(key=lambda r: r["updated"] or 0, reverse=True)
+            return rows
 
     def unpin(self, session_key):
+        with self._lock:
+            self._pins.pop(session_key, None)
+            self._pins_dirty.discard(session_key)
         store.unpin(session_key)
+
+    def _pin_flush_loop(self):
+        while True:
+            time.sleep(PIN_FLUSH_S)
+            try:
+                self._flush_pins()
+            except Exception:
+                pass
+
+    def _flush_pins(self):
+        now = time.time()
+        with self._lock:
+            for k in [k for k, v in self._pins.items()
+                      if now - (v[1] or 0) > SESSION_TTL]:
+                self._pins.pop(k, None)
+                self._pins_dirty.discard(k)
+            dirty = [(v[1], k) for k, v in self._pins.items()
+                     if k in self._pins_dirty]
+            self._pins_dirty.clear()
+        store.touch_pins(dirty)
+        store.prune_pins(SESSION_TTL)
 
     # ---------- bootstrap ----------
 
