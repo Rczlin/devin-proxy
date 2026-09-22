@@ -152,10 +152,13 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   request only goes to accounts that actually advertised the model.
   Settings: default model, default effort (auto-applied to
   family/alias requests that don't pin a variant), per-family default
-  variants (click a variant chip to make it the family's default),
-  custom aliases (`alias=uid`, optionally `alias=uid@effort` for a
-  per-alias default effort), and an extra JSON catalog URL
-  (`DEVIN_PROXY_MODELS_URL`) merged into the list
+  variants (click a variant chip to make it the family's default,
+  ✕ hides it — hidden variants are skipped by `/v1/models`, family
+  defaults and effort remapping but explicit uid requests still pass
+  through), custom aliases (`alias=uid`, optionally `alias=uid@effort`
+  for a per-alias default effort; ✕ deletes user aliases and hides
+  builtin/remote ones — both restorable), and an extra JSON catalog
+  URL (`DEVIN_PROXY_MODELS_URL`) merged into the list
 - **Playground** — test any model streaming or not, straight from the UI;
   optionally pin to a specific account
 - **API Keys** — mint `sk-dp-…` keys for callers (SHA-256 hashed in the
