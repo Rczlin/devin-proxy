@@ -42,7 +42,7 @@ class Account:
         a.id = r["id"]
         a.name = r["name"]
         a.email = r["email"]
-        a.token = r["token"]
+        a.token = normalize_token(r["token"])
         a.api_server_url = r["api_server_url"] or DEFAULT_API_SERVER
         a.webapp = r["devin_webapp_host"] or DEFAULT_WEBAPP
         a.api_url = r["devin_api_url"] or DEFAULT_API_URL
@@ -87,6 +87,15 @@ class Account:
             cooldown_until=self.cooldown_until, last_error=self.last_error,
             last_used=self.last_used, last_ok=self.last_ok,
             req_count=self.req_count)
+
+
+def normalize_token(token):
+    """The OAuth exchange returns a bare session JWT; upstream calls need it
+    as `devin-session-token$<jwt>` (the format the Devin CLI stores)."""
+    token = (token or "").strip()
+    if "$" not in token and token.count(".") == 2 and token.startswith("eyJ"):
+        return "devin-session-token$" + token
+    return token
 
 
 def is_hard_failure(err):
@@ -143,7 +152,7 @@ class Pool:
 
     def add(self, token, name=None, email=None, api_server_url=None,
             webapp=None, api_url=None, source=None, plan=None, manual=False):
-        token = (token or "").strip()
+        token = normalize_token(token)
         if not token:
             return None, "empty token"
         th = "tomb:" + hashlib.sha256(token.encode()).hexdigest()
@@ -151,6 +160,9 @@ class Pool:
             store.meta_set(th, "0")
         elif store.meta_get(th) == "1":
             return None, "previously removed"
+        for r in store.list_accounts():
+            if normalize_token(r["token"]) == token:
+                return None, "duplicate token"
         row = store.add_account(
             token, name=name, email=email, api_server_url=api_server_url,
             devin_webapp_host=webapp, devin_api_url=api_url,
@@ -312,14 +324,15 @@ def cancel_flow(fid):
 
 
 def _exchange_code(client, code, verifier, webapp):
-    """authorization code -> session credentials. Tries the Connect-JSON
-    exchange on api.devin.ai first, then the /auth/cli/token fallbacks."""
+    """authorization code -> session credentials. /auth/cli/token on
+    api.devin.ai is the live endpoint ({code, code_verifier} -> {"token"});
+    the Connect-JSON RPC and the webapp path are kept as fallbacks."""
     payload = {"code": code, "code_verifier": verifier}
     attempts = [
+        (DEFAULT_API_URL + "/auth/cli/token", payload),
         (DEFAULT_API_URL + "/exa.seat_management_pb.SeatManagementService/"
          "ExchangePKCEAuthorizationCode",
          dict(payload, redirect_uri="")),
-        (DEFAULT_API_URL + "/auth/cli/token", payload),
         (webapp.rstrip("/") + "/auth/cli/token", payload),
     ]
     last = "exchange failed"
