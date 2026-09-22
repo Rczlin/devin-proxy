@@ -34,7 +34,8 @@ class Account:
     __slots__ = ("id", "name", "email", "token", "api_server_url", "webapp",
                  "api_url", "source", "plan", "created", "disabled",
                  "fail_count", "consecutive_fails", "cooldown_until",
-                 "last_error", "last_used", "last_ok", "req_count", "in_flight")
+                 "last_error", "last_used", "last_ok", "req_count",
+                 "max_concurrent", "models", "in_flight")
 
     @classmethod
     def from_row(cls, r):
@@ -57,11 +58,21 @@ class Account:
         a.last_used = r["last_used"]
         a.last_ok = r["last_ok"]
         a.req_count = r["req_count"] or 0
+        a.max_concurrent = r["max_concurrent"] or 0
+        a.models = {m for m in (r["models"] or "").split(",") if m}
         a.in_flight = 0
         return a
 
     def display(self):
         return self.name or self.email or f"acct-{self.id}"
+
+    def serves(self, models):
+        """True if this account may serve any of `models` (requested name or
+        resolved uid). Empty allowlist = all models."""
+        return not self.models or not models or bool(self.models & models)
+
+    def at_cap(self):
+        return bool(self.max_concurrent) and self.in_flight >= self.max_concurrent
 
     def public(self):
         tail = self.token[-6:] if len(self.token) > 6 else "***"
@@ -77,6 +88,8 @@ class Account:
                 "cooldown_s": max(0, round(self.cooldown_until - now)),
                 "last_error": self.last_error, "last_used": self.last_used,
                 "last_ok": self.last_ok, "req_count": self.req_count,
+                "max_concurrent": self.max_concurrent,
+                "models": sorted(self.models),
                 "in_flight": self.in_flight, "created": self.created}
 
     def persist(self):
@@ -86,7 +99,8 @@ class Account:
             consecutive_fails=self.consecutive_fails,
             cooldown_until=self.cooldown_until, last_error=self.last_error,
             last_used=self.last_used, last_ok=self.last_ok,
-            req_count=self.req_count)
+            req_count=self.req_count, max_concurrent=self.max_concurrent,
+            models=",".join(sorted(self.models)) or None)
 
 
 def normalize_token(token):
@@ -187,7 +201,8 @@ class Pool:
 
     # ---------- scheduling ----------
 
-    def pick(self, session_key=None, exclude=frozenset(), force_id=None):
+    def pick(self, session_key=None, exclude=frozenset(), force_id=None,
+             models=None):
         with self._lock:
             now = time.time()
             if force_id is not None:
@@ -197,7 +212,8 @@ class Pool:
                     return a
                 return None
             avail = [a for a in self._accs.values()
-                     if not a.disabled and a.id not in exclude]
+                     if not a.disabled and a.id not in exclude
+                     and not a.at_cap() and a.serves(models)]
             if not avail:
                 return None
             if session_key:

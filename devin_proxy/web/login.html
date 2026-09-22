@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Sign in</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#0d1117;color:#e6edf3;font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  display:flex;align-items:center;justify-content:center;min-height:100vh}
+.box{background:#161b22;border:1px solid #2d333b;border-radius:10px;padding:30px;width:320px}
+.box h1{font-size:16px;font-weight:600;margin-bottom:18px;text-align:center}
+input{width:100%;background:#0d1117;border:1px solid #2d333b;color:#e6edf3;border-radius:6px;
+  padding:9px 12px;font-size:14px;margin-bottom:12px}
+input:focus{outline:none;border-color:#58a6ff}
+button{width:100%;background:#1f6feb;border:1px solid #1f6feb;color:#fff;border-radius:6px;
+  padding:9px;font-size:14px;cursor:pointer}
+button:hover{background:#388bfd}
+.err{color:#f85149;font-size:12px;min-height:18px;margin-top:8px;text-align:center}
+</style>
+</head>
+<body>
+<form class="box" id="f" autocomplete="off">
+  <h1>Sign in</h1>
+  <input id="k" type="password" placeholder="Access key" autofocus>
+  <button type="submit">Continue</button>
+  <p class="err" id="e"></p>
+</form>
+<script>
+const f=document.getElementById('f'),k=document.getElementById('k'),e=document.getElementById('e');
+fetch('/admin/api/overview').then(r=>{if(r.ok)location.replace('/admin/app')}).catch(()=>{});
+f.onsubmit=async ev=>{
+  ev.preventDefault();e.textContent='';
+  try{
+    const r=await fetch('/admin/api/login',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({key:k.value.trim()})});
+    if(r.ok){location.replace('/admin/app');return}
+    e.textContent='Invalid key';
+  }catch{e.textContent='Network error'}
+  k.select();
+};
+</script>
+</body>
+</html>

@@ -74,11 +74,6 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 .kv{display:grid;grid-template-columns:150px 1fr;gap:6px 14px;font-size:13px;margin-bottom:14px}
 .kv .k{color:var(--dim)}
 .toast{position:fixed;bottom:20px;right:20px;background:var(--panel2);border:1px solid var(--accent);border-radius:8px;padding:10px 18px;font-size:13px;display:none;z-index:99;max-width:60vw;word-break:break-all}
-/* login overlay */
-#login{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;z-index:100}
-#login.on{display:flex}
-#login .box{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:28px;width:340px}
-#login input{width:100%;margin:10px 0}
 .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--dim);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
 .reveal{background:#0d1117;border:1px solid var(--yellow);border-radius:6px;padding:10px;margin-top:10px;font-family:var(--mono);font-size:12px;word-break:break-all}
@@ -86,16 +81,6 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 </style>
 </head>
 <body>
-<div id="login">
-  <div class="box">
-    <h2 style="margin-bottom:4px">管理后台已锁定</h2>
-    <p class="muted">该实例使用 --api-key 启动，请输入管理密钥：</p>
-    <input id="login-key" type="password" placeholder="API Key" autofocus>
-    <button class="primary" style="width:100%" onclick="doLogin()">进入</button>
-    <p class="muted" id="login-err" style="margin-top:8px;color:var(--red)"></p>
-  </div>
-</div>
-
 <div class="app">
   <aside class="side">
     <h1><span class="dot"></span><span>devin-proxy</span></h1>
@@ -108,7 +93,7 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
       <a data-p="keys">🔑 <span>API Keys</span></a>
       <a data-p="conf">⚙️ <span>状态</span></a>
     </nav>
-    <div class="foot" id="foot"></div>
+    <div class="foot"><span id="foot"></span><a style="display:block;margin-top:6px" onclick="logout()">⏻ 退出登录</a></div>
   </aside>
   <main class="main">
 
@@ -186,7 +171,7 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
       </div>
       <div class="panel" style="padding:0;overflow-x:auto">
         <table><thead><tr>
-          <th>ID</th><th>账号</th><th>Plan</th><th>来源</th><th>状态</th><th>请求</th><th>在途</th><th>失败</th><th>最近使用</th><th>Token</th><th></th>
+          <th>ID</th><th>账号</th><th>Plan</th><th>来源</th><th>状态</th><th>请求</th><th>在途/上限</th><th>模型限制</th><th>失败</th><th>最近使用</th><th>Token</th><th></th>
         </tr></thead><tbody id="acc-body"></tbody></table>
       </div>
       <div class="panel">
@@ -232,14 +217,16 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
       <div class="panel">
         <h3>创建调用方 Key</h3>
         <div class="row">
-          <input id="key-name" placeholder="名称，如 my-app" style="width:220px">
+          <input id="key-name" placeholder="名称，如 my-app" style="width:180px">
+          <input id="key-models" placeholder="限制模型（逗号分隔，留空=全部）" style="width:240px">
+          <input id="key-conc" type="number" min="0" placeholder="并发上限" title="并发上限，0=不限" style="width:100px">
           <button class="primary" onclick="createKey()">创建</button>
         </div>
         <div id="key-reveal"></div>
-        <p class="muted" style="margin-top:8px">客户端用 <code>Authorization: Bearer sk-dp-…</code> 调用。Key 以 SHA-256 哈希存储，完整值仅在创建时显示一次。存在任一 key 后，未带 key 的请求会被拒绝（除非未设 --api-key 且无 key）。</p>
+        <p class="muted" style="margin-top:8px">客户端用 <code>Authorization: Bearer sk-dp-…</code> 调用。Key 以 SHA-256 哈希存储，完整值仅在创建时显示一次。可为每个 key 限定可用模型（uid 或别名）与并发上限；<code>/v1/models</code> 只会返回该 key 允许的模型。</p>
       </div>
-      <div class="panel">
-        <table><thead><tr><th>ID</th><th>名称</th><th>Key</th><th>创建时间</th><th>最近使用</th><th>状态</th><th></th></tr></thead>
+      <div class="panel" style="padding:0;overflow-x:auto">
+        <table><thead><tr><th>ID</th><th>名称</th><th>Key</th><th>模型限制</th><th>并发</th><th>创建时间</th><th>最近使用</th><th>状态</th><th></th></tr></thead>
         <tbody id="key-body"></tbody></table>
       </div>
     </section>
@@ -277,21 +264,17 @@ const fmtT = ts => ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}):'
 const fmtDur = s => s>86400?(s/86400).toFixed(1)+' 天':s>3600?(s/3600).toFixed(1)+' 小时':Math.round(s/60)+' 分钟';
 const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-// ---------- auth ----------
-let AK = localStorage.getItem('dp_admin_key') || '';
+// ---------- auth (cookie session from /admin login) ----------
 async function api(path, opts={}){
-  opts.headers = Object.assign({}, opts.headers, AK ? {Authorization:'Bearer '+AK} : {});
   const r = await fetch(path, opts);
-  if (r.status === 401){ $('#login').classList.add('on'); throw new Error('unauthorized') }
+  if (r.status === 401){ location.href='/admin'; throw new Error('unauthorized') }
   if (!r.ok){ let m; try{m=(await r.json()).detail}catch{} throw new Error(m||('HTTP '+r.status)) }
   return r;
 }
-async function doLogin(){
-  AK = $('#login-key').value.trim();
-  try{ await api('/admin/api/overview'); localStorage.setItem('dp_admin_key',AK); $('#login').classList.remove('on'); boot() }
-  catch(e){ $('#login-err').textContent = '密钥无效'; AK='' }
+async function logout(){
+  await fetch('/admin/api/logout',{method:'POST'}).catch(()=>{});
+  location.href='/admin';
 }
-$('#login-key').addEventListener('keydown',e=>{if(e.key==='Enter')doLogin()});
 
 // nav
 document.querySelectorAll('.nav a').forEach(a=>a.onclick=()=>{
@@ -368,10 +351,11 @@ async function showReq(id){
 }
 
 // accounts
-let OA_FID=null;
+let OA_FID=null, ACC_MAP={};
 async function loadAccounts(){
   const d=await (await api('/admin/api/accounts')).json();
   const p=d.pool||{};
+  ACC_MAP={}; d.accounts.forEach(a=>ACC_MAP[a.id]=a);
   $('#accs-summary').textContent=`共 ${p.total||0} 个 · 就绪 ${p.ready||0} · 冷却 ${p.cooldown||0} · 钉扎会话 ${p.sessions||0}`;
   $('#acc-body').innerHTML=d.accounts.map(a=>{
     const st=a.disabled?'<span class="tag off">禁用</span>'
@@ -381,14 +365,18 @@ async function loadAccounts(){
     return `<tr><td>${a.id}</td>
       <td><b>${esc(a.label)}</b>${a.email?`<br><span class="muted">${esc(a.email)}</span>`:''}${a.last_error?`<br><span class="muted" style="color:var(--red)" title="${esc(a.last_error)}">${esc(a.last_error.slice(0,60))}</span>`:''}</td>
       <td>${esc(a.plan||'-')}</td><td class="muted">${esc(a.source||'-')}</td>
-      <td>${st}</td><td>${u.n||0}</td><td>${a.in_flight}</td><td>${a.fail_count}</td>
+      <td>${st}</td><td>${u.n||0}</td>
+      <td>${a.in_flight}/${a.max_concurrent||'∞'}</td>
+      <td class="muted">${a.models&&a.models.length?esc(a.models.join(',')):'全部'}</td>
+      <td>${a.fail_count}</td>
       <td>${fmtT(a.last_used)}</td><td class="muted">…${esc(a.token_tail)}</td>
       <td style="white-space:nowrap">
         <button onclick="testAccount(${a.id})">测试</button>
         <button onclick="refreshAccount(${a.id})">刷新</button>
+        <button onclick="editAccLimits(${a.id})">限制</button>
         <button onclick="toggleAccount(${a.id},${a.disabled?0:1})">${a.disabled?'启用':'禁用'}</button>
         <button class="danger" onclick="delAccount(${a.id},'${esc(a.label)}')">删除</button>
-      </td></tr>`}).join('')||'<tr><td colspan=11 class=muted>暂无账号 — 用上方 OAuth 登录或手动添加</td></tr>';
+      </td></tr>`}).join('')||'<tr><td colspan=12 class=muted>暂无账号 — 用上方 OAuth 登录或手动添加</td></tr>';
   const s=await (await api('/admin/api/sessions')).json();
   $('#sess-body').innerHTML=(s.sessions||[]).map(x=>`<tr>
     <td class="muted">${esc(x.session_key)}</td><td>${esc(x.aname||x.email||('#'+x.account_id))}</td>
@@ -444,6 +432,16 @@ async function toggleAccount(id,dis){
   await api('/admin/api/accounts/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({disabled:!!dis})});
   loadAccounts();
 }
+async function editAccLimits(id){
+  const a=ACC_MAP[id];if(!a)return;
+  const mc=prompt('该账号最大并发请求数（0 = 不限）',a.max_concurrent||0);
+  if(mc===null)return;
+  const models=prompt('该账号可服务的模型（逗号分隔 uid/别名，留空 = 全部）',(a.models||[]).join(','));
+  if(models===null)return;
+  await api('/admin/api/accounts/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({max_concurrent:parseInt(mc)||0,models})});
+  toast('已更新');loadAccounts();
+}
 async function delAccount(id,name){
   if(!confirm(`删除账号「${name}」？`))return;
   await api('/admin/api/accounts/'+id,{method:'DELETE'});loadAccounts();
@@ -482,12 +480,11 @@ async function pgSend(){
   const stream=$('#pg-stream').checked;
   const t0=performance.now();
   const headers={'Content-Type':'application/json'};
-  if(AK)headers.Authorization='Bearer '+AK;
   try{
     if(stream){
       const r=await fetch('/admin/api/playground',{method:'POST',headers,
         body:JSON.stringify({model:$('#pg-model').value,messages:msgs,stream:true,stream_options:{include_usage:true}})});
-      if(r.status===401){$('#login').classList.add('on');throw new Error('unauthorized')}
+      if(r.status===401){location.href='/admin';throw new Error('unauthorized')}
       const rd=r.body.getReader(),dec=new TextDecoder();let buf='',think='';
       for(;;){
         const{done,value}=await rd.read();if(done)break;
@@ -522,22 +519,39 @@ async function pgSend(){
 document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter'&&$('#p-play').classList.contains('on'))pgSend()});
 
 // keys
+let KEY_MAP={};
 async function loadKeys(){
   const d=await (await api('/admin/api/keys')).json();
+  KEY_MAP={}; d.keys.forEach(k=>KEY_MAP[k.id]=k);
   $('#key-body').innerHTML=d.keys.map(k=>`<tr><td>${k.id}</td><td>${esc(k.name)}</td>
     <td>${esc(k.prefix)}…${esc(k.tail)}</td>
+    <td class="muted">${esc(k.models||'全部')}</td>
+    <td>${k.max_concurrent||'∞'}</td>
     <td>${fmtT(k.created)}</td><td>${fmtT(k.last_used)}</td>
     <td><span class="tag ${k.disabled?'off':'ok'}">${k.disabled?'禁用':'启用'}</span></td>
-    <td><button onclick="toggleKey(${k.id},${k.disabled?0:1})">${k.disabled?'启用':'禁用'}</button>
-        <button class="danger" onclick="delKey(${k.id},'${esc(k.name)}')">删除</button></td></tr>`).join('')||'<tr><td colspan=7 class=muted>暂无 key — 任何人都能调用本代理</td></tr>';
+    <td style="white-space:nowrap"><button onclick="editKey(${k.id})">限制</button>
+        <button onclick="toggleKey(${k.id},${k.disabled?0:1})">${k.disabled?'启用':'禁用'}</button>
+        <button class="danger" onclick="delKey(${k.id},'${esc(k.name)}')">删除</button></td></tr>`).join('')||'<tr><td colspan=9 class=muted>暂无 key</td></tr>';
 }
 async function createKey(){
   const name=$('#key-name').value.trim();if(!name)return toast('请输入名称');
-  const d=await (await api('/admin/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name})})).json();
-  $('#key-name').value='';
+  const d=await (await api('/admin/api/keys',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,models:$('#key-models').value.trim()||null,
+      max_concurrent:parseInt($('#key-conc').value)||0})})).json();
+  $('#key-name').value='';$('#key-models').value='';$('#key-conc').value='';
   $('#key-reveal').innerHTML=`<div class="reveal">⚠️ 完整 key 只显示这一次，请立即保存：<br><b>${esc(d.key)}</b>
     <a style="margin-left:10px" onclick="navigator.clipboard.writeText('${d.key}');toast('已复制')">复制</a></div>`;
   loadKeys();
+}
+async function editKey(id){
+  const k=KEY_MAP[id];if(!k)return;
+  const models=prompt('允许的模型（逗号分隔 uid/别名，留空 = 全部）',k.models||'');
+  if(models===null)return;
+  const mc=prompt('并发上限（0 = 不限）',k.max_concurrent||0);
+  if(mc===null)return;
+  await api('/admin/api/keys/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({models,max_concurrent:parseInt(mc)||0})});
+  toast('已更新');loadKeys();
 }
 async function toggleKey(id,dis){await api('/admin/api/keys/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({disabled:!!dis})});loadKeys()}
 async function delKey(id,name){

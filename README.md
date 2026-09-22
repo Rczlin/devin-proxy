@@ -29,13 +29,19 @@ credentials found on the machine (see below).
 
 Point any OpenAI client at `http://127.0.0.1:8317/v1`.
 
-Optional shared-secret for clients (`Authorization: Bearer <key>`):
+The proxy is always locked. Set the master key explicitly:
 
 ```bash
 python -m devin_proxy --api-key my-secret
 ```
 
-`--api-key` also locks the admin console (enter the key to log in).
+If `--api-key`/`DEVIN_PROXY_KEY` is not set, a random master key is generated
+on first run, persisted in the DB, and printed to the console. The master key
+unlocks the admin console (`/admin` → sign in → cookie session) and works as a
+caller key on `/v1`. Without a valid credential, `/v1` returns 401 and `/admin`
+shows only a generic sign-in page — no console code, model list, or service
+details are exposed (`/docs`, `/openapi.json` and `Server` header are off;
+`/healthz` reports only `{"ok": true}`).
 
 ## Accounts (multi-account pool)
 
@@ -52,7 +58,10 @@ from the admin console (**账号池** page):
   `credentials.toml` and Devin Desktop state DBs; imports every distinct
   credential as its own account.
 - Per-account: enable/disable, delete, connectivity test, identity/plan
-  refresh, last error, cooldown countdown, in-flight count.
+  refresh, last error, cooldown countdown, in-flight count, plus a
+  **max-concurrency cap** and a **model allowlist** (限制 button) — the
+  scheduler skips capped or non-serving accounts and fails over to the
+  next eligible one.
 
 ### Scheduling
 
@@ -126,8 +135,10 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
 - **Playground** — test any model streaming or not, straight from the UI;
   optionally pin to a specific account
 - **API Keys** — mint `sk-dp-…` keys for callers (SHA-256 hashed in the
-  DB, shown once); enable/disable/delete. Once any key exists, `/v1`
-  requires `Authorization: Bearer`
+  DB, shown once); enable/disable/delete. Per-key limits: model allowlist
+  (uid or alias — `/v1/models` then returns only those) and a concurrency
+  cap (over-limit calls get 429). `/v1` always requires
+  `Authorization: Bearer`
 - **状态** — pool summary, upstream connectivity check across accounts,
   DB path/size, uptime
 
@@ -145,9 +156,10 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   `response.completed`, …)
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`,
   `GET /v1/responses/{id}/input_items`
-- `GET /v1/models` — known model uids + aliases
-- `GET /healthz`
-- `/admin/*` — console + JSON API
+- `GET /v1/models` — model uids + aliases (filtered to the caller key's
+  allowlist when set)
+- `GET /healthz` — `{"ok": true}` only
+- `/admin` — sign-in page → cookie session → `/admin/app` console
 
 Model: pass a variant uid (`claude-sonnet-5-medium`, `gpt-5-6-sol-low`,
 `swe-2-high`, …) or an alias (`claude`, `sonnet`, `opus`, `gemini`, `gpt`,
