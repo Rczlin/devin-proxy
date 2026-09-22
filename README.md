@@ -123,8 +123,14 @@ Open `http://127.0.0.1:8317/admin` — a persistent dashboard backed by
 SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
 `DEVIN_PROXY_DB`):
 
-- **仪表盘** — request/token totals, success rate, avg latency & TTFT,
-  24 h chart, per-model stats, truncated-stream & retry counters
+- **仪表盘** — time-windowed monitoring (1h / 24h / 7d / 30d / all):
+  request & token totals, success rate, avg + P50/P95 latency, TTFT,
+  RPM and tokens/min, in-flight requests; account-pool health strip
+  (ready / cooldown / losing-streak, per-account in-flight); stacked
+  request/error chart with a latency overlay, token trend chart,
+  model-share bars, per-account and per-key usage tables, and a
+  recent-errors feed that jumps straight into the request detail view.
+  Every row/bar is clickable to filter the request log
 - **请求日志** — every request logged (model, endpoint, account, tokens,
   latency, status, caller key, messages); filter by model/status/flag/text/
   account, paginate, inspect detail, or purge. Retention capped by
