@@ -27,6 +27,7 @@ def _conn():
         _con.row_factory = sqlite3.Row
         _con.execute("PRAGMA journal_mode=WAL")
         _con.execute("PRAGMA busy_timeout=5000")
+        _con.execute("PRAGMA synchronous=NORMAL")
         _con.executescript("""
         CREATE TABLE IF NOT EXISTS requests (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -341,13 +342,16 @@ def set_key_disabled(kid, disabled):
 
 def key_info(key):
     """-> full key row for a presented bearer key, else None."""
+    h = _hash(key)
     with _lock:
         r = _conn().execute(
-            "SELECT id,name,disabled,models,max_concurrent FROM api_keys "
-            "WHERE key_hash=?", (_hash(key),)).fetchone()
-        if r is not None and not r["disabled"]:
+            "SELECT id,name,disabled,models,max_concurrent,last_used "
+            "FROM api_keys WHERE key_hash=?", (h,)).fetchone()
+        now = time.time()
+        if (r is not None and not r["disabled"]
+                and now - (r["last_used"] or 0) > 60):
             _conn().execute("UPDATE api_keys SET last_used=? WHERE key_hash=?",
-                            (time.time(), _hash(key)))
+                            (now, h))
             _conn().commit()
     if r is None:
         return None
@@ -445,14 +449,6 @@ def account_stats():
 
 # ---------- session pinning ----------
 
-def get_pin(session_key):
-    with _lock:
-        r = _conn().execute(
-            "SELECT account_id FROM sessions WHERE session_key=?",
-            (session_key,)).fetchone()
-    return r["account_id"] if r else None
-
-
 def set_pin(session_key, account_id):
     with _lock:
         _conn().execute(
@@ -463,10 +459,13 @@ def set_pin(session_key, account_id):
         _conn().commit()
 
 
-def touch_pin(session_key):
+def touch_pins(pairs):
+    """Batch-refresh `updated` on existing pins. pairs: [(updated, key), ...]"""
+    if not pairs:
+        return
     with _lock:
-        _conn().execute("UPDATE sessions SET updated=? WHERE session_key=?",
-                        (time.time(), session_key))
+        _conn().executemany(
+            "UPDATE sessions SET updated=? WHERE session_key=?", pairs)
         _conn().commit()
 
 

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                StreamingResponse)
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from . import accounts as accounts_mod
 from . import creds as creds_mod
@@ -138,9 +139,10 @@ def make_router(app):
                                      app.state.resolve_model(body),
                                      "admin:playground", t0, force),
                 media_type="text/event-stream")
-        return JSONResponse(app.state.collect(
-            request, body, app.state.resolve_model(body),
-            "admin:playground", t0, force))
+        resp = await run_in_threadpool(
+            app.state.collect, request, body,
+            app.state.resolve_model(body), "admin:playground", t0, force)
+        return JSONResponse(resp)
 
     class NewKey(BaseModel):
         name: str

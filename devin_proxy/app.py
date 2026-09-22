@@ -9,6 +9,7 @@ import uuid
 import httpx
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from . import accounts as accounts_mod
 from . import creds as creds_mod
@@ -395,7 +396,9 @@ def create_app(api_key=None):
                              release),
                 media_type="text/event-stream")
         try:
-            return JSONResponse(_collect(request, body, model, skey, t0))
+            resp = await run_in_threadpool(
+                _collect, request, body, model, skey, t0)
+            return JSONResponse(resp)
         finally:
             release()
 
@@ -530,8 +533,8 @@ def create_app(api_key=None):
         release = acquire_key_slot(request)
         if release is None:
             raise HTTPException(429, "key concurrency limit reached")
-        return responses_mod.handle(
-            request, body, t0,
+        return await run_in_threadpool(
+            responses_mod.handle, request, body, t0,
             iter_chat=iter_chat, resolve_model=resolve_model,
             record=_record, release=release)
 

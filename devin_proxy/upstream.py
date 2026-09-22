@@ -54,30 +54,31 @@ def get_user_jwt(client, base_url, api_key, force_refresh=False):
     key = (base_url, api_key)
     with _jwt_lock:
         cached = _jwt_cache.get(key)
-        if not force_refresh and cached and cached["exp"] > time.time() + 60:
-            return cached["jwt"]
-        req = proto.GetUserJwtRequest(metadata=build_metadata(api_key))
-        resp = client.post(
-            base_url + JWT_PATH,
-            content=req.SerializeToString(),
-            headers={"Content-Type": "application/proto",
-                     "Connect-Protocol-Version": "1"},
-        )
-        resp.raise_for_status()
-        out = proto.GetUserJwtResponse()
-        out.ParseFromString(resp.content)
-        if not out.jwt:
-            raise RuntimeError("GetUserJwt returned no JWT")
-        exp = time.time() + 600
-        try:
-            import base64
-            payload = out.jwt.split(".")[1]
-            payload += "=" * (-len(payload) % 4)
-            exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp", exp)
-        except Exception:
-            pass
+    if not force_refresh and cached and cached["exp"] > time.time() + 60:
+        return cached["jwt"]
+    req = proto.GetUserJwtRequest(metadata=build_metadata(api_key))
+    resp = client.post(
+        base_url + JWT_PATH,
+        content=req.SerializeToString(),
+        headers={"Content-Type": "application/proto",
+                 "Connect-Protocol-Version": "1"},
+    )
+    resp.raise_for_status()
+    out = proto.GetUserJwtResponse()
+    out.ParseFromString(resp.content)
+    if not out.jwt:
+        raise RuntimeError("GetUserJwt returned no JWT")
+    exp = time.time() + 600
+    try:
+        import base64
+        payload = out.jwt.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp", exp)
+    except Exception:
+        pass
+    with _jwt_lock:
         _jwt_cache[key] = {"jwt": out.jwt, "exp": exp}
-        return out.jwt
+    return out.jwt
 
 
 def clear_jwt(base_url, api_key):
