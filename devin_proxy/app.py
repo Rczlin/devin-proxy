@@ -729,48 +729,91 @@ def create_app(api_key=None):
                 except Exception:
                     pass
             got_content, saw_stop, terminal, buf = False, False, None, []
-            try:
-                for ev in upstream.stream_chat(
-                        app.state.http, acct.api_server_url, acct.token, req,
-                        capture=(lambda k, d: log.cap_frame(cap_att, k, d))
-                        if cap_att is not None else None):
-                    if isinstance(ev, dict):
-                        if log:
-                            if ev.get("kind") == "truncated":
-                                log.flag("truncated")
-                            log.ev("upstream_err", account=acct.display(),
-                                   detail=ev)
-                        if not got_content:
-                            terminal = ev
+            desc_sanitized = False
+            while True:
+                try:
+                    for ev in upstream.stream_chat(
+                            app.state.http, acct.api_server_url, acct.token,
+                            req,
+                            capture=(lambda k, d: log.cap_frame(cap_att, k, d))
+                            if cap_att is not None else None):
+                        if isinstance(ev, dict):
+                            if log:
+                                if ev.get("kind") == "truncated":
+                                    log.flag("truncated")
+                                log.ev("upstream_err", account=acct.display(),
+                                       detail=ev)
+                            if not got_content:
+                                terminal = ev
+                                break
+                            if stream:
+                                pool.mark_fail(acct, ev)
+                                yield acct, ev
+                                return
+                            terminal = ev       # buffered: retry next account
                             break
+                        got_content = True
+                        if ev.stop_reason:
+                            saw_stop = True
+                        if log:
+                            log.ev("msg", **_msg_summary(ev))
                         if stream:
-                            pool.mark_fail(acct, ev)
                             yield acct, ev
-                            return
-                        terminal = ev       # buffered: retry on next account
-                        break
-                    got_content = True
-                    if ev.stop_reason:
-                        saw_stop = True
+                        else:
+                            buf.append(ev)
+                except Exception as e:
+                    e2 = {"kind": "exception", "message": str(e)}
                     if log:
-                        log.ev("msg", **_msg_summary(ev))
-                    if stream:
-                        yield acct, ev
-                    else:
-                        buf.append(ev)
-            except Exception as e:
-                e2 = {"kind": "exception", "message": str(e)}
-                if log:
-                    log.ev("exception", account=acct.display(),
-                           error=repr(e)[:800],
-                           tb=traceback.format_exc()[-3000:])
-                if got_content and stream:
-                    pool.mark_fail(acct, e2)
-                    yield acct, e2
-                    return
-                terminal = e2
-            finally:
-                pool.release(acct)
+                        log.ev("exception", account=acct.display(),
+                               error=repr(e)[:800],
+                               tb=traceback.format_exc()[-3000:])
+                    if got_content and stream:
+                        pool.mark_fail(acct, e2)
+                        yield acct, e2
+                        return
+                    terminal = e2
+                finally:
+                    pool.release(acct)
+                # upstream rejects requests whose tool descriptions carry
+                # verbatim text from its internal tool/prompt corpus, reported
+                # as "MCP configuration issue". Retry once on the same account
+                # with homoglyph-sanitized descriptions — request-scoped, so
+                # failover to another account would not help anyway.
+                if (terminal is not None
+                        and terminal.get("kind") == "upstream_error"
+                        and "MCP configuration issue" in
+                        str(terminal.get("message", ""))
+                        and len(req.tools) and not desc_sanitized):
+                    desc_sanitized = True
+                    got_content, saw_stop, terminal, buf = (
+                        False, False, None, [])
+                    for t in req.tools:
+                        t.description = upstream.sanitize_tool_desc(
+                            t.description)
+                    if log:
+                        log.flag("desc_sanitized")
+                        log.ev("mcp_retry", account=acct.display(),
+                               n_tools=len(req.tools))
+                        try:
+                            cap_req2 = proto.GetChatMessageRequest()
+                            cap_req2.CopyFrom(req)
+                            cap_req2.metadata.api_key = "***"
+                            if cap_req2.metadata.user_jwt:
+                                cap_req2.metadata.user_jwt = "***"
+                            cap_att = log.cap_attempt({
+                                "attempt": attempt, "account": acct.display(),
+                                "server": acct.api_server_url, "model": model,
+                                "sanitized_desc": True,
+                                "request_pb_b64": base64.b64encode(
+                                    cap_req2.SerializeToString()).decode(),
+                                "redacted": "metadata.api_key/user_jwt"})
+                            from google.protobuf.json_format import (
+                                MessageToDict)
+                            cap_att["request"] = MessageToDict(cap_req2)
+                        except Exception:
+                            cap_att = None
+                    continue
+                break
             if terminal is None:
                 if log:
                     if got_content and not saw_stop:
