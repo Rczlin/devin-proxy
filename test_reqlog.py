@@ -40,10 +40,14 @@ print("ReqLog caps + flags OK")
 
 # cap reached
 import devin_proxy.app as A
+_orig_cap = A._LOG_CAP
 A._LOG_CAP = 1000
-rl2 = ReqLog()
-for i in range(50):
-    rl2.ev("msg", text="x" * 300)
-assert rl2._ev_full and rl2.events[-1]["t"] == "log_cap"
+try:
+    rl2 = ReqLog()
+    for i in range(50):
+        rl2.ev("msg", text="x" * 300)
+    assert rl2._ev_full and rl2.events[-1]["t"] == "log_cap"
+finally:
+    A._LOG_CAP = _orig_cap
 print("cap reached -> log_cap marker OK")
 print("ALL OK")

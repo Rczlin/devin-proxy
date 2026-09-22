@@ -206,6 +206,7 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
         <label class="muted" title="每 5 秒刷新当前页"><input type="checkbox" id="rq-auto"> 自动刷新</label>
         <span class="muted" id="rq-total"></span>
         <span style="flex:1"></span>
+        <button onclick="exportBundle()" title="打包请求日志/账号状态/模型目录等全部诊断数据为 zip">📦 导出诊断包</button>
         <button class="danger" onclick="clearReqs()">清空日志</button>
         <button id="rq-prev" onclick="reqPage(-1)">← 上一页</button>
         <span class="muted" id="rq-page"></span>
@@ -368,7 +369,10 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
     <div class="pane" id="md-p-ev"><div id="md-ev" style="max-height:56vh;overflow:auto"></div></div>
     <div class="pane" id="md-p-sse"><pre id="md-sse"></pre></div>
     <div style="display:flex;justify-content:space-between;margin-top:12px">
-      <button onclick="copyPane()">📋 复制当前页内容</button>
+      <span>
+        <button onclick="copyPane()">📋 复制当前页内容</button>
+        <button onclick="dlCapture()" title="下载该请求的完整抓包(原始请求体/上游protobuf/全部响应帧,不截断)">📥 抓包</button>
+      </span>
       <button onclick="modal.classList.remove('on')">关闭</button>
     </div>
   </div>
@@ -632,13 +636,31 @@ async function loadReqs(){
     <td>${r.prompt_tokens}</td><td>${r.completion_tokens}</td><td>${cacheCell(r)}</td>
     <td>${r.latency_ms}ms</td><td>${r.ttft_ms??'-'}</td><td>${r.tps??'-'}</td>
     <td>${esc(r.account||'')}</td><td>${esc(r.key_name||'')}</td>
-    <td><a onclick="showReq(${r.id})">详情</a></td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';
+    <td><a onclick="showReq(${r.id})">详情</a>${r.has_cap?` <a onclick="dlCapture(${r.id})" title="下载完整抓包">📦</a>`:''}</td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';
 }
 function reqPage(d){reqOffset=Math.max(0,reqOffset+d*PAGE);loadReqs()}
 setInterval(()=>{if($('#p-reqs').classList.contains('on')&&$('#rq-auto').checked)loadReqs().catch(()=>{})},5000);
 async function clearReqs(){
   if(!confirm('确定清空全部请求日志？不可恢复。'))return;
   await api('/admin/api/requests/clear',{method:'POST'});reqOffset=0;loadReqs();toast('已清空');
+}
+async function exportBundle(){
+  const r=await api('/admin/api/export');
+  const b=await r.blob();
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(b);
+  a.download=(r.headers.get('content-disposition')||'').match(/filename="?([^";]+)/)?.[1]||'devin-proxy-diag.zip';
+  a.click();URL.revokeObjectURL(a.href);toast('已导出诊断包');
+}
+let mdRid=null;
+async function dlCapture(id){
+  id=id||mdRid;if(!id)return;
+  const r=await api('/admin/api/requests/'+id+'/capture');
+  if(r.status===404){toast('该请求没有抓包数据');return}
+  const b=await r.blob();
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(b);a.download=`req-${id}-capture.json`;
+  a.click();URL.revokeObjectURL(a.href);toast('已下载抓包');
 }
 
 // request detail modal (tabbed)
@@ -649,7 +671,8 @@ document.querySelectorAll('#md-tabs a').forEach(a=>a.onclick=()=>{
   a.classList.add('on');MD_TAB=a.dataset.t;$('#md-p-'+MD_TAB).classList.add('on');
 });
 const pretty=s=>{if(!s)return'';try{return JSON.stringify(JSON.parse(s),null,1)}catch{return s}};
-const EV_LABEL={request:['请求进入',''],attempt:['尝试',''],msg:['上游消息',''],upstream_err:['上游错误','err'],
+const EV_LABEL={request:['请求进入',''],parse_error:['解析失败','err'],mapped:['请求映射',''],
+  built:['上游请求',''],attempt:['尝试',''],msg:['上游消息',''],upstream_err:['上游错误','err'],
   exception:['连接异常','err'],proxy_exception:['代理异常','err'],build_error:['构建失败','err'],
   failover:['切换账号','warn'],end:['流结束',''],finish:['完成',''],failed:['最终失败','err'],
   downstream_error:['下游报错','err'],log_cap:['日志截断','warn']};
@@ -676,6 +699,7 @@ function renderEvents(js){
   }).join(''):'<div class="muted" style="padding:10px">无上游事件记录（旧版本请求无此数据）</div>';
 }
 async function showReq(id){
+  mdRid=id;
   const r=await (await api('/admin/api/requests/'+id)).json();
   $('#md-id').textContent='#'+r.id;
   $('#md-flags').innerHTML=flagTags(r.flags);

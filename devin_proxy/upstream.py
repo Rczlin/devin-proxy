@@ -269,14 +269,26 @@ def _is_soft(msg):
     return any(s in m for s in _SOFT_HINTS)
 
 
-def stream_chat(client, base_url, api_key, request, timeout=None):
+def stream_chat(client, base_url, api_key, request, timeout=None,
+                capture=None):
     """POST GetChatMessage; yields GetChatMessageResponse messages, then
     dicts on terminal errors. Every error dict carries `kind` (http_error /
     upstream_error / truncated / protocol_error) and `message`.
 
+    `capture(kind, data)` — when given, receives every raw wire payload for
+    the full-fidelity packet log: "resp_headers" (json), "frame" (decoded
+    proto bytes), "trailer" (end-stream payload), "http_body" (error body).
+
     A Connect-RPC server stream MUST end with an END_STREAM trailer frame.
     If the connection closes without one the stream was truncated — that is
     reported as an error instead of silently looking like a clean finish."""
+
+    def cap(kind, data):
+        if capture is not None:
+            try:
+                capture(kind, data)
+            except Exception:
+                pass
     headers = {
         "Content-Type": "application/connect+proto",
         "Connect-Protocol-Version": "1",
@@ -292,9 +304,16 @@ def stream_chat(client, base_url, api_key, request, timeout=None):
     with client.stream("POST", base_url + CHAT_PATH,
                        content=_connect_frame(request.SerializeToString()),
                        headers=headers, **kw) as resp:
+        cap("resp_headers", json.dumps(
+            {k: v for k, v in resp.headers.items()
+             if k.lower() != "set-cookie"}).encode())
         if resp.status_code != 200:
             body = resp.read()
+            cap("http_body", body)
             yield {"kind": "http_error", "http_error": resp.status_code,
+                   "resp_headers": {k: v[:200] for k, v in
+                                    resp.headers.items()
+                                    if k.lower() != "set-cookie"},
                    "message": body.decode("utf-8", "replace")[:2000]}
             return
         # iter_bytes(n) asks httpx to repackage the body into n-byte pieces —
@@ -321,6 +340,7 @@ def stream_chat(client, base_url, api_key, request, timeout=None):
                     raw = payload
                 if flags & END_STREAM:
                     ended = True
+                    cap("trailer", raw)
                     err = _trailer_error(raw)
                     if err:
                         trailer_txt = raw.decode("utf-8", "replace")[:4000]
@@ -333,6 +353,7 @@ def stream_chat(client, base_url, api_key, request, timeout=None):
                                "soft": _is_soft(err) or _is_soft(trailer_txt)}
                     continue
                 n_frames += 1
+                cap("frame", raw)
                 msg = proto.GetChatMessageResponse()
                 try:
                     msg.ParseFromString(raw)
