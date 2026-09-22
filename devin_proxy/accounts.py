@@ -118,6 +118,8 @@ def is_hard_failure(err):
     auth/quota/rate-limit/5xx/network. 4xx request-shape errors are soft."""
     if not isinstance(err, dict):
         return True                       # exceptions: network/protocol
+    if err.get("soft"):
+        return False
     code = err.get("http_error")
     if code is None:
         return True

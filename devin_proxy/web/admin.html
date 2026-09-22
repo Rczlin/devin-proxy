@@ -77,6 +77,19 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 .spin{display:inline-block;width:12px;height:12px;border:2px solid var(--dim);border-top-color:var(--accent);border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px}
 @keyframes sp{to{transform:rotate(360deg)}}
 .reveal{background:#0d1117;border:1px solid var(--yellow);border-radius:6px;padding:10px;margin-top:10px;font-family:var(--mono);font-size:12px;word-break:break-all}
+/* detail modal tabs + upstream event timeline */
+.tabs{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+.tabs a{padding:4px 14px;border-radius:6px;font-size:12.5px;color:var(--dim);border:1px solid var(--border);cursor:pointer}
+.tabs a.on{background:#1f6feb22;color:var(--accent);border-color:var(--accent)}
+.pane{display:none}.pane.on{display:block}
+.pane pre{max-height:56vh}
+.evt{display:flex;gap:10px;padding:4px 8px;border-bottom:1px solid #21262d;font-family:var(--mono);font-size:11.5px;align-items:baseline}
+.evt:hover{background:#1c233055}
+.evt .ms{color:var(--dim);min-width:76px;text-align:right;flex-shrink:0}
+.evt .kt{min-width:92px;flex-shrink:0;color:var(--accent)}
+.evt .dt{color:var(--text);word-break:break-all;white-space:pre-wrap;min-width:0}
+.evt.err .kt{color:var(--red)}.evt.err .dt{color:#ffa198}
+.evt.warn .kt{color:var(--yellow)}
 @media(max-width:760px){.side{width:56px}.side h1 span:last-child,.nav a span{display:none}.nav a{justify-content:center}}
 </style>
 </head>
@@ -116,8 +129,10 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
       <div class="row" style="margin-bottom:12px">
         <select id="rq-model"><option value="">全部模型</option></select>
         <select id="rq-ok"><option value="">全部状态</option><option value="1">成功</option><option value="0">失败</option></select>
+        <select id="rq-flag"><option value="">全部标记</option><option value="truncated">断流/截断</option><option value="retried">重试恢复</option><option value="no_stop_reason">无 stop</option></select>
         <input id="rq-q" placeholder="搜索 错误/客户端/Key" style="width:180px">
         <button class="primary" onclick="reqOffset=0;loadReqs()">筛选</button>
+        <label class="muted" title="每 5 秒刷新当前页"><input type="checkbox" id="rq-auto"> 自动刷新</label>
         <span class="muted" id="rq-total"></span>
         <span style="flex:1"></span>
         <button class="danger" onclick="clearReqs()">清空日志</button>
@@ -246,11 +261,20 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 </div>
 
 <div class="modal" id="modal" onclick="if(event.target===this)this.classList.remove('on')">
-  <div class="box"><h3 style="margin-bottom:12px">请求详情 <span class="muted" id="md-id"></span></h3>
-    <div class="kv" id="md-kv"></div>
-    <h3 style="margin-bottom:8px">Messages</h3>
-    <pre id="md-msgs"></pre>
-    <div style="text-align:right;margin-top:12px"><button onclick="modal.classList.remove('on')">关闭</button></div>
+  <div class="box" style="width:min(980px,94vw)">
+    <h3 style="margin-bottom:10px">请求详情 <span class="muted" id="md-id"></span><span id="md-flags"></span></h3>
+    <div class="tabs" id="md-tabs">
+      <a data-t="ov" class="on">概览</a><a data-t="req">请求体</a><a data-t="msg">Messages</a><a data-t="ev">上游事件</a><a data-t="sse">SSE 输出</a>
+    </div>
+    <div class="pane on" id="md-p-ov"><div class="kv" id="md-kv"></div></div>
+    <div class="pane" id="md-p-req"><pre id="md-req"></pre></div>
+    <div class="pane" id="md-p-msg"><pre id="md-msgs"></pre></div>
+    <div class="pane" id="md-p-ev"><div id="md-ev" style="max-height:56vh;overflow:auto"></div></div>
+    <div class="pane" id="md-p-sse"><pre id="md-sse"></pre></div>
+    <div style="display:flex;justify-content:space-between;margin-top:12px">
+      <button onclick="copyPane()">📋 复制当前页内容</button>
+      <button onclick="modal.classList.remove('on')">关闭</button>
+    </div>
   </div>
 </div>
 <div class="toast" id="toast"></div>
@@ -292,6 +316,7 @@ async function loadDash(){
   $('#cards').innerHTML = [
     ['总请求', fmt(d.total)],['今日请求', fmt(d.today.requests)],
     ['成功率', rate, d.errors? 'yellow':'green'],['错误数', d.errors, d.errors?'red':''],
+    ['断流/截断', d.truncated||0, d.truncated?'red':''],['重试恢复', d.retried||0],
     ['输入 tokens', fmt(d.input_tokens)],['输出 tokens', fmt(d.output_tokens)],
     ['平均延迟', d.avg_latency_ms+'ms'],['平均 TTFT', d.avg_ttft_ms?d.avg_ttft_ms+'ms':'-'],
     ['日志体积', fmtB(d.db_size)],
@@ -313,41 +338,88 @@ async function loadDash(){
 // requests
 let reqOffset=0, reqTotal=0;
 const PAGE=50;
+const FLAG_LABELS={truncated:'断流',retried:'重试',retried_partial:'部分重试',retry_same_account:'同号重试',no_stop_reason:'无stop',client_aborted:'客户端断开',protocol_error:'协议错'};
+const flagTags=f=>(f||'').split(',').filter(Boolean).map(x=>` <span class="tag ${x==='truncated'?'err':'off'}">${esc(FLAG_LABELS[x]||x)}</span>`).join('');
 async function loadReqs(){
-  const model=$('#rq-model').value, ok=$('#rq-ok').value, q=$('#rq-q').value.trim();
-  const u=`/admin/api/requests?limit=${PAGE}&offset=${reqOffset}`+(model?`&model=${encodeURIComponent(model)}`:'')+(ok!==''?`&ok=${ok}`:'')+(q?`&q=${encodeURIComponent(q)}`:'');
+  const model=$('#rq-model').value, ok=$('#rq-ok').value, q=$('#rq-q').value.trim(), flag=$('#rq-flag').value;
+  const u=`/admin/api/requests?limit=${PAGE}&offset=${reqOffset}`+(model?`&model=${encodeURIComponent(model)}`:'')+(ok!==''?`&ok=${ok}`:'')+(q?`&q=${encodeURIComponent(q)}`:'')+(flag?`&flag=${encodeURIComponent(flag)}`:'');
   const d=await (await api(u)).json();
   reqTotal=d.total;
   $('#rq-total').textContent=`共 ${d.total} 条`;
   $('#rq-page').textContent=`第 ${Math.floor(reqOffset/PAGE)+1} / ${Math.max(1,Math.ceil(d.total/PAGE))} 页`;
   $('#rq-prev').disabled=reqOffset<=0;
   $('#rq-next').disabled=reqOffset+PAGE>=d.total;
-  $('#rq-body').innerHTML=d.items.map(r=>`<tr>
+  $('#rq-body').innerHTML=d.items.map(r=>`<tr${r.ok?'':' style="background:#f851490a"'}>
     <td>${r.id}</td><td>${fmtT(r.ts)}</td>
     <td><span class="tag model">${esc(r.resolved_model||r.model)}</span></td>
     <td class="muted">${esc(r.endpoint||'chat')}</td>
     <td>${r.stream?'✓':''}</td>
-    <td><span class="tag ${r.ok?'ok':'err'}">${r.ok?r.status:'ERR'}</span></td>
+    <td><span class="tag ${r.ok?'ok':'err'}">${r.ok?r.status:'ERR'}</span>${flagTags(r.flags)}</td>
     <td>${r.prompt_tokens}</td><td>${r.completion_tokens}</td>
     <td>${r.latency_ms}ms</td><td>${r.ttft_ms??'-'}</td>
     <td>${esc(r.account||'')}</td><td>${esc(r.key_name||'')}</td>
     <td><a onclick="showReq(${r.id})">详情</a></td></tr>`).join('')||'<tr><td colspan=13 class=muted>暂无请求</td></tr>';
 }
 function reqPage(d){reqOffset=Math.max(0,reqOffset+d*PAGE);loadReqs()}
+setInterval(()=>{if($('#p-reqs').classList.contains('on')&&$('#rq-auto').checked)loadReqs().catch(()=>{})},5000);
 async function clearReqs(){
   if(!confirm('确定清空全部请求日志？不可恢复。'))return;
   await api('/admin/api/requests/clear',{method:'POST'});reqOffset=0;loadReqs();toast('已清空');
 }
+
+// request detail modal (tabbed)
+let MD_TAB='ov';
+document.querySelectorAll('#md-tabs a').forEach(a=>a.onclick=()=>{
+  document.querySelectorAll('#md-tabs a').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('#modal .pane').forEach(x=>x.classList.remove('on'));
+  a.classList.add('on');MD_TAB=a.dataset.t;$('#md-p-'+MD_TAB).classList.add('on');
+});
+const pretty=s=>{if(!s)return'';try{return JSON.stringify(JSON.parse(s),null,1)}catch{return s}};
+const EV_LABEL={request:['请求进入',''],attempt:['尝试',''],msg:['上游消息',''],upstream_err:['上游错误','err'],
+  exception:['连接异常','err'],proxy_exception:['代理异常','err'],build_error:['构建失败','err'],
+  failover:['切换账号','warn'],end:['流结束',''],finish:['完成',''],failed:['最终失败','err'],
+  downstream_error:['下游报错','err'],log_cap:['日志截断','warn']};
+function evSummary(e){
+  const d={...e};delete d.i;delete d.t;delete d.ms;
+  if(e.t==='msg'){
+    const p=[];
+    if(d.mid)p.push('mid='+d.mid);
+    if(d.text!=null)p.push('text='+JSON.stringify(d.text).slice(0,220));
+    if(d.think!=null)p.push('think='+JSON.stringify(d.think).slice(0,220));
+    if(d.tool_calls)p.push('tools='+d.tool_calls.map(t=>`${t.name||'?'}(${(t.arguments||'').length}字)`).join(','));
+    if(d.stop)p.push('stop='+d.stop);
+    if(d.usage)p.push('usage='+JSON.stringify(d.usage));
+    return p.join('  ')||'(空帧)';
+  }
+  let s=JSON.stringify(d);
+  return s.length>600?s.slice(0,600)+'…':s;
+}
+function renderEvents(js){
+  let arr=[];try{arr=JSON.parse(js||'[]')}catch{}
+  $('#md-ev').innerHTML=arr.length?arr.map(e=>{
+    const[lb,cl]=EV_LABEL[e.t]||[e.t,''];
+    return `<div class="evt ${cl}"><span class="ms">+${e.ms}ms</span><span class="kt">${esc(lb)}</span><span class="dt">${esc(evSummary(e))}</span></div>`;
+  }).join(''):'<div class="muted" style="padding:10px">无上游事件记录（旧版本请求无此数据）</div>';
+}
 async function showReq(id){
   const r=await (await api('/admin/api/requests/'+id)).json();
   $('#md-id').textContent='#'+r.id;
+  $('#md-flags').innerHTML=flagTags(r.flags);
   $('#md-kv').innerHTML=[['时间',fmtT(r.ts)],['模型',`${esc(r.model)} → ${esc(r.resolved_model)}`],
     ['接口',esc(r.endpoint||'chat')],['状态',r.ok?r.status:'ERR'],['错误',esc(r.error||'-')],['tokens',`${r.prompt_tokens} in / ${r.completion_tokens} out`],
     ['延迟',r.latency_ms+'ms'],['首token',(r.ttft_ms??'-')+'ms'],['客户端',esc(r.client||'-')],['账号',esc(r.account||'-')],['Key',esc(r.key_name||'-')]]
     .map(([k,v])=>`<div class=k>${k}</div><div>${v}</div>`).join('');
-  try{$('#md-msgs').textContent=JSON.stringify(JSON.parse(r.messages_json||'[]'),null,1)}
-  catch{$('#md-msgs').textContent=r.messages_json||''}
+  $('#md-req').textContent=pretty(r.request_json)||'(未记录请求体)';
+  $('#md-msgs').textContent=pretty(r.messages_json)||'(无)';
+  renderEvents(r.events_json);
+  let sse=[];try{sse=JSON.parse(r.sse_json||'[]')}catch{}
+  $('#md-sse').textContent=sse.length?sse.map(s=>'data: '+s).join('\n\n'):'(无 SSE 记录)';
+  document.querySelector('#md-tabs a').click();   // reset to 概览
   $('#modal').classList.add('on');
+}
+function copyPane(){
+  const el=$('#md-p-'+MD_TAB).querySelector('pre,#md-ev,#md-kv');
+  navigator.clipboard.writeText(el?el.textContent:'').then(()=>toast('已复制'));
 }
 
 // accounts

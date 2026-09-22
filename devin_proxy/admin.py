@@ -100,9 +100,11 @@ def make_router(app):
 
     @router.get("/api/requests", dependencies=[Depends(admin_key)])
     def requests(limit: int = 50, offset: int = 0, model: str = None,
-                 ok: int = None, q: str = None, account: str = None):
+                 ok: int = None, q: str = None, account: str = None,
+                 flag: str = None):
         limit = max(1, min(limit, 200))
-        items, total = store.list_requests(limit, offset, model, ok, q, account)
+        items, total = store.list_requests(limit, offset, model, ok, q,
+                                           account, flag)
         return {"items": items, "total": total}
 
     @router.get("/api/requests/{rid}", dependencies=[Depends(admin_key)])

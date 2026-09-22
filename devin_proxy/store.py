@@ -107,6 +107,12 @@ def _conn():
         """)
         _migrate_keys()
         _migrate_requests()
+        _add_columns("requests", {
+            "request_json": "TEXT",
+            "events_json": "TEXT",
+            "sse_json": "TEXT",
+            "flags": "TEXT",
+        })
         _add_columns("api_keys", {
             "models": "TEXT",
             "max_concurrent": "INTEGER DEFAULT 0",
@@ -155,17 +161,20 @@ def _hash(key):
 
 def log_request(model, resolved_model, stream, ok, status, error,
                 prompt_tokens, completion_tokens, latency_ms, ttft_ms,
-                client, key_name, messages_json, account=None, endpoint=None):
+                client, key_name, messages_json, account=None, endpoint=None,
+                request_json=None, events_json=None, sse_json=None, flags=None):
     global _insert_count
     with _lock:
         _conn().execute(
             "INSERT INTO requests (ts,model,resolved_model,stream,ok,status,error,"
             "prompt_tokens,completion_tokens,latency_ms,ttft_ms,client,key_name,"
-            "account,endpoint,messages_json)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "account,endpoint,messages_json,request_json,events_json,sse_json,"
+            "flags)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), model, resolved_model, int(stream), int(ok), status, error,
              prompt_tokens, completion_tokens, latency_ms, ttft_ms, client, key_name,
-             account, endpoint, messages_json))
+             account, endpoint, messages_json, request_json, events_json, sse_json,
+             flags))
         _insert_count += 1
         if _insert_count % 100 == 0:
             _conn().execute(
@@ -175,7 +184,7 @@ def log_request(model, resolved_model, stream, ok, status, error,
         _conn().commit()
 
 
-def _where(model=None, ok=None, q=None, account=None):
+def _where(model=None, ok=None, q=None, account=None, flag=None):
     sql, args = " WHERE 1=1", []
     if model:
         sql += " AND (model=? OR resolved_model=?)"
@@ -186,17 +195,28 @@ def _where(model=None, ok=None, q=None, account=None):
     if ok is not None:
         sql += " AND ok=?"
         args.append(int(ok))
+    if flag:
+        sql += " AND flags LIKE ?"
+        args.append(f"%{flag}%")
     if q:
-        sql += " AND (error LIKE ? OR client LIKE ? OR key_name LIKE ? OR account LIKE ?)"
-        args += [f"%{q}%"] * 4
+        sql += (" AND (error LIKE ? OR client LIKE ? OR key_name LIKE ?"
+                " OR account LIKE ? OR flags LIKE ?)")
+        args += [f"%{q}%"] * 5
     return sql, args
 
 
-def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None):
-    where, args = _where(model, ok, q, account)
+_REQ_LIST_COLS = ("id,ts,model,resolved_model,stream,ok,status,error,"
+                  "prompt_tokens,completion_tokens,latency_ms,ttft_ms,client,"
+                  "key_name,account,endpoint,flags")
+
+
+def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None,
+                  flag=None):
+    where, args = _where(model, ok, q, account, flag)
     with _lock:
         rows = _conn().execute(
-            f"SELECT * FROM requests{where} ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
+            " ORDER BY id DESC LIMIT ? OFFSET ?",
             args + [limit, offset]).fetchall()
         total = _conn().execute(
             f"SELECT COUNT(*) c FROM requests{where}", args).fetchone()["c"]
@@ -243,10 +263,18 @@ def stats_overview():
                  SUM(prompt_tokens+completion_tokens) tok, SUM(1-ok) errs
           FROM requests WHERE ts>=? GROUP BY h ORDER BY h""",
           (since, since)).fetchall()
+        truncated = c.execute(
+            "SELECT COUNT(*) c FROM requests WHERE flags LIKE '%truncated%'",
+        ).fetchone()["c"]
+        retried = c.execute(
+            "SELECT COUNT(*) c FROM requests WHERE flags LIKE '%retried%'",
+        ).fetchone()["c"]
         db_size = os.path.getsize(_DB_PATH) if os.path.exists(_DB_PATH) else 0
     return {
         "total": row["total"] or 0,
         "errors": (row["total"] or 0) - (row["ok_count"] or 0),
+        "truncated": truncated,
+        "retried": retried,
         "input_tokens": row["in_tok"] or 0,
         "output_tokens": row["out_tok"] or 0,
         "avg_latency_ms": round(row["avg_lat"] or 0),

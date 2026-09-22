@@ -1,6 +1,7 @@
 """FastAPI app: OpenAI /v1/chat/completions + /v1/responses -> Devin Cascade."""
 import hashlib
 import json
+import os
 import secrets
 import threading
 import time
@@ -44,6 +45,151 @@ KNOWN_UIDS = [
 _EFFORT_SUFFIX = {"minimal": "none", "low": "low", "medium": "medium",
                   "high": "high"}
 _UID_SUFFIXES = {"none", "low", "medium", "high", "xhigh", "max"}
+
+# Upstream read timeout: Devin's agent stream can pause for a long time while
+# the server runs tools. 300s was too short and looked like a silent 断流.
+_READ_TIMEOUT = float(os.environ.get("DEVIN_PROXY_READ_TIMEOUT", "1800"))
+# Per-blob char caps for the per-request debug record (request body /
+# upstream event timeline / outbound SSE frames).
+_LOG_CAP = int(os.environ.get("DEVIN_PROXY_LOG_CAP", "200000"))
+_EV_CAP = 12000          # one event / one SSE payload
+_REQ_CAP = 60000         # raw request body
+
+try:
+    import h2  # noqa: F401
+    _HTTP2 = True
+except Exception:
+    _HTTP2 = False
+
+
+class ReqLog:
+    """Per-request debug recorder: request body, upstream event timeline and
+    every SSE payload sent downstream. Attached to request.state and persisted
+    into the requests row by _record. Never raises."""
+
+    def __init__(self, body=None):
+        self.t0 = time.perf_counter()
+        self.events, self.sse, self.flags = [], [], set()
+        self.request_json = None
+        self._ev_sz = self._sse_sz = 0
+        self._ev_full = self._sse_full = False
+        if body is not None:
+            try:
+                self.request_json = json.dumps(
+                    body, ensure_ascii=False, default=str)[:_REQ_CAP]
+            except Exception:
+                pass
+
+    def _ms(self):
+        return int((time.perf_counter() - self.t0) * 1000)
+
+    def ev(self, kind, **data):
+        """Append an upstream/pipeline event to the timeline."""
+        try:
+            if self._ev_full:
+                return
+            e = {"i": len(self.events) + 1, "t": kind, "ms": self._ms()}
+            e.update(data)
+            s = json.dumps(e, ensure_ascii=False, default=str)
+            if len(s) > _EV_CAP:
+                for k, v in list(e.items()):
+                    vs = json.dumps(v, ensure_ascii=False, default=str)
+                    if len(vs) > 4000:
+                        e[k] = vs[:4000] + "…"
+                e["data_truncated"] = True
+                s = json.dumps(e, ensure_ascii=False, default=str)
+            if self._ev_sz + len(s) > _LOG_CAP:
+                self.events.append({"i": len(self.events) + 1, "t": "log_cap",
+                                    "ms": self._ms(),
+                                    "note": "event log size cap reached"})
+                self._ev_full = True
+                return
+            self.events.append(e)
+            self._ev_sz += len(s)
+        except Exception:
+            pass
+
+    def out(self, payload):
+        """Record one outbound SSE frame (or the final response body).
+        Returns the payload so `yield rl.out(s)` stays transparent."""
+        try:
+            if self._sse_full:
+                return payload
+            s = payload if isinstance(payload, str) else json.dumps(
+                payload, ensure_ascii=False, default=str)
+            s = s.strip()
+            if s.startswith("data:"):
+                s = s[5:].strip()
+            if len(s) > _EV_CAP:
+                s = s[:_EV_CAP] + "…"
+            if self._sse_sz + len(s) > _LOG_CAP:
+                self.sse.append("… output log size cap reached …")
+                self._sse_full = True
+                return payload
+            self.sse.append(s)
+            self._sse_sz += len(s)
+        except Exception:
+            pass
+        return payload
+
+    def flag(self, f):
+        try:
+            self.flags.add(f)
+        except Exception:
+            pass
+
+    def _dump(self, items):
+        if not items:
+            return None
+        try:
+            return json.dumps(items, ensure_ascii=False, default=str)
+        except Exception:
+            return None
+
+    def events_dump(self):
+        return self._dump(self.events)
+
+    def sse_dump(self):
+        return self._dump(self.sse)
+
+    def flags_str(self):
+        return ",".join(sorted(self.flags)) or None
+
+
+def reqlog_for(request, body=None):
+    """Get (or lazily create) the ReqLog for this request."""
+    rl = getattr(request.state, "reqlog", None)
+    if rl is None:
+        rl = ReqLog(body)
+        request.state.reqlog = rl
+        try:
+            rl.ev("request", ua=(request.headers.get("user-agent") or "")[:160],
+                  path=str(request.url.path))
+        except Exception:
+            pass
+    return rl
+
+
+def _msg_summary(ev):
+    """GetChatMessageResponse -> compact dict for the event timeline."""
+    d = {}
+    if ev.message_id:
+        d["mid"] = ev.message_id
+    if ev.delta_text:
+        d["text"] = ev.delta_text
+    if ev.delta_thinking:
+        d["think"] = ev.delta_thinking
+    if len(ev.delta_tool_calls):
+        d["tool_calls"] = [{"id": tc.id, "name": tc.name,
+                            "arguments": tc.arguments}
+                           for tc in ev.delta_tool_calls]
+    if ev.stop_reason:
+        d["stop"] = int(ev.stop_reason)
+    if ev.HasField("usage"):
+        d["usage"] = upstream.extract_usage(ev)
+    if ev.thinking_signature:
+        d["think_sig"] = ev.thinking_signature[:200]
+    return d
 
 
 class ToolAgg:
@@ -98,7 +244,12 @@ def create_app(api_key=None):
     imported = pool.import_detected(creds_mod.detect_all())
     app.state.pool = pool
     app.state.proxy_key = api_key
-    app.state.http = httpx.Client(timeout=httpx.Timeout(300, connect=15))
+    app.state.http = httpx.Client(
+        timeout=httpx.Timeout(connect=15, read=_READ_TIMEOUT, write=60,
+                              pool=30),
+        http2=_HTTP2,
+        limits=httpx.Limits(max_keepalive_connections=20,
+                            keepalive_expiry=120))
     app.state.key_slots = {}
     app.state.slot_lock = threading.Lock()
     if imported:
@@ -175,6 +326,7 @@ def create_app(api_key=None):
     def _record(request, body, model, ok, status, error, usage, t0, ttft,
                 account=None, endpoint=None):
         try:
+            rl = reqlog_for(request, body)
             msgs = body.get("messages") or body.get("input") or []
             store.log_request(
                 model=body.get("model"), resolved_model=model,
@@ -188,6 +340,10 @@ def create_app(api_key=None):
                 key_name=getattr(request.state, "key_name", None),
                 account=account, endpoint=endpoint,
                 messages_json=json.dumps(msgs, ensure_ascii=False)[:20000],
+                request_json=rl.request_json,
+                events_json=rl.events_dump(),
+                sse_json=rl.sse_dump(),
+                flags=rl.flags_str(),
             )
         except Exception:
             pass
@@ -300,63 +456,115 @@ def create_app(api_key=None):
             or body.get("max_completion_tokens"),
             temperature=body.get("temperature"), top_p=body.get("top_p"))
 
-    def iter_chat(body, session_key=None, force_account=None):
+    def iter_chat(body, session_key=None, force_account=None, stream=True,
+                  log=None):
         """Failover driver. Yields (acct, event). Terminal upstream error is
-        yielded as (acct_or_None, dict). On success returns quietly."""
+        yielded as (acct_or_None, dict). On success returns quietly.
+
+        stream=False buffers each attempt's events instead of forwarding them
+        live, so a mid-stream failure can be retried on the next account —
+        safe because nothing has reached the client yet."""
         model = resolve_model(body)
         want = {m for m in (body.get("model"), model) if m}
         tried, last_err = set(), {"message": "no accounts configured",
-                                  "http_error": 503}
+                                  "http_error": 503, "kind": "no_account"}
         force_id = force_account.id if force_account else None
         attempts = 1 if force_account else accounts_mod.MAX_ATTEMPTS
-        for _ in range(attempts):
+        transient_retries = 0       # 断流/异常允许重试同一账号（连接闪断≠账号坏）
+        for attempt in range(1, attempts + 1):
             acct = pool.pick(session_key, exclude=tried, force_id=force_id,
                              models=want)
             if acct is None:
-                if pool.accounts():
+                if not tried and pool.accounts():
                     last_err = {"message": "no eligible account (all busy, "
                                 "cooling down, or model-restricted)",
-                                "http_error": 503}
+                                "http_error": 503, "kind": "no_account"}
                 break
             tried.add(acct.id)
             force_id = None
+            if log:
+                log.ev("attempt", n=attempt, account=acct.display(),
+                       account_id=acct.id)
             try:
                 req = build_request(body, model, acct)
             except Exception as e:
                 last_err = {"message": f"{acct.display()}: {e}",
                             "http_error": getattr(
-                                getattr(e, "response", None), "status_code", 502)}
+                                getattr(e, "response", None), "status_code",
+                                502),
+                            "kind": "build_error"}
+                if log:
+                    log.ev("build_error", account=acct.display(),
+                           error=str(e)[:500])
                 pool.release(acct)
                 pool.mark_fail(acct, last_err)
                 continue
-            got_content, terminal = False, None
+            got_content, saw_stop, terminal, buf = False, False, None, []
             try:
                 for ev in upstream.stream_chat(
                         app.state.http, acct.api_server_url, acct.token, req):
                     if isinstance(ev, dict):
+                        if log:
+                            if ev.get("kind") == "truncated":
+                                log.flag("truncated")
+                            log.ev("upstream_err", account=acct.display(),
+                                   detail=ev)
                         if not got_content:
                             terminal = ev
                             break
-                        pool.mark_fail(acct, ev)
-                        yield acct, ev
-                        return
+                        if stream:
+                            pool.mark_fail(acct, ev)
+                            yield acct, ev
+                            return
+                        terminal = ev       # buffered: retry on next account
+                        break
                     got_content = True
-                    yield acct, ev
+                    if ev.stop_reason:
+                        saw_stop = True
+                    if log:
+                        log.ev("msg", **_msg_summary(ev))
+                    if stream:
+                        yield acct, ev
+                    else:
+                        buf.append(ev)
             except Exception as e:
-                if got_content:
-                    err = {"message": str(e)}
-                    pool.mark_fail(acct, err)
-                    yield acct, err
+                e2 = {"kind": "exception", "message": str(e)}
+                if log:
+                    log.ev("exception", account=acct.display(),
+                           error=repr(e)[:800])
+                if got_content and stream:
+                    pool.mark_fail(acct, e2)
+                    yield acct, e2
                     return
-                terminal = {"message": str(e)}
+                terminal = e2
             finally:
                 pool.release(acct)
             if terminal is None:
+                if log:
+                    if got_content and not saw_stop:
+                        log.flag("no_stop_reason")
+                    log.ev("end", account=acct.display(), clean=True,
+                           stop_reason=saw_stop)
+                for ev in buf:
+                    yield acct, ev
                 pool.mark_ok(acct)
                 pool.pin(session_key, acct)
                 return
             last_err = terminal
+            if terminal.get("kind") in ("truncated", "exception",
+                                        "protocol_error") \
+                    and transient_retries < 2 and attempt < attempts:
+                transient_retries += 1
+                tried.discard(acct.id)      # transient cut: same acct may retry
+                if log:
+                    log.flag("retry_same_account")
+            if log:
+                log.ev("failover", account=acct.display(), detail=terminal,
+                       had_content=got_content)
+                log.flag("retried_partial" if got_content else "retried")
             pool.mark_fail(acct, terminal)
+        if log:
+            log.ev("failed", detail=last_err)
         yield None, last_err
 
     def oai_usage(u):
@@ -381,14 +589,32 @@ def create_app(api_key=None):
 
     @app.post("/v1/chat/completions", dependencies=[Depends(check_key)])
     async def chat(request: Request):
-        body = await request.json()
         t0 = time.perf_counter()
+        try:
+            body = await request.json()
+        except Exception as e:
+            reqlog_for(request, {})
+            _record(request, {}, "", False, 400, f"invalid JSON body: {e}",
+                    None, t0, None, endpoint="chat")
+            raise HTTPException(400, f"invalid JSON body: {e}")
+        if not isinstance(body, dict):
+            reqlog_for(request, {"raw": str(body)[:2000]})
+            _record(request, {}, "", False, 400, "body must be a JSON object",
+                    None, t0, None, endpoint="chat")
+            raise HTTPException(400, "request body must be a JSON object")
+        reqlog_for(request, body)
         skey = session_key_for(request, body)
         model = resolve_model(body)
         if not model_allowed(request, body.get("model"), model):
+            _record(request, body, model, False, 403,
+                    "model not permitted for this key", None, t0, None,
+                    endpoint="chat")
             raise HTTPException(403, "model not permitted for this key")
         release = acquire_key_slot(request)
         if release is None:
+            _record(request, body, model, False, 429,
+                    "key concurrency limit reached", None, t0, None,
+                    endpoint="chat")
             raise HTTPException(429, "key concurrency limit reached")
         if body.get("stream"):
             return StreamingResponse(
@@ -403,10 +629,12 @@ def create_app(api_key=None):
             release()
 
     def _collect(request, body, model, skey, t0, force_account=None):
+        rl = reqlog_for(request, body)
         texts, think, agg = [], [], ToolAgg()
         finish, usage, rid = "stop", None, f"chatcmpl-{uuid.uuid4().hex[:24]}"
         err, acct_name = None, None
-        for acct, ev in iter_chat(body, skey, force_account):
+        for acct, ev in iter_chat(body, skey, force_account, stream=False,
+                                  log=rl):
             if acct:
                 acct_name = acct.display()
             if isinstance(ev, dict):
@@ -447,11 +675,13 @@ def create_app(api_key=None):
                              "finish_reason": finish}]}
         if usage:
             resp["usage"] = oai_usage(usage)
+        rl.out(resp)
         _record(request, body, model, True, 200, None, usage, t0, None,
                 account=acct_name, endpoint="chat")
         return resp
 
     def _sse_stream(request, body, model, skey, t0, force_account=None):
+        rl = reqlog_for(request, body)
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
         rid, created = f"chatcmpl-{uuid.uuid4().hex[:24]}", int(time.time())
         agg, finish, usage, err = ToolAgg(), "stop", None, None
@@ -466,12 +696,13 @@ def create_app(api_key=None):
             return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
         try:
-            for acct, ev in iter_chat(body, skey, force_account):
+            for acct, ev in iter_chat(body, skey, force_account, stream=True,
+                                      log=rl):
                 if acct:
                     acct_name = acct.display()
                 if not started:
                     started = True
-                    yield chunk({"role": "assistant"})
+                    yield rl.out(chunk({"role": "assistant"}))
                 if isinstance(ev, dict):
                     err = ev
                     break
@@ -480,9 +711,9 @@ def create_app(api_key=None):
                 if ev.message_id:
                     rid = ev.message_id
                 if ev.delta_text:
-                    yield chunk({"content": ev.delta_text})
+                    yield rl.out(chunk({"content": ev.delta_text}))
                 if ev.delta_thinking:
-                    yield chunk({"reasoning_content": ev.delta_thinking})
+                    yield rl.out(chunk({"reasoning_content": ev.delta_thinking}))
                 for tc in ev.delta_tool_calls:
                     fed = agg.feed(tc)
                     if fed:
@@ -492,35 +723,49 @@ def create_app(api_key=None):
                             fn["name"] = call["name"]
                         if delta:
                             fn["arguments"] = delta
-                        yield chunk({"tool_calls": [
+                        yield rl.out(chunk({"tool_calls": [
                             {"index": idx, "id": call["id"],
-                             "type": "function", "function": fn}]})
+                             "type": "function", "function": fn}]}))
                 if ev.stop_reason:
                     finish = upstream.STOP_REASONS.get(ev.stop_reason, "stop")
                 if ev.HasField("usage"):
                     usage = upstream.extract_usage(ev)
+        except GeneratorExit:
+            rl.flag("client_aborted")
+            rl.ev("client_aborted")
+            _record(request, body, model, False, 499,
+                    "client disconnected mid-stream", usage, t0, ttft,
+                    account=acct_name, endpoint="chat")
+            raise
         except Exception as e:
-            err = {"message": str(e)}
+            err = {"kind": "proxy_error", "message": str(e)}
+            rl.ev("proxy_exception", error=repr(e)[:800])
         if not started:
-            yield chunk({"role": "assistant"})
+            yield rl.out(chunk({"role": "assistant"}))
 
         if err:
-            yield chunk({}, "stop")
-            yield "data: " + json.dumps(
+            # Surface the failure as an SSE error object (what OpenAI clients
+            # expect) — never a fake finish_reason:"stop", which made upstream
+            # 断流 look like a normal completion and hid the real error.
+            kind = err.get("kind") or "upstream_error"
+            yield rl.out("data: " + json.dumps(
                 {"error": {"message": err.get("message", "upstream error"),
-                           "type": "server_error"}}) + "\n\n"
+                           "type": "server_error", "code": kind}},
+                ensure_ascii=False) + "\n\n")
+            rl.ev("downstream_error", detail=err)
             _record(request, body, model, False, err.get("http_error", 502),
                     err.get("message"), usage, t0, ttft,
                     account=acct_name, endpoint="chat")
         else:
             if agg.order and finish == "stop":
                 finish = "tool_calls"
-            yield chunk({}, finish)
+            rl.ev("finish", finish_reason=finish)
+            yield rl.out(chunk({}, finish))
             if include_usage and usage:
-                yield f'data: {{"id": "{rid}", "object": "chat.completion.chunk", "created": {created}, "model": "{model}", "choices": [], "usage": {json.dumps(oai_usage(usage))}}}\n\n'
+                yield rl.out(f'data: {{"id": "{rid}", "object": "chat.completion.chunk", "created": {created}, "model": "{model}", "choices": [], "usage": {json.dumps(oai_usage(usage))}}}\n\n')
             _record(request, body, model, True, 200, None, usage, t0, ttft,
                     account=acct_name, endpoint="chat")
-        yield "data: [DONE]\n\n"
+        yield rl.out("data: [DONE]\n\n")
 
     # ---------- Responses API ----------
 
@@ -528,10 +773,25 @@ def create_app(api_key=None):
 
     @app.post("/v1/responses", dependencies=[Depends(check_key)])
     async def create_response(request: Request):
-        body = await request.json()
         t0 = time.perf_counter()
+        try:
+            body = await request.json()
+        except Exception as e:
+            reqlog_for(request, {})
+            _record(request, {}, "", False, 400, f"invalid JSON body: {e}",
+                    None, t0, None, endpoint="responses")
+            raise HTTPException(400, f"invalid JSON body: {e}")
+        if not isinstance(body, dict):
+            reqlog_for(request, {"raw": str(body)[:2000]})
+            _record(request, {}, "", False, 400, "body must be a JSON object",
+                    None, t0, None, endpoint="responses")
+            raise HTTPException(400, "request body must be a JSON object")
+        reqlog_for(request, body)
         release = acquire_key_slot(request)
         if release is None:
+            _record(request, body, resolve_model(body), False, 429,
+                    "key concurrency limit reached", None, t0, None,
+                    endpoint="responses")
             raise HTTPException(429, "key concurrency limit reached")
         return await run_in_threadpool(
             responses_mod.handle, request, body, t0,

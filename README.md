@@ -124,11 +124,20 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
 `DEVIN_PROXY_DB`):
 
 - **仪表盘** — request/token totals, success rate, avg latency & TTFT,
-  24 h chart, per-model stats
+  24 h chart, per-model stats, truncated-stream & retry counters
 - **请求日志** — every request logged (model, endpoint, account, tokens,
-  latency, status, caller key, messages); filter by model/status/text/
+  latency, status, caller key, messages); filter by model/status/flag/text/
   account, paginate, inspect detail, or purge. Retention capped by
-  `DEVIN_PROXY_MAX_ROWS` (default 50000)
+  `DEVIN_PROXY_MAX_ROWS` (default 50000). Each row also stores the raw
+  request body, a timestamped **upstream event timeline** (every delta /
+  tool-call / stop_reason / trailer error / failover) and **every SSE
+  payload sent to the client** — open 详情 → 上游事件 / SSE 输出 to
+  debug dropped streams. Size capped by `DEVIN_PROXY_LOG_CAP`
+  (default 200 KB per blob)
+- **断流检测** — a Connect stream that ends without the required
+  end-of-stream trailer is logged `truncated` and surfaced to the client
+  as an SSE error (never a fake `stop`); non-streaming requests
+  transparently retry a mid-stream failure on the next account
 - **账号池** — multi-account management (above): OAuth login, manual add,
   local import, enable/disable/delete/test, session-pin list + unbind
 - **模型** — all callable model uids/aliases + per-model usage stats
