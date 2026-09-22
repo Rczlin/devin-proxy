@@ -284,6 +284,26 @@ store.meta_set("default_effort", "")
 r = tc.patch("/admin/api/models/settings", headers=H,
              json={"family_efforts": {"swe-2": "bogus"}})
 assert r.status_code == 400
+# request-specified effort beats every configured default; a variant
+# suffix pinned in the model name is never rewritten either
+rm = app.state.resolve_model
+store.meta_set("default_effort", "low")
+store.meta_set("family_efforts", '{"claude-sonnet-5": "high"}')
+assert rm({"model": "claude-sonnet-5"}) == "claude-sonnet-5-high"  # fam dflt
+assert rm({"model": "claude-sonnet-5", "reasoning_effort": "medium"}) \
+    == "claude-sonnet-5-medium"
+assert rm({"model": "claude-sonnet-5",
+           "reasoning": {"effort": "medium"}}) == "claude-sonnet-5-medium"
+assert rm({"model": "claude-sonnet-5", "reasoning": "medium"}) \
+    == "claude-sonnet-5-medium"                        # bare string effort
+assert rm({"model": "claude-sonnet-5", "reasoning": True}) \
+    == "claude-sonnet-5-high"                          # junk -> ignored
+assert rm({"model": "claude-sonnet-5-medium"}) \
+    == "claude-sonnet-5-medium"                        # pinned variant
+assert rm({"model": "claude-sonnet-5",
+           "reasoning_effort": "max"}) == "claude-sonnet-5-high"  # no max var
+store.meta_set("default_effort", "")
+store.meta_set("family_efforts", "{}")
 tc.patch("/admin/api/models/settings", headers=H,
          json={"default_model": "", "default_effort": "", "aliases": ""})
 print("settings OK")
