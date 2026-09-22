@@ -16,9 +16,8 @@ def main():
     args = p.parse_args()
 
     app = create_app(api_key=args.api_key)
-    creds = app.state.creds
-    print(f"devin-proxy -> {creds.api_server_url}")
-    print(f"credentials:  {creds.source}")
+    s = app.state.pool.summary()
+    print(f"devin-proxy   accounts: {s['total']} ({s['ready']} ready)")
     print(f"OpenAI base:  http://{args.host}:{args.port}/v1")
     print(f"admin UI:     http://{args.host}:{args.port}/admin")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")

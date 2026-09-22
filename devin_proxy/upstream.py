@@ -46,14 +46,16 @@ def build_metadata(api_key, user_jwt=""):
     )
 
 
-_jwt_cache = {"jwt": "", "exp": 0.0}
+_jwt_cache = {}          # (base_url, api_key) -> {"jwt": str, "exp": float}
 _jwt_lock = threading.Lock()
 
 
-def get_user_jwt(client, base_url, api_key):
+def get_user_jwt(client, base_url, api_key, force_refresh=False):
+    key = (base_url, api_key)
     with _jwt_lock:
-        if _jwt_cache["jwt"] and _jwt_cache["exp"] > time.time() + 60:
-            return _jwt_cache["jwt"]
+        cached = _jwt_cache.get(key)
+        if not force_refresh and cached and cached["exp"] > time.time() + 60:
+            return cached["jwt"]
         req = proto.GetUserJwtRequest(metadata=build_metadata(api_key))
         resp = client.post(
             base_url + JWT_PATH,
@@ -74,17 +76,25 @@ def get_user_jwt(client, base_url, api_key):
             exp = json.loads(base64.urlsafe_b64decode(payload)).get("exp", exp)
         except Exception:
             pass
-        _jwt_cache.update(jwt=out.jwt, exp=exp)
+        _jwt_cache[key] = {"jwt": out.jwt, "exp": exp}
         return out.jwt
 
 
-def make_prompt(role, text="", tool_call_id=None, tool_calls=None, images=None):
+def clear_jwt(base_url, api_key):
+    with _jwt_lock:
+        _jwt_cache.pop((base_url, api_key), None)
+
+
+def make_prompt(role, text="", tool_call_id=None, tool_calls=None, images=None,
+                thinking=None):
     msg = proto.ChatMessagePrompt(
         source=SOURCE[role],
         prompt=text or "",
         num_tokens=max(1, len(text or "") // 4),
         is_user_input=1,
     )
+    if thinking:
+        msg.thinking = thinking
     if tool_call_id:
         msg.tool_call_id = tool_call_id
     for tc in tool_calls or []:
