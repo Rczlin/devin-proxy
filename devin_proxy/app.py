@@ -405,10 +405,12 @@ def create_app(api_key=None):
                 for t in tools or [] if t.get("type") == "function"]
 
     def resolve_model(body):
-        uid = (models_mod.resolve(body.get("model"))
+        name = body.get("model")
+        uid = (models_mod.resolve(name)
                or models_mod.default_uid())
         effort = ((body.get("reasoning") or {}).get("effort")
-                  or body.get("reasoning_effort"))
+                  or body.get("reasoning_effort")
+                  or models_mod.auto_effort(name))
         return models_mod.apply_effort(uid, effort)
 
     def build_request(body, model, acct):
@@ -544,29 +546,53 @@ def create_app(api_key=None):
 
     # ---------- endpoints ----------
 
+    def _variant_obj(m, created):
+        return {
+            "id": m["uid"], "object": "model", "created": created,
+            "owned_by": m["vendor"], "display_name": m["label"],
+            "family": m["family"], "effort": m["effort"],
+            "context_window": m["context"],
+            "max_output_tokens": m["max_output"],
+            "credit_cost": m["credit"],
+            "cost_summary": m.get("cost_summary"),
+            "alias": m.get("alias"),
+            "capabilities": {"vision": bool(m["images"]),
+                             "thinking": bool(m["thinking"]),
+                             "tools": True},
+            "source": ("remote" if m["remote_accounts"]
+                       else "url" if m["url"] else "builtin")}
+
     @app.get("/v1/models", dependencies=[Depends(check_key)])
     def list_models(request: Request):
+        """One entry per model family (id = family name; the effort is
+        picked via reasoning.effort). ?variants=1 lists every variant
+        uid instead."""
         allowed = _key_models(request)
         models_mod.maybe_refresh(app.state.http, pool)
         created = int(models_mod.sync_info()["ts"] or 0)
+        full = request.query_params.get("variants") in ("1", "true", "all")
         data = []
-        for e in models_mod.entries():
-            if allowed is not None and e["uid"] not in allowed:
+        for f in models_mod.grouped():
+            if allowed is not None and not (
+                    {f["prefix"]} | {m["uid"] for m in f["models"]}
+            ) & allowed:
                 continue
-            data.append({
-                "id": e["uid"], "object": "model", "created": created,
-                "owned_by": e["vendor"], "display_name": e["label"],
-                "family": e["family"], "effort": e["effort"],
-                "context_window": e["context"],
-                "max_output_tokens": e["max_output"],
-                "credit_cost": e["credit"],
-                "cost_summary": e.get("cost_summary"),
-                "alias": e.get("alias"),
-                "capabilities": {"vision": bool(e["images"]),
-                                 "thinking": bool(e["thinking"]),
-                                 "tools": True},
-                "source": ("remote" if e["remote_accounts"]
-                           else "url" if e["url"] else "builtin")})
+            if full:
+                data.extend(_variant_obj(m, created) for m in f["models"])
+                continue
+            want = f.get("default") or "medium"
+            main = (next((m for m in f["models"]
+                          if m["effort"] == want), None)
+                    or next((m for m in f["models"]
+                             if m["effort"] == "medium"), None)
+                    or f["models"][0])
+            o = _variant_obj(main, created)
+            o["id"] = f["prefix"]
+            o["display_name"] = f["label"]
+            o["effort"] = None
+            o["efforts"] = [m["effort"] for m in f["models"]
+                            if m["effort"]]
+            data.append(o)
         for a, t in models_mod.aliases().items():
             if allowed is None or a in allowed:
                 data.append({"id": a, "object": "model", "created": 0,

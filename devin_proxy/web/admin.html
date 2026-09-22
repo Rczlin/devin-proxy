@@ -211,12 +211,19 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
         <div class="row" style="margin-top:10px">
           <span class="muted">默认模型</span>
           <select id="default-model" style="min-width:230px"></select>
+          <span class="muted">默认思考</span>
+          <select id="default-effort">
+            <option value="">自动</option><option value="none">无思考</option>
+            <option value="low">低</option><option value="medium">中</option>
+            <option value="high">高</option><option value="xhigh">超高</option>
+            <option value="max">满</option>
+          </select>
           <span class="muted">远端目录 URL</span>
           <input id="models-url" placeholder="JSON（可选）" style="flex:1;min-width:200px;font-family:var(--mono)">
           <button onclick="saveModelSettings()">保存</button>
         </div>
         <div class="row" style="margin-top:10px">
-          <textarea id="alias-edit" placeholder="自定义别名，每行 alias=uid（随上方「保存」生效）" style="min-height:40px;flex:1"></textarea>
+          <textarea id="alias-edit" placeholder="自定义别名，每行 alias=uid 或 alias=uid@effort（如 opus=claude-opus-5@low，随上方「保存」生效）" style="min-height:40px;flex:1"></textarea>
         </div>
       </div>
       <div id="model-fams"></div>
@@ -583,12 +590,20 @@ async function loadModels(){
     +d.models.map(m=>`<option${m===d.default_model?' selected':''}>${esc(m)}</option>`).join('')
     +(d.default_model&&!d.models.includes(d.default_model)?`<option selected>${esc(d.default_model)}</option>`:'');
   if(!d.default_model)sel.value='';
+  $('#default-effort').value=d.default_effort||'';
   $('#alias-edit').value=Object.entries(d.user_aliases||{}).map(([a,t])=>`${a}=${t}`).join('\n');
-  $('#model-fams').innerHTML=d.families.map(f=>
-    `<div class="panel"><h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
+  $('#model-fams').innerHTML=d.families.map(f=>{
+    const prefer=f.default||'medium';
+    const main=f.models.find(m=>m.effort===prefer)||f.models.find(m=>m.effort==='medium')||f.models[0];
+    const rest=f.models.filter(m=>m!==main);
+    return `<div class="panel"><h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
       <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
       <span class="muted" style="float:right">${f.models.length} 变体</span></h3>
-      <div class="mgrid">${f.models.map(modelChip).join('')}</div></div>`).join('')
+      <div class="mgrid">${modelChip(main)}</div>
+      ${rest.length?`<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">展开其余 ${rest.length} 个变体</summary>
+        <div class="mgrid" style="margin-top:8px">${rest.map(modelChip).join('')}</div></details>`:''}
+      </div>`;
+  }).join('')
     ||'<div class="panel muted">目录为空 — 点「立即同步」从上游账号拉取（或配置远端目录 URL）</div>';
   $('#alias-list').innerHTML=Object.entries(d.aliases||{}).map(([a,t])=>
     `<button style="margin:0 6px 8px 0" onclick="pickModel('${esc(a)}')" title="→ ${esc(t)}">${esc(a)} <span class="muted">→ ${esc(t)}</span></button>`).join('')
@@ -612,6 +627,7 @@ async function syncModels(){
 async function saveModelSettings(){
   const d=await (await api('/admin/api/models/settings',{method:'PATCH',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({default_model:$('#default-model').value,
+      default_effort:$('#default-effort').value,
       models_url:$('#models-url').value.trim(),aliases:$('#alias-edit').value})})).json();
   toast('已保存 · 默认 '+(d.default_model||'自动'));loadModels().catch(()=>{});
 }
