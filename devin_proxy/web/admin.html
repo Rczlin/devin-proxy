@@ -90,6 +90,9 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 .evt .dt{color:var(--text);word-break:break-all;white-space:pre-wrap;min-width:0}
 .evt.err .kt{color:var(--red)}.evt.err .dt{color:#ffa198}
 .evt.warn .kt{color:var(--yellow)}
+.mgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:8px}
+.mchip{text-align:left;padding:9px 11px;height:auto;white-space:normal;line-height:1.4}
+.mchip .tag{margin:2px 2px 0 0}
 @media(max-width:760px){.side{width:56px}.side h1 span:last-child,.nav a span{display:none}.nav a{justify-content:center}}
 </style>
 </head>
@@ -198,10 +201,28 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
     </section>
 
     <section class="page" id="p-models">
-      <h2>模型</h2>
+      <h2>模型 <span class="muted" id="model-count"></span></h2>
       <div class="panel">
-        <h3>可用模型 uid（点击填入 Playground）</h3>
-        <div id="model-list"></div>
+        <h3>目录同步 <span class="muted">上游 GetCliModelConfigs · 可选远端 JSON</span></h3>
+        <div class="row">
+          <button class="primary" id="sync-btn" onclick="syncModels()">立即同步</button>
+          <span class="muted" id="sync-info"></span>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <span class="muted">默认模型</span>
+          <select id="default-model" style="min-width:230px"></select>
+          <span class="muted">远端目录 URL</span>
+          <input id="models-url" placeholder="JSON（可选）" style="flex:1;min-width:200px;font-family:var(--mono)">
+          <button onclick="saveModelSettings()">保存</button>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <textarea id="alias-edit" placeholder="自定义别名，每行 alias=uid（随上方「保存」生效）" style="min-height:40px;flex:1"></textarea>
+        </div>
+      </div>
+      <div id="model-fams"></div>
+      <div class="panel">
+        <h3>别名（点击填入 Playground）</h3>
+        <div id="alias-list"></div>
       </div>
       <div class="panel">
         <h3>使用统计</h3>
@@ -526,22 +547,85 @@ async function clearSessions(){
 }
 
 // models
+const EFF={none:'无思考',low:'低',medium:'中',high:'高',xhigh:'超高',max:'满'};
+function modelChip(m){
+  const tags=[
+    m.effort?`<span class="tag off">${esc(EFF[m.effort]||m.effort)}</span>`:'',
+    m.context?`<span class="tag off">${fmt(m.context)} ctx</span>`:'',
+    m.images?'<span class="tag model" title="支持图像输入">👁 图像</span>':'',
+    m.thinking?'<span class="tag model" title="支持思考">🧠 思考</span>':'',
+    m.alias?`<span class="tag model" title="上游别名">@${esc(m.alias)}</span>`:'',
+    m.credit!=null?`<span class="tag off" title="${esc(m.cost_summary||'credit 消耗倍率')}">×${m.credit}</span>`:'',
+    m.cost_summary?`<span class="tag off" title="${esc(m.cost_summary)}">💲 ${esc(m.cost_summary.split(' · ')[0].replace(/ \/ .*/,''))}/1M</span>`:'',
+    m.remote_accounts?`<span class="tag ok" title="广告此模型的上游账号数">${m.remote_accounts} 账号</span>`:'',
+    m.url?'<span class="tag model">URL</span>':'',
+  ].filter(Boolean).join('');
+  return `<button class="mchip" onclick="pickModel('${esc(m.uid)}')" title="${esc(m.uid)}">
+    <b>${esc(m.label)}</b><br><span class="muted" style="font-size:11px">${esc(m.uid)}</span>
+    ${tags?'<br>'+tags:''}</button>`;
+}
 async function loadModels(){
   const d=await (await api('/admin/api/models')).json();
-  $('#model-list').innerHTML=d.models.map(m=>
-    `<button style="margin:0 6px 8px 0" onclick="pickModel('${esc(m)}')">${esc(m)}</button>`).join('');
+  const s=d.sync||{};
+  $('#model-count').textContent=`${d.models.length} 个`;
+  const acctN=Object.keys(s.accounts||{}).length;
+  $('#sync-info').innerHTML=[
+    s.ts?`最近同步 ${fmtT(s.ts)}`:'尚未同步',
+    s.refreshing?'<span class="spin"></span> 同步中':'',
+    s.count?`远端 ${s.count} 个`:'',
+    acctN?`${acctN} 账号上报`:'',
+  ].filter(Boolean).join(' · ')
+    +(s.errors&&s.errors.length?` · <span style="color:var(--red)">${s.errors.length} 账号失败：${esc(s.errors.map(e=>`${e.account}: ${e.error}`).join('；').slice(0,200))}</span>`:'')
+    +(s.url_err?` · <span style="color:var(--red)">URL 源失败：${esc(s.url_err)}</span>`:'');
+  $('#models-url').value=s.url||'';
+  const sel=$('#default-model');
+  sel.innerHTML='<option value="">自动</option>'
+    +d.models.map(m=>`<option${m===d.default_model?' selected':''}>${esc(m)}</option>`).join('')
+    +(d.default_model&&!d.models.includes(d.default_model)?`<option selected>${esc(d.default_model)}</option>`:'');
+  if(!d.default_model)sel.value='';
+  $('#alias-edit').value=Object.entries(d.user_aliases||{}).map(([a,t])=>`${a}=${t}`).join('\n');
+  $('#model-fams').innerHTML=d.families.map(f=>
+    `<div class="panel"><h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
+      <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
+      <span class="muted" style="float:right">${f.models.length} 变体</span></h3>
+      <div class="mgrid">${f.models.map(modelChip).join('')}</div></div>`).join('')
+    ||'<div class="panel muted">目录为空 — 点「立即同步」从上游账号拉取（或配置远端目录 URL）</div>';
+  $('#alias-list').innerHTML=Object.entries(d.aliases||{}).map(([a,t])=>
+    `<button style="margin:0 6px 8px 0" onclick="pickModel('${esc(a)}')" title="→ ${esc(t)}">${esc(a)} <span class="muted">→ ${esc(t)}</span></button>`).join('')
+    ||'<span class="muted">目录为空时别名暂不可用</span>';
   $('#model-stats').innerHTML=(d.stats||[]).map(m=>
     `<tr><td><span class="tag model">${esc(m.m)}</span></td><td>${m.n}</td><td>${m.errs||0}</td><td>${fmt(m.in_tok)}</td><td>${fmt(m.out_tok)}</td><td>${Math.round(m.avg_lat)}ms</td><td>${fmtT(m.last_used)}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>暂无使用记录</td></tr>';
-  const sel=$('#rq-model'), cur=sel.value;
-  sel.innerHTML='<option value="">全部模型</option>'+d.models.map(m=>`<option>${esc(m)}</option>`).join('');
-  sel.value=cur;
+  const rq=$('#rq-model'),cur=rq.value;
+  rq.innerHTML='<option value="">全部模型</option>'+d.models.map(m=>`<option>${esc(m)}</option>`).join('');
+  rq.value=cur;
+}
+async function syncModels(){
+  $('#sync-btn').disabled=true;
+  try{
+    const d=await (await api('/admin/api/models/refresh',{method:'POST'})).json();
+    toast(d.skipped?('已跳过：'+d.skipped)
+      :`同步完成：${d.count} 个模型`+(d.errors&&d.errors.length?`，${d.errors.length} 个账号失败`:'')
+      +(d.url_err?'，URL 源失败':''));
+  }catch(e){toast('同步失败: '+e.message)}
+  $('#sync-btn').disabled=false;loadModels().catch(()=>{});
+}
+async function saveModelSettings(){
+  const d=await (await api('/admin/api/models/settings',{method:'PATCH',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({default_model:$('#default-model').value,
+      models_url:$('#models-url').value.trim(),aliases:$('#alias-edit').value})})).json();
+  toast('已保存 · 默认 '+(d.default_model||'自动'));loadModels().catch(()=>{});
 }
 function pickModel(m){document.querySelector('[data-p=play]').click();$('#pg-model').value=m;$('#pg-in').focus()}
 
 // playground (via admin channel — no client key needed, still logged)
 async function loadPlayground(){
   const d=await (await api('/admin/api/models')).json();
-  $('#pg-model').innerHTML=d.models.map(m=>`<option>${esc(m)}</option>`).join('');
+  const fams=d.families.map(f=>`<optgroup label="${esc(f.label)}">`
+    +f.models.map(m=>`<option value="${esc(m.uid)}">${esc(m.label)} · ${esc(m.uid)}</option>`).join('')
+    +'</optgroup>').join('');
+  const al=Object.keys(d.aliases||{}).length
+    ?'<optgroup label="别名">'+Object.entries(d.aliases).map(([a,t])=>`<option value="${esc(a)}">${esc(a)} → ${esc(t)}</option>`).join('')+'</optgroup>':'';
+  $('#pg-model').innerHTML=(fams+al)||'<option value="default">default</option>';
 }
 async function pgSend(){
   const btn=$('#pg-send');btn.disabled=true;$('#pg-meta').textContent='';

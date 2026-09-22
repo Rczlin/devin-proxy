@@ -23,9 +23,9 @@ def _msg(name, fields):
     return descriptor_pb2.DescriptorProto(name=name, field=fields)
 
 
-STR, I32, U64, DBL, FLT, MSG = (
+STR, I32, U64, DBL, FLT, MSG, BOOL = (
     T.TYPE_STRING, T.TYPE_INT32, T.TYPE_UINT64,
-    T.TYPE_DOUBLE, T.TYPE_FLOAT, T.TYPE_MESSAGE,
+    T.TYPE_DOUBLE, T.TYPE_FLOAT, T.TYPE_MESSAGE, T.TYPE_BOOL,
 )
 REP = T.LABEL_REPEATED
 
@@ -101,6 +101,39 @@ _fd = descriptor_pb2.FileDescriptorProto(
             _f("metadata", 1, MSG, type_name=".devin.Metadata"),
         ]),
         _msg("GetUserJwtResponse", [_f("jwt", 1, STR)]),
+        _msg("ModelFeatures", [
+            _f("supports_thinking", 15, BOOL),
+        ]),
+        _msg("ModelInfo", [
+            _f("context_tokens", 4, I32),
+            _f("model_features", 6, MSG, type_name=".devin.ModelFeatures"),
+            _f("max_output_tokens", 13, I32),
+            _f("deployment", 20, STR),
+            _f("family", 23, STR),
+            _f("alias", 27, STR),
+        ]),
+        _msg("ModelFamily", [
+            _f("label", 1, STR),
+        ]),
+        _msg("ModelPricing", [
+            _f("item", 1, STR), _f("price", 2, FLT), _f("unit", 3, STR),
+            _f("note", 7, STR),
+        ]),
+        _msg("ClientModelConfig", [
+            _f("label", 1, STR), _f("credit_cost", 3, FLT),
+            _f("disabled", 4, BOOL), _f("supports_images", 5, BOOL),
+            _f("max_tokens", 18, I32), _f("model_uid", 22, STR),
+            _f("model_info", 23, MSG, type_name=".devin.ModelInfo"),
+            _f("family", 30, MSG, type_name=".devin.ModelFamily"),
+            _f("pricing", 32, MSG, REP, ".devin.ModelPricing"),
+        ]),
+        _msg("GetCliModelConfigsRequest", [
+            _f("metadata", 1, MSG, type_name=".devin.Metadata"),
+        ]),
+        _msg("GetCliModelConfigsResponse", [
+            _f("client_model_configs", 1, MSG, REP,
+               ".devin.ClientModelConfig"),
+        ]),
     ],
 )
 
@@ -125,3 +158,10 @@ GetChatMessageRequest = cls("GetChatMessageRequest")
 GetChatMessageResponse = cls("GetChatMessageResponse")
 GetUserJwtRequest = cls("GetUserJwtRequest")
 GetUserJwtResponse = cls("GetUserJwtResponse")
+ModelFeatures = cls("ModelFeatures")
+ModelInfo = cls("ModelInfo")
+ModelFamily = cls("ModelFamily")
+ModelPricing = cls("ModelPricing")
+ClientModelConfig = cls("ClientModelConfig")
+GetCliModelConfigsRequest = cls("GetCliModelConfigsRequest")
+GetCliModelConfigsResponse = cls("GetCliModelConfigsResponse")

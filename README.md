@@ -140,7 +140,18 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   transparently retry a mid-stream failure on the next account
 - **账号池** — multi-account management (above): OAuth login, manual add,
   local import, enable/disable/delete/test, session-pin list + unbind
-- **模型** — all callable model uids/aliases + per-model usage stats
+- **模型** — the catalog is **fetched from upstream**, not hardcoded:
+  `GetCliModelConfigs` runs against every enabled account (same call the
+  Devin CLI/Desktop makes at boot — with the Windsurf client identity,
+  which is what returns the full Cascade catalog), results are unioned,
+  persisted in the DB, and re-synced in the background every
+  `DEVIN_PROXY_MODELS_TTL` seconds (default 1 h) plus on demand via
+  立即同步. The page groups variants by family with vendor / effort /
+  context-window / vision / thinking / credit / pricing badges and shows
+  how many accounts advertise each model. Scheduling uses this too: a
+  request only goes to accounts that actually advertised the model.
+  Settings: default model, custom aliases (`alias=uid`), and an extra
+  JSON catalog URL (`DEVIN_PROXY_MODELS_URL`) merged into the list
 - **Playground** — test any model streaming or not, straight from the UI;
   optionally pin to a specific account
 - **API Keys** — mint `sk-dp-…` keys for callers (SHA-256 hashed in the
@@ -165,20 +176,28 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   `response.completed`, …)
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`,
   `GET /v1/responses/{id}/input_items`
-- `GET /v1/models` — model uids + aliases (filtered to the caller key's
-  allowlist when set)
+- `GET /v1/models` — the synced catalog + aliases, with per-model
+  `display_name`, `family`, `effort`, `context_window`,
+  `max_output_tokens`, `credit_cost`, `cost_summary`, `capabilities`
+  and `source` (filtered to the caller key's allowlist when set)
 - `GET /healthz` — `{"ok": true}` only
 - `/admin` — sign-in page → cookie session → `/admin/app` console
 
-Model: pass a variant uid (`claude-sonnet-5-medium`, `gpt-5-6-sol-low`,
-`swe-2-high`, …) or an alias (`claude`, `sonnet`, `opus`, `gemini`, `gpt`,
-`swe`). `reasoning.effort` / `reasoning_effort` (`minimal|low|medium|
-high`) remaps the uid's effort suffix when the variant exists.
+Model: pass a variant uid as reported by the catalog
+(`claude-sonnet-5-medium`, `swe-2-high`, …), a bare family name
+(`swe-2`, `claude-opus-5` — resolves to the family's default variant),
+or an alias (`claude`, `sonnet`, `opus`, `gemini`, `gpt`, `codex`,
+`swe`, plus custom ones). Unknown names pass through to upstream as-is.
+`reasoning.effort` / `reasoning_effort` (`minimal|none|low|medium|high|
+xhigh|max`) remaps the uid's effort suffix when the variant exists.
 
 ## Layout
 
 - `devin_proxy/proto.py` — protobuf schema (field numbers of the wire format)
-- `devin_proxy/upstream.py` — Connect-RPC client (framing, GetUserJwt, streaming)
+- `devin_proxy/upstream.py` — Connect-RPC client (framing, GetUserJwt,
+  GetCliModelConfigs, streaming)
+- `devin_proxy/models.py` — remote-synced model catalog (aliases, effort
+  mapping, per-account coverage, TTL snapshot)
 - `devin_proxy/creds.py` — local credential discovery (`detect_all`)
 - `devin_proxy/accounts.py` — account pool (scheduling, pinning, cooldown,
   failover) + OAuth PKCE login + identity probe

@@ -14,37 +14,9 @@ from starlette.concurrency import run_in_threadpool
 
 from . import accounts as accounts_mod
 from . import creds as creds_mod
+from . import models as models_mod
 from . import store
 from . import upstream
-
-MODEL_ALIASES = {
-    # friendly name -> wire model_uid
-    "claude": "claude-sonnet-5-medium",
-    "sonnet": "claude-sonnet-5-medium",
-    "opus": "claude-opus-5-high",
-    "gemini": "gemini-3-8-flash-medium",
-    "gpt": "gpt-5-6-sol-medium",
-    "swe": "swe-2-high",
-    "default": "claude-sonnet-5-medium",
-    "auto": "claude-sonnet-5-medium",
-}
-
-KNOWN_UIDS = [
-    "claude-opus-5-low", "claude-opus-5-medium", "claude-opus-5-high",
-    "claude-opus-5-xhigh", "claude-opus-5-max",
-    "claude-sonnet-5-low", "claude-sonnet-5-medium", "claude-sonnet-5-high",
-    "claude-sonnet-5-xhigh", "claude-sonnet-5-max",
-    "claude-fable-5-1-low", "claude-fable-5-1-medium", "claude-fable-5-1-high",
-    "gpt-5-6-sol-none", "gpt-5-6-sol-low", "gpt-5-6-sol-medium",
-    "gpt-5-6-sol-high", "gpt-5-6-sol-xhigh", "gpt-5-6-sol-max",
-    "gpt-5-6-luna-none", "gpt-5-6-luna-low", "gpt-5-6-luna-medium",
-    "gemini-3-8-flash-low", "gemini-3-8-flash-medium", "gemini-3-8-flash-high",
-    "swe-2-high", "swe-1-7-medium", "swe-1-7-lightning-medium",
-]
-
-_EFFORT_SUFFIX = {"minimal": "none", "low": "low", "medium": "medium",
-                  "high": "high"}
-_UID_SUFFIXES = {"none", "low", "medium", "high", "xhigh", "max"}
 
 # Upstream read timeout: Devin's agent stream can pause for a long time while
 # the server runs tools. 300s was too short and looked like a silent 断流.
@@ -261,6 +233,7 @@ def create_app(api_key=None):
         print(f"admin key (generated, saved): {api_key}")
     elif key_src == "stored":
         print(f"admin key (from db): {api_key}")
+    models_mod.maybe_refresh(app.state.http, pool)
 
     @app.middleware("http")
     async def _stealth(request, call_next):
@@ -432,16 +405,11 @@ def create_app(api_key=None):
                 for t in tools or [] if t.get("type") == "function"]
 
     def resolve_model(body):
-        uid = MODEL_ALIASES.get(body.get("model"),
-                              body.get("model") or "claude-sonnet-5-medium")
+        uid = (models_mod.resolve(body.get("model"))
+               or models_mod.default_uid())
         effort = ((body.get("reasoning") or {}).get("effort")
                   or body.get("reasoning_effort"))
-        suffix = _EFFORT_SUFFIX.get(str(effort or "").lower())
-        if suffix and uid.rsplit("-", 1)[-1] in _UID_SUFFIXES:
-            cand = uid.rsplit("-", 1)[0] + "-" + suffix
-            if cand in KNOWN_UIDS:
-                uid = cand
-        return uid
+        return models_mod.apply_effort(uid, effort)
 
     def build_request(body, model, acct):
         system, prompts = map_messages(body.get("messages"))
@@ -473,7 +441,8 @@ def create_app(api_key=None):
         transient_retries = 0       # 断流/异常允许重试同一账号（连接闪断≠账号坏）
         for attempt in range(1, attempts + 1):
             acct = pool.pick(session_key, exclude=tried, force_id=force_id,
-                             models=want)
+                             models=want,
+                             remote=models_mod.served_by(want))
             if acct is None:
                 if not tried and pool.accounts():
                     last_err = {"message": "no eligible account (all busy, "
@@ -578,9 +547,30 @@ def create_app(api_key=None):
     @app.get("/v1/models", dependencies=[Depends(check_key)])
     def list_models(request: Request):
         allowed = _key_models(request)
-        names = KNOWN_UIDS + list(MODEL_ALIASES)
-        data = [{"id": m, "object": "model", "created": 0, "owned_by": "proxy"}
-                for m in names if allowed is None or m in allowed]
+        models_mod.maybe_refresh(app.state.http, pool)
+        created = int(models_mod.sync_info()["ts"] or 0)
+        data = []
+        for e in models_mod.entries():
+            if allowed is not None and e["uid"] not in allowed:
+                continue
+            data.append({
+                "id": e["uid"], "object": "model", "created": created,
+                "owned_by": e["vendor"], "display_name": e["label"],
+                "family": e["family"], "effort": e["effort"],
+                "context_window": e["context"],
+                "max_output_tokens": e["max_output"],
+                "credit_cost": e["credit"],
+                "cost_summary": e.get("cost_summary"),
+                "alias": e.get("alias"),
+                "capabilities": {"vision": bool(e["images"]),
+                                 "thinking": bool(e["thinking"]),
+                                 "tools": True},
+                "source": ("remote" if e["remote_accounts"]
+                           else "url" if e["url"] else "builtin")})
+        for a, t in models_mod.aliases().items():
+            if allowed is None or a in allowed:
+                data.append({"id": a, "object": "model", "created": 0,
+                             "owned_by": "proxy", "alias_of": t})
         return {"object": "list", "data": data}
 
     @app.get("/healthz")

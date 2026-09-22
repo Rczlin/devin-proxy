@@ -13,6 +13,7 @@ from . import proto
 
 CHAT_PATH = "/exa.api_server_pb.ApiServerService/GetChatMessage"
 JWT_PATH = "/exa.auth_pb.AuthService/GetUserJwt"
+MODELS_PATH = "/exa.api_server_pb.ApiServerService/GetCliModelConfigs"
 
 COMPRESSED = 0x01
 END_STREAM = 0x02
@@ -21,7 +22,7 @@ STOP_REASONS = {10: "tool_calls", 11: "content_filter", 1: "length", 3: "length"
 SOURCE = {"user": 1, "assistant": 2, "tool": 4, "system": 1}
 
 CLIENT_IDE = "devin-cli"
-CLIENT_VERSION = "3000.10.31"
+CLIENT_VERSION = "3000.11.1"
 
 
 def build_metadata(api_key, user_jwt=""):
@@ -84,6 +85,89 @@ def get_user_jwt(client, base_url, api_key, force_refresh=False):
 def clear_jwt(base_url, api_key):
     with _jwt_lock:
         _jwt_cache.pop((base_url, api_key), None)
+
+
+def _models_metadata(api_key):
+    """Metadata for GetCliModelConfigs. The catalog is gated on client
+    identity: devin-cli metadata gets only the CLI fallback model, while
+    the Windsurf IDE identity returns the full Cascade catalog — the
+    models this relay actually serves via GetChatMessage. Wire tags
+    follow the Windsurf layout (ide_name=1, extension_version=2,
+    ide_version=7, extension_name=12, ide_type=28)."""
+    return proto.Metadata(
+        ide_name="windsurf",                # tag 1
+        ide_version="1.48.2",               # tag 2 = extension_version
+        api_key=api_key,                    # tag 3
+        locale="en",                        # tag 4
+        extension_version="3.2.23",         # tag 7 = ide_version
+        ide_name_2="windsurf",              # tag 12 = extension_name
+    )
+
+
+def _cost_summary(pricing):
+    """pricing rows -> '$5 / 1M Input · $0.5 / 1M Cached input · …'"""
+    out = []
+    for p in pricing:
+        unit = (p.unit or "").replace(" tokens", "").strip()
+        label = (p.item or "").strip()
+        if p.price and label:
+            out.append(f"${p.price:g} / {unit} {label}".strip())
+    return " · ".join(out) or None
+
+
+def fetch_model_configs(client, base_url, api_key, timeout=20):
+    """GetCliModelConfigs (the call Devin CLI/Desktop makes at boot)
+    -> [{uid, label, context, max_output, family_slug, family_label,
+         alias, images, thinking, credit, pricing, cost_summary}].
+    Disabled/uid-less entries are skipped. Raises on transport/parse
+    failure — callers catch per account."""
+    req = proto.GetCliModelConfigsRequest(
+        metadata=_models_metadata(api_key))
+    resp = client.post(
+        base_url + MODELS_PATH,
+        content=req.SerializeToString(),
+        headers={"Content-Type": "application/proto",
+                 "Connect-Protocol-Version": "1",
+                 "Accept": "application/proto",
+                 "Authorization": f"Basic {api_key}-{api_key}"},
+        timeout=timeout)
+    resp.raise_for_status()
+    raw = resp.content
+    out = proto.GetCliModelConfigsResponse()
+    try:
+        out.ParseFromString(raw)
+    except Exception:
+        out.ParseFromString(gzip.decompress(raw))
+    models = []
+    for c in out.client_model_configs:
+        uid = (c.model_uid or "").strip()
+        if not uid or c.disabled:
+            continue
+        e = {"uid": uid, "label": (c.label or "").strip() or None,
+             "context": c.max_tokens or None,
+             "credit": c.credit_cost or None,
+             "images": bool(c.supports_images)}
+        if c.HasField("model_info"):
+            mi = c.model_info
+            if mi.max_output_tokens:
+                e["max_output"] = mi.max_output_tokens
+            if mi.family:
+                e["family_slug"] = mi.family
+            if mi.alias:
+                e["alias"] = mi.alias
+            if mi.HasField("model_features"):
+                e["thinking"] = bool(mi.model_features.supports_thinking)
+        if c.HasField("family") and c.family.label:
+            e["family_label"] = c.family.label
+        if c.pricing:
+            e["pricing"] = [{"item": p.item, "price": p.price,
+                             "unit": p.unit, "note": p.note or None}
+                            for p in c.pricing]
+            cs = _cost_summary(c.pricing)
+            if cs:
+                e["cost_summary"] = cs
+        models.append(e)
+    return models
 
 
 def make_prompt(role, text="", tool_call_id=None, tool_calls=None, images=None,
