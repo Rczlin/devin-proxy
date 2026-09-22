@@ -83,6 +83,15 @@ class Credentials:
 
 
 def load():
+    token_file = os.environ.get("DEVIN_SESSION_TOKEN_FILE")
+    if token_file:
+        try:
+            key = open(token_file, encoding="utf-8").read().strip()
+            if key:
+                return Credentials(key, os.environ.get("DEVIN_API_SERVER_URL",
+                                   DEFAULT_API_SERVER), token_file)
+        except OSError:
+            pass
     env_key = os.environ.get("DEVIN_SESSION_TOKEN") or os.environ.get("WINDSURF_API_KEY")
     if env_key:
         return Credentials(env_key, os.environ.get("DEVIN_API_SERVER_URL", DEFAULT_API_SERVER), "env")
