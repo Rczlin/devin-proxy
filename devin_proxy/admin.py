@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -116,8 +117,8 @@ def make_router(app):
         token: str
 
     class AccountPatch(BaseModel):
-        name: str = None
-        disabled: bool = None
+        name: Optional[str] = None
+        disabled: Optional[bool] = None
 
     @router.get("/api/accounts", dependencies=[Depends(admin_key)])
     def list_accounts():
@@ -217,11 +218,11 @@ def make_router(app):
 
     class OauthStart(BaseModel):
         label: str = ""
-        webapp: str = None
+        webapp: Optional[str] = None
 
     class OauthComplete(BaseModel):
         code: str
-        label: str = None
+        label: Optional[str] = None
 
     @router.post("/api/oauth/start", dependencies=[Depends(admin_key)])
     def oauth_start(body: OauthStart):
