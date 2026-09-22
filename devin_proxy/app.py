@@ -590,6 +590,7 @@ def create_app(api_key=None):
             o["id"] = f["prefix"]
             o["display_name"] = f["label"]
             o["effort"] = None
+            o["default_effort"] = f.get("default")
             o["efforts"] = [m["effort"] for m in f["models"]
                             if m["effort"]]
             data.append(o)

@@ -434,7 +434,13 @@ def apply_effort(uid, effort):
 
 
 def grouped(include_hidden=False):
-    """entries() grouped by family -> [{prefix,label,vendor,desc,models}]."""
+    """entries() grouped by family -> [{prefix,label,vendor,desc,models}].
+
+    f["default"] is the effort a request without reasoning.effort actually
+    lands on: family override > global default > builtin preference,
+    restricted to variants the family really has (auto_effort/apply_effort
+    degrade the same way). f["default_override"] is the raw admin override
+    so UIs can tell a set value apart from an inherited one."""
     fams = {}
     for e in entries(include_hidden):
         f = fams.setdefault(e["family"], {
@@ -443,11 +449,19 @@ def grouped(include_hidden=False):
         f["models"].append(e)
     out = list(fams.values())
     overs = family_efforts()
+    glob = default_effort()
     for f in out:
         meta = next((x for x in FAMILIES if x[0] == f["prefix"]), None)
         f["desc"] = meta[3] if meta else ""
-        f["default"] = overs.get(f["prefix"]) or \
-            (meta[4] if meta else "medium")
+        have = sorted({m["effort"] for m in f["models"]
+                       if m["effort"] and not m.get("hidden")},
+                      key=lambda e: EFFORTS.index(e)
+                      if e in EFFORTS else len(EFFORTS))
+        f["default"] = next(
+            (e for e in (overs.get(f["prefix"]), glob,
+                         meta[4] if meta else None, "medium")
+             if e in have), have[0] if have else None)
+        f["default_override"] = overs.get(f["prefix"])
         f["order"] = min(m["order"] for m in f["models"])
     return sorted(out, key=lambda f: (f["order"], f["prefix"]))
 

@@ -280,7 +280,7 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
           <span class="muted">默认模型</span>
           <select id="default-model" style="min-width:230px"></select>
           <span class="muted">默认思考</span>
-          <select id="default-effort">
+          <select id="default-effort" title="全局默认思考等级：请求未指定 effort 时套用；各家族卡片可单独覆盖">
             <option value="">自动</option><option value="none">无思考</option>
             <option value="low">低</option><option value="medium">中</option>
             <option value="high">高</option><option value="xhigh">超高</option>
@@ -793,6 +793,7 @@ async function clearSessions(){
 
 // models
 const EFF={none:'无思考',low:'低',medium:'中',high:'高',xhigh:'超高',max:'满'};
+const EFFORD=['none','low','medium','high','xhigh','max'];
 let _famEff={};
 function famChip(f,main){
   const tags=[
@@ -800,7 +801,7 @@ function famChip(f,main){
     main.images?'<span class="tag model" title="支持图像输入">👁 图像</span>':'',
     main.thinking?'<span class="tag model" title="支持思考">🧠 思考</span>':'',
     main.credit!=null?`<span class="tag off" title="${esc(main.cost_summary||'credit 消耗倍率')}">×${main.credit}</span>`:'',
-    main.effort?`<span class="tag ok" title="默认变体">默认·${esc(EFF[main.effort]||main.effort)}</span>`:'',
+    main.effort?`<span class="tag ok" title="默认思考等级：请求未指定 effort 时命中此变体">默认·${esc(EFF[main.effort]||main.effort)}</span>`:'',
     main.remote_accounts?`<span class="tag ok" title="广告此模型的上游账号数">${main.remote_accounts} 账号</span>`:'',
   ].filter(Boolean).join('');
   return `<button class="mchip" onclick="pickModel('${esc(f.prefix)}')" title="${esc(f.prefix)} — 点击在 Playground 试用">
@@ -855,7 +856,8 @@ async function setFamDefault(fam,eff){
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({family_efforts:{[fam]:eff}})})).json();
   _famEff=d.family_efforts||{};
-  toast(`${fam} 默认 → ${EFF[eff]||eff}`);loadModels().catch(()=>{});
+  toast(eff?`${fam} 默认思考 → ${EFF[eff]||eff}`:`${fam} 默认思考 → 自动`);
+  loadModels().catch(()=>{});
 }
 async function loadModels(){
   const d=await (await api('/admin/api/models')).json();
@@ -884,9 +886,19 @@ async function loadModels(){
     const vis=f.models.filter(m=>!m.hidden);
     const main=vis.find(m=>m.effort===prefer)||vis.find(m=>m.effort==='medium')||vis[0]||f.models[0];
     const rest=f.models.filter(m=>m!==main);
+    const effs=[...new Set(vis.map(m=>m.effort).filter(Boolean))]
+      .sort((a,b)=>EFFORD.indexOf(a)-EFFORD.indexOf(b));
+    const head=effs.length
+      ?`<span style="float:right;font-weight:400;text-transform:none;letter-spacing:0">默认思考
+        <select style="padding:2px 6px;font-size:12px" title="请求未指定 effort 时该家族改写到哪个变体（自动 = 跟随全局默认/内置偏好）"
+          onchange="setFamDefault('${esc(f.prefix)}',this.value)">
+          <option value="">自动${f.default_override?'':(f.default?`（${esc(EFF[f.default]||f.default)}）`:'')}</option>
+          ${effs.map(e=>`<option value="${esc(e)}"${e===f.default_override?' selected':''}>${esc(EFF[e]||e)}</option>`).join('')}
+        </select> <span class="muted">${f.models.length} 变体</span></span>`
+      :`<span class="muted" style="float:right">${f.models.length} 变体</span>`;
     return `<div class="panel"><h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
       <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
-      <span class="muted" style="float:right">${f.models.length} 变体</span></h3>
+      ${head}</h3>
       <div class="mgrid">${famChip(f,main)}</div>
       ${rest.length?`<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">展开 ${rest.length} 个变体（点击设为默认）</summary>
         <div class="mgrid" style="margin-top:8px">${rest.map(m=>modelChip(m,f.prefix,false)).join('')}</div></details>`:''}
