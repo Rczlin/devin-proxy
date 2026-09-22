@@ -3,11 +3,19 @@ services:
     image: ghcr.io/rczlin/devin-proxy:latest
     container_name: devin-proxy
     env_file: .env
+    environment:
+      DEVIN_SESSION_TOKEN_FILE: /run/secrets/devin_token
+    secrets:
+      - devin_token
     ports:
       - "127.0.0.1:8317:8317"     # drop 127.0.0.1 to expose on LAN — set DEVIN_PROXY_KEY first
     volumes:
       - devin-proxy-data:/data    # persists request log + API keys
     restart: unless-stopped
+
+secrets:
+  devin_token:
+    file: ./devin-token.txt     # contents: windsurf_api_key from credentials.toml
 
 volumes:
   devin-proxy-data:
