@@ -15,7 +15,7 @@ import uuid
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import store, upstream
-from .app import ToolAgg
+from .app import ToolAgg, reqlog_for
 
 
 def _iid(prefix):
@@ -252,12 +252,22 @@ def handle(request, body, t0, *, iter_chat, resolve_model, record,
         try:
             chat_body, items, chain_skey = to_chat_body(body)
         except ValueError as e:
+            record(request, body, "", False, 400, str(e), None, t0, None,
+                   endpoint="responses")
             return _err(400, str(e), code="previous_response_not_found")
+        except Exception as e:
+            record(request, body, "", False, 500,
+                   f"request mapping failed: {e}", None, t0, None,
+                   endpoint="responses")
+            raise
         model = resolve_model(chat_body)
         row = getattr(request.state, "key_row", None)
         allowed = set(row["models"]) if row and row.get("models") else None
         if (allowed is not None and chat_body.get("model") not in allowed
                 and model not in allowed):
+            record(request, body, model, False, 403,
+                   "model not permitted for this key", None, t0, None,
+                   endpoint="responses")
             return _err(403, "model not permitted for this key",
                         code="model_not_permitted")
         conv = body.get("conversation")
@@ -319,9 +329,10 @@ def _persist(body, rid, model, status, acct_name, skey, items_in, items_out,
 
 def _collect(request, body, chat_body, model, skey, rid, items_in,
              iter_chat, record, t0):
+    rl = reqlog_for(request, body)
     texts, think, agg = [], [], ToolAgg()
     usage, err, acct_name = None, None, None
-    for acct, ev in iter_chat(chat_body, skey):
+    for acct, ev in iter_chat(chat_body, skey, stream=False, log=rl):
         if acct:
             acct_name = acct.display()
         if isinstance(ev, dict):
@@ -345,6 +356,7 @@ def _collect(request, body, chat_body, model, skey, rid, items_in,
     resp = response_object(rid, model, body, items_out, usage)
     _persist(body, rid, model, "completed", acct_name, skey,
              items_in, items_out, resp)
+    rl.out(resp)
     record(request, body, model, True, 200, None, usage, t0, None,
            account=acct_name, endpoint="responses")
     return JSONResponse(resp)
@@ -365,6 +377,7 @@ class _Emit:
 
 def _sse(request, body, chat_body, model, skey, rid, items_in,
          iter_chat, record, t0):
+    rl = reqlog_for(request, body)
     em = _Emit()
     agg, usage, err = ToolAgg(), None, None
     acct_name, ttft = None, None
@@ -451,65 +464,76 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
                           "call_id": call_id, "name": name,
                           "arguments": "", "status": "in_progress"})
 
-    yield em.ev("response.created", response=base)
-    yield em.ev("response.in_progress", response=base)
+    yield rl.out(em.ev("response.created", response=base))
+    yield rl.out(em.ev("response.in_progress", response=base))
 
-    for acct, ev in iter_chat(chat_body, skey):
-        if acct:
-            acct_name = acct.display()
-        if isinstance(ev, dict):
-            err = ev
-            break
-        if ttft is None:
-            ttft = int((time.perf_counter() - t0) * 1000)
-        if ev.delta_thinking:
-            if open_kind != "reasoning":
-                for x in close_open():
-                    yield x
-                for x in open_reasoning():
-                    yield x
-            think_parts.append(ev.delta_thinking)
-            yield em.ev("response.reasoning_summary_text.delta",
-                        item_id=rs_id, output_index=out_idx, summary_index=0,
-                        delta=ev.delta_thinking)
-        if ev.delta_text:
-            if open_kind != "message":
-                for x in close_open():
-                    yield x
-                for x in open_message():
-                    yield x
-            text_parts.append(ev.delta_text)
-            yield em.ev("response.output_text.delta", item_id=msg_id,
-                        output_index=out_idx, content_index=0,
-                        delta=ev.delta_text)
-        for tc in ev.delta_tool_calls:
-            fed = agg.feed(tc)
-            if not fed:
-                continue
-            idx, call, new_name, delta = fed
-            if new_name or (fc_open is None and call["id"]):
-                if not (fc_open and fc_open["call_id"] == call["id"]):
+    try:
+        for acct, ev in iter_chat(chat_body, skey, stream=True, log=rl):
+            if acct:
+                acct_name = acct.display()
+            if isinstance(ev, dict):
+                err = ev
+                break
+            if ttft is None:
+                ttft = int((time.perf_counter() - t0) * 1000)
+            if ev.delta_thinking:
+                if open_kind != "reasoning":
                     for x in close_open():
-                        yield x
-                    for x in open_fc(call["id"], call["name"]):
-                        yield x
-            if delta and fc_open:
-                yield em.ev("response.function_call_arguments.delta",
-                            item_id=fc_open["id"], output_index=out_idx,
-                            delta=delta)
-        if ev.HasField("usage"):
-            usage = upstream.extract_usage(ev)
+                        yield rl.out(x)
+                    for x in open_reasoning():
+                        yield rl.out(x)
+                think_parts.append(ev.delta_thinking)
+                yield rl.out(em.ev("response.reasoning_summary_text.delta",
+                                   item_id=rs_id, output_index=out_idx,
+                                   summary_index=0, delta=ev.delta_thinking))
+            if ev.delta_text:
+                if open_kind != "message":
+                    for x in close_open():
+                        yield rl.out(x)
+                    for x in open_message():
+                        yield rl.out(x)
+                text_parts.append(ev.delta_text)
+                yield rl.out(em.ev("response.output_text.delta",
+                                   item_id=msg_id, output_index=out_idx,
+                                   content_index=0, delta=ev.delta_text))
+            for tc in ev.delta_tool_calls:
+                fed = agg.feed(tc)
+                if not fed:
+                    continue
+                idx, call, new_name, delta = fed
+                if new_name or (fc_open is None and call["id"]):
+                    if not (fc_open and fc_open["call_id"] == call["id"]):
+                        for x in close_open():
+                            yield rl.out(x)
+                        for x in open_fc(call["id"], call["name"]):
+                            yield rl.out(x)
+                if delta and fc_open:
+                    yield rl.out(em.ev(
+                        "response.function_call_arguments.delta",
+                        item_id=fc_open["id"], output_index=out_idx,
+                        delta=delta))
+            if ev.HasField("usage"):
+                usage = upstream.extract_usage(ev)
+    except GeneratorExit:
+        rl.flag("client_aborted")
+        rl.ev("client_aborted")
+        record(request, body, model, False, 499,
+               "client disconnected mid-stream", usage, t0, ttft,
+               account=acct_name, endpoint="responses")
+        raise
 
     for x in close_open():
-        yield x
+        yield rl.out(x)
 
     if err:
         status = err.get("http_error", 502)
         msg = err.get("message", "upstream error")
+        kind = err.get("kind") or "upstream_error"
         resp = response_object(rid, model, body, [], usage, status="failed",
-                               err={"code": "server_error", "message": msg})
-        yield em.ev("response.failed", response=resp)
-        yield em.ev("error", code="server_error", message=msg)
+                               err={"code": kind, "message": msg})
+        rl.ev("downstream_error", detail=err)
+        yield rl.out(em.ev("response.failed", response=resp))
+        yield rl.out(em.ev("error", code=kind, message=msg))
         record(request, body, model, False, status, msg, usage, t0, ttft,
                account=acct_name, endpoint="responses")
     else:
@@ -527,7 +551,8 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
         resp = response_object(rid, model, body, items_out, usage)
         _persist(body, rid, model, "completed", acct_name, skey,
                  items_in, items_out, resp)
+        rl.ev("finish", status="completed")
         record(request, body, model, True, 200, None, usage, t0, ttft,
                account=acct_name, endpoint="responses")
-        yield em.ev("response.completed", response=resp)
-    yield "data: [DONE]\n\n"
+        yield rl.out(em.ev("response.completed", response=resp))
+    yield rl.out("data: [DONE]\n\n")

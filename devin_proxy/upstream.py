@@ -158,9 +158,26 @@ def _trailer_error(payload):
         return None
 
 
-def stream_chat(client, base_url, api_key, request, timeout=300):
+_SOFT_HINTS = ("context", "too long", "invalid", "bad request", "maximum",
+               "exceed", "malformed", "parse", "too many tokens")
+
+
+def _is_soft(msg):
+    """Request-scoped upstream errors (context overflow, bad input, …) must
+    not cool the account down — retrying the same request elsewhere won't
+    help, but the account itself is healthy."""
+    m = (msg or "").lower()
+    return any(s in m for s in _SOFT_HINTS)
+
+
+def stream_chat(client, base_url, api_key, request, timeout=None):
     """POST GetChatMessage; yields GetChatMessageResponse messages, then
-    dicts {'error': ...} on trailer errors."""
+    dicts on terminal errors. Every error dict carries `kind` (http_error /
+    upstream_error / truncated / protocol_error) and `message`.
+
+    A Connect-RPC server stream MUST end with an END_STREAM trailer frame.
+    If the connection closes without one the stream was truncated — that is
+    reported as an error instead of silently looking like a clean finish."""
     headers = {
         "Content-Type": "application/connect+proto",
         "Connect-Protocol-Version": "1",
@@ -170,13 +187,15 @@ def stream_chat(client, base_url, api_key, request, timeout=300):
         "User-Agent": "connect-go/1.18.1 (go1.26.3)",
         "Authorization": f"Basic {api_key}-{api_key}",
     }
+    kw = {"timeout": timeout} if timeout is not None else {}
     pending = b""
+    ended, n_frames = False, 0
     with client.stream("POST", base_url + CHAT_PATH,
                        content=_connect_frame(request.SerializeToString()),
-                       headers=headers, timeout=timeout) as resp:
+                       headers=headers, **kw) as resp:
         if resp.status_code != 200:
             body = resp.read()
-            yield {"http_error": resp.status_code,
+            yield {"kind": "http_error", "http_error": resp.status_code,
                    "message": body.decode("utf-8", "replace")[:2000]}
             return
         for chunk in resp.iter_bytes(65536):
@@ -188,15 +207,37 @@ def stream_chat(client, base_url, api_key, request, timeout=300):
                     break
                 payload = pending[5:5 + ln]
                 pending = pending[5 + ln:]
-                raw = gzip.decompress(payload) if flags & COMPRESSED else payload
+                if flags & COMPRESSED:
+                    try:
+                        raw = gzip.decompress(payload)
+                    except Exception as e:
+                        yield {"kind": "protocol_error",
+                               "message": f"bad gzip frame #{n_frames}: {e}"}
+                        return
+                else:
+                    raw = payload
                 if flags & END_STREAM:
+                    ended = True
                     err = _trailer_error(raw)
                     if err:
-                        yield {"error": err}
+                        yield {"kind": "upstream_error", "message": err,
+                               "trailer": raw.decode("utf-8", "replace")[:4000],
+                               "soft": _is_soft(err)}
                     continue
+                n_frames += 1
                 msg = proto.GetChatMessageResponse()
-                msg.ParseFromString(raw)
+                try:
+                    msg.ParseFromString(raw)
+                except Exception as e:
+                    yield {"kind": "protocol_error",
+                           "message": f"bad protobuf frame #{n_frames}: {e}"}
+                    return
                 yield msg
+        if not ended:
+            yield {"kind": "truncated", "truncated": True,
+                   "message": "upstream closed the stream without an "
+                              f"end-of-stream frame ({n_frames} frames, "
+                              f"{len(pending)} trailing bytes)"}
 
 
 def extract_usage(msg):
