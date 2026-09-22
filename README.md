@@ -94,21 +94,19 @@ Production deploy — compose only, no local build:
 
 ```bash
 cp .env.example .env            # set DEVIN_PROXY_KEY (locks /v1 + admin)
-# put your session token in ./devin-token.txt — the windsurf_api_key
-# value from %APPDATA%\devin\credentials.toml on a signed-in machine
+mkdir -p data && chown 1000:1000 data   # container runs as uid 1000
 docker compose pull
 docker compose up -d
 ```
 
 `docker-compose.yml` pulls `ghcr.io/rczlin/devin-proxy:latest` (built by
-the Action, public — no registry login needed), mounts the token file as
-a docker secret (`/run/secrets/devin_token`, read via
-`DEVIN_SESSION_TOKEN_FILE`), loads `.env`, and keeps the request log +
-API keys + account pool on the `/data` volume. You can also skip the
-token file entirely and add accounts via OAuth in the admin console.
-
-The token goes in a file, not `.env`, because compose interpolates `$`
-in env_file values and the session token contains one.
+the Action, public — no registry login needed), loads `.env`, and
+persists the request log + API keys + account pool in `./data`
+(bind-mounted to `/data`). No token file needed — the container starts
+with an empty pool; open `/admin` → 账号池 and add accounts via OAuth
+login (paste-code flow works headless over SSH) or manual token entry.
+To seed a token file instead, bind-mount it and set
+`DEVIN_SESSION_TOKEN_FILE` in `.env`.
 
 ## Admin console
 
