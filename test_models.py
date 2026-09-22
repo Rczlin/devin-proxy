@@ -159,6 +159,22 @@ store.meta_set("model_aliases", '{"fast": "claude-sonnet-5@low",'
 assert M.auto_effort("fast") == "low"                 # per-alias effort
 assert M.auto_effort("big") is None                   # alias pins variant
 assert M.resolve("fast") == "claude-sonnet-5-medium"  # family target
+# per-family default beats the global default
+store.meta_set("family_efforts", '{"claude-sonnet-5": "high"}')
+assert M.auto_effort("claude-sonnet-5") == "high"
+assert M.auto_effort("claude") == "high"              # builtin alias -> fam
+assert M.auto_effort("opus") == "high"                # other fam -> global
+assert M.family_default("claude-sonnet-5") == "claude-sonnet-5-high"
+store.meta_set("default_effort", "medium")
+assert M.family_default("claude-sonnet-5") == "claude-sonnet-5-high"
+store.meta_set("default_effort", "high")
+store.meta_set("family_efforts", "{}")
+# empty request model: default_model's own suffix must NOT suppress
+# the global default (the "改不动" case)
+store.meta_set("default_model", "swe-2-high")
+assert M.auto_effort(None) == "high"
+assert M.auto_effort("") == "high"
+store.meta_set("default_model", "")
 store.meta_set("default_effort", "")
 store.meta_set("model_aliases", "{}")
 print("auto_effort OK")
@@ -243,6 +259,17 @@ r = tc.patch("/admin/api/models/settings", headers=H,
 assert r.status_code == 400
 r = tc.patch("/admin/api/models/settings", headers=H,
              json={"aliases": "bad=swe-2@bogus"})
+assert r.status_code == 400
+# per-family default variant (点击设为默认)
+r = tc.patch("/admin/api/models/settings", headers=H,
+             json={"family_efforts": {"swe-2": "high"}}).json()
+assert r["family_efforts"] == {"swe-2": "high"}
+assert M.auto_effort("swe-2") == "high"
+r = tc.patch("/admin/api/models/settings", headers=H,
+             json={"family_efforts": {"swe-2": ""}}).json()
+assert r["family_efforts"] == {}
+r = tc.patch("/admin/api/models/settings", headers=H,
+             json={"family_efforts": {"swe-2": "bogus"}})
 assert r.status_code == 400
 tc.patch("/admin/api/models/settings", headers=H,
          json={"default_model": "", "default_effort": "", "aliases": ""})

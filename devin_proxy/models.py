@@ -199,35 +199,64 @@ def alias_effort(name):
     return None
 
 
+def family_efforts():
+    """-> {family: effort} per-family default variants (admin setting)."""
+    try:
+        d = json.loads(store.meta_get("family_efforts") or "{}")
+        if isinstance(d, dict):
+            return {_norm_fam(k): v.strip().lower()
+                    for k, v in d.items()
+                    if str(v).strip().lower() in EFFORT_SUFFIX}
+    except Exception:
+        pass
+    return {}
+
+
 def default_effort():
     """Global default effort (admin setting), or None."""
     e = (store.meta_get("default_effort") or "").strip().lower()
     return e if e in EFFORT_SUFFIX else None
 
 
+def _family_of_name(n):
+    """Alias/bare name -> family slug: builtin alias spec, remote alias,
+    else the name itself."""
+    spec = ALIAS_DEFS.get(n)
+    if n in ALIAS_DEFS:
+        return spec[0] if spec else None
+    ra = _remote_aliases()
+    if n in ra:
+        return ra[n]
+    return n
+
+
 def auto_effort(name):
     """Effort to auto-apply when the request didn't specify
-    reasoning.effort: the alias's own setting wins, else the global
-    default — skipped when the requested name (or the configured
-    default model) already pins a variant suffix like '-high'."""
+    reasoning.effort. Precedence: alias's own @effort > per-family
+    default > global default. A variant suffix on the requested name
+    ('…-high') pins it; the configured default_model's suffix does not
+    suppress the global default."""
     n = str(name or "").strip()
+    pinned = bool(n)                 # an explicitly requested model
     if not n:
         n = (store.meta_get("default_model") or "").strip()
         if not n:
             return default_effort()
-    if split_effort(n)[1] is not None:
+    if pinned and split_effort(n)[1] is not None:
         return None
     ua = user_aliases()
     if n in ua:
         uid, eff = _alias_target(ua[n])
         if eff:
             return eff
-        if split_effort(uid)[1] is not None:
+        if pinned and split_effort(uid)[1] is not None:
             return None
-        return default_effort()
-    if n in uids():
-        return None
-    return default_effort()
+        n = uid                      # target may be a family name
+    fam = _family_of_name(n)
+    if fam:
+        fam = _norm_fam(split_effort(fam)[0] or fam)
+    fe = family_efforts().get(fam) if fam else None
+    return fe or default_effort()
 
 
 def entries():
@@ -273,7 +302,9 @@ def family_default(name, prefer=None):
              if e["family"] == (fam[0] if fam else n)]
     if not cands:
         return None
-    for want in [prefer or (fam[4] if fam else "medium"), "medium"]:
+    over = family_efforts().get(fam[0] if fam else n)
+    for want in [over, prefer or (fam[4] if fam else "medium"),
+                 "medium"]:
         for e in cands:
             if e["effort"] == want:
                 return e["uid"]
@@ -378,10 +409,12 @@ def grouped():
             "vendor": e["vendor"], "desc": "", "models": []})
         f["models"].append(e)
     out = list(fams.values())
+    overs = family_efforts()
     for f in out:
         meta = next((x for x in FAMILIES if x[0] == f["prefix"]), None)
         f["desc"] = meta[3] if meta else ""
-        f["default"] = meta[4] if meta else "medium"
+        f["default"] = overs.get(f["prefix"]) or \
+            (meta[4] if meta else "medium")
         f["order"] = min(m["order"] for m in f["models"])
     return sorted(out, key=lambda f: (f["order"], f["prefix"]))
 

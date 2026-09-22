@@ -151,10 +151,11 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   how many accounts advertise each model. Scheduling uses this too: a
   request only goes to accounts that actually advertised the model.
   Settings: default model, default effort (auto-applied to
-  family/alias requests that don't pin a variant), custom aliases
-  (`alias=uid`, optionally `alias=uid@effort` for a per-alias default
-  effort), and an extra JSON catalog URL (`DEVIN_PROXY_MODELS_URL`)
-  merged into the list
+  family/alias requests that don't pin a variant), per-family default
+  variants (click a variant chip to make it the family's default),
+  custom aliases (`alias=uid`, optionally `alias=uid@effort` for a
+  per-alias default effort), and an extra JSON catalog URL
+  (`DEVIN_PROXY_MODELS_URL`) merged into the list
 - **Playground** — test any model streaming or not, straight from the UI;
   optionally pin to a specific account
 - **API Keys** — mint `sk-dp-…` keys for callers (SHA-256 hashed in the

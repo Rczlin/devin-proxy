@@ -555,7 +555,21 @@ async function clearSessions(){
 
 // models
 const EFF={none:'无思考',low:'低',medium:'中',high:'高',xhigh:'超高',max:'满'};
-function modelChip(m){
+let _famEff={};
+function famChip(f,main){
+  const tags=[
+    main.context?`<span class="tag off">${fmt(main.context)} ctx</span>`:'',
+    main.images?'<span class="tag model" title="支持图像输入">👁 图像</span>':'',
+    main.thinking?'<span class="tag model" title="支持思考">🧠 思考</span>':'',
+    main.credit!=null?`<span class="tag off" title="${esc(main.cost_summary||'credit 消耗倍率')}">×${main.credit}</span>`:'',
+    main.effort?`<span class="tag ok" title="默认变体">默认·${esc(EFF[main.effort]||main.effort)}</span>`:'',
+    main.remote_accounts?`<span class="tag ok" title="广告此模型的上游账号数">${main.remote_accounts} 账号</span>`:'',
+  ].filter(Boolean).join('');
+  return `<button class="mchip" onclick="pickModel('${esc(f.prefix)}')" title="${esc(f.prefix)} — 点击在 Playground 试用">
+    <b>${esc(f.label)}</b><br><span class="muted" style="font-size:11px">${esc(f.prefix)}</span>
+    ${tags?'<br>'+tags:''}</button>`;
+}
+function modelChip(m,fam,isDef){
   const tags=[
     m.effort?`<span class="tag off">${esc(EFF[m.effort]||m.effort)}</span>`:'',
     m.context?`<span class="tag off">${fmt(m.context)} ctx</span>`:'',
@@ -566,10 +580,20 @@ function modelChip(m){
     m.cost_summary?`<span class="tag off" title="${esc(m.cost_summary)}">💲 ${esc(m.cost_summary.split(' · ')[0].replace(/ \/ .*/,''))}/1M</span>`:'',
     m.remote_accounts?`<span class="tag ok" title="广告此模型的上游账号数">${m.remote_accounts} 账号</span>`:'',
     m.url?'<span class="tag model">URL</span>':'',
+    isDef?'<span class="tag ok">★ 默认</span>':'',
   ].filter(Boolean).join('');
-  return `<button class="mchip" onclick="pickModel('${esc(m.uid)}')" title="${esc(m.uid)}">
+  const act=m.effort?`setFamDefault('${esc(fam)}','${esc(m.effort)}')`:`pickModel('${esc(m.uid)}')`;
+  const tip=m.effort?'点击设为该家族默认变体':'点击在 Playground 试用';
+  return `<button class="mchip" onclick="${act}" title="${esc(m.uid)} — ${tip}">
     <b>${esc(m.label)}</b><br><span class="muted" style="font-size:11px">${esc(m.uid)}</span>
     ${tags?'<br>'+tags:''}</button>`;
+}
+async function setFamDefault(fam,eff){
+  const d=await (await api('/admin/api/models/settings',{method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({family_efforts:{[fam]:eff}})})).json();
+  _famEff=d.family_efforts||{};
+  toast(`${fam} 默认 → ${EFF[eff]||eff}`);loadModels().catch(()=>{});
 }
 async function loadModels(){
   const d=await (await api('/admin/api/models')).json();
@@ -591,6 +615,7 @@ async function loadModels(){
     +(d.default_model&&!d.models.includes(d.default_model)?`<option selected>${esc(d.default_model)}</option>`:'');
   if(!d.default_model)sel.value='';
   $('#default-effort').value=d.default_effort||'';
+  _famEff=d.family_efforts||{};
   $('#alias-edit').value=Object.entries(d.user_aliases||{}).map(([a,t])=>`${a}=${t}`).join('\n');
   $('#model-fams').innerHTML=d.families.map(f=>{
     const prefer=f.default||'medium';
@@ -599,9 +624,9 @@ async function loadModels(){
     return `<div class="panel"><h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
       <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
       <span class="muted" style="float:right">${f.models.length} 变体</span></h3>
-      <div class="mgrid">${modelChip(main)}</div>
-      ${rest.length?`<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">展开其余 ${rest.length} 个变体</summary>
-        <div class="mgrid" style="margin-top:8px">${rest.map(modelChip).join('')}</div></details>`:''}
+      <div class="mgrid">${famChip(f,main)}</div>
+      ${rest.length?`<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">展开 ${rest.length} 个变体（点击设为默认）</summary>
+        <div class="mgrid" style="margin-top:8px">${rest.map(m=>modelChip(m,f.prefix,false)).join('')}</div></details>`:''}
       </div>`;
   }).join('')
     ||'<div class="panel muted">目录为空 — 点「立即同步」从上游账号拉取（或配置远端目录 URL）</div>';
