@@ -56,6 +56,23 @@ def _resolve_refs(items, index):
     return out
 
 
+# Call items paired with a matching *_output item further down the input.
+_CALL_ITEMS = {"function_call", "custom_tool_call", "local_shell_call",
+               "computer_call"}
+_OUT_ITEMS = {"function_call_output", "custom_tool_call_output",
+              "local_shell_call_output", "computer_call_output"}
+# Tool types whose calls take freeform input rather than JSON arguments.
+_FREEFORM_TOOLS = {"custom", "freeform"}
+
+
+def _json_or_str(v, default=""):
+    if isinstance(v, str):
+        return v
+    if v is None:
+        return default
+    return json.dumps(v, ensure_ascii=False)
+
+
 def items_to_messages(items):
     """Responses items -> chat-style messages (reuses app.map_messages)."""
     msgs = []
@@ -88,41 +105,79 @@ def items_to_messages(items):
                                       "text": note or f"[file: {name}]"})
                 content = parts
             msgs.append({"role": role, "content": content})
-        elif t == "function_call":
-            msgs.append({"role": "assistant", "content": None, "tool_calls": [{
-                "id": it.get("call_id") or it.get("id") or "",
-                "type": "function",
-                "function": {"name": it.get("name") or "",
-                             "arguments": it.get("arguments") or ""}}]})
-        elif t == "function_call_output":
+        elif t in _CALL_ITEMS:
+            cid = it.get("call_id") or it.get("id") or ""
+            name = it.get("name") or t
+            if t == "custom_tool_call":
+                # freeform input wrapped to match the synthesized schema in
+                # _norm_tools; unwrapped back to raw text on the way out
+                raw = it.get("input")
+                args = json.dumps(
+                    {"input": _json_or_str(raw)}, ensure_ascii=False)
+            elif t == "function_call":
+                args = _json_or_str(it.get("arguments"))
+            else:                   # local_shell_call / computer_call
+                args = _json_or_str(it.get("action"), "{}")
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": [{"id": cid, "type": "function",
+                                         "function": {"name": name,
+                                                      "arguments": args}}]})
+        elif t in _OUT_ITEMS:
             out = it.get("output")
             if isinstance(out, list):
                 out = "\n".join(str(p.get("text") or "") for p in out
                                 if isinstance(p, dict))
+            elif out is not None:
+                out = _json_or_str(out)
             msgs.append({"role": "tool",
                          "tool_call_id": it.get("call_id") or it.get("id") or "",
                          "content": out if out is not None else ""})
-        elif t == "reasoning":
-            text = "\n".join(
-                s.get("text") or "" for s in it.get("summary") or []
-                if isinstance(s, dict))
-            text += "\n" + "\n".join(
-                c.get("text") or "" for c in it.get("content") or []
-                if isinstance(c, dict))
-            msgs.append({"role": "assistant", "content": "",
-                         "reasoning_content": text.strip() or None})
+        # reasoning items are dropped on purpose: upstream needs a thinking
+        # signature to replay them and OpenAI's encrypted_content is opaque —
+        # forwarding either gets the request rejected by the provider.
+        # web_search_call / mcp_* / *_call without an output pair and other
+        # unknown types are dropped too.
     return msgs
 
 
 def _norm_tools(tools):
     out = []
     for t in tools or []:
-        if t.get("type") == "function":
+        ty = t.get("type")
+        if ty == "function":
+            fn = t.get("function") or t
+            out.append({"type": "function", "function": {
+                "name": fn.get("name") or "",
+                "description": fn.get("description") or "",
+                "parameters": fn.get("parameters")
+                or {"type": "object", "properties": {}}}})
+        elif ty in _FREEFORM_TOOLS:
+            # freeform input goes through the upstream function channel as a
+            # single string parameter; unwrapped on output (see output_items)
             out.append({"type": "function", "function": {
                 "name": t.get("name") or "",
                 "description": t.get("description") or "",
-                "parameters": t.get("parameters") or {}}})
-    return out
+                "parameters": {"type": "object",
+                               "properties": {"input": {"type": "string"}},
+                               "required": ["input"],
+                               "additionalProperties": False}}})
+    return [t for t in out if t["function"]["name"]]
+
+
+def custom_tool_names(body):
+    return {t.get("name") for t in body.get("tools") or []
+            if t.get("type") in _FREEFORM_TOOLS and t.get("name")}
+
+
+def _unwrap_input(args):
+    """{\"input\": \"...\"} arguments -> the raw freeform string."""
+    try:
+        d = json.loads(args)
+        if isinstance(d, dict) and isinstance(d.get("input"), str):
+            return d["input"]
+    except Exception:
+        pass
+    return args
 
 
 def _norm_tool_choice(tc):
@@ -187,7 +242,7 @@ def _usage_obj(u):
     }
 
 
-def output_items(text, think, agg):
+def output_items(text, think, agg, custom=frozenset()):
     items = []
     if think:
         items.append({"id": _iid("rs"), "type": "reasoning",
@@ -195,6 +250,12 @@ def output_items(text, think, agg):
                       "content": [{"type": "reasoning_text", "text": think}]})
     for cid in agg.order:
         c = agg.calls[cid]
+        if c["name"] in custom:
+            items.append({"id": _iid("fc"), "type": "custom_tool_call",
+                          "call_id": c["id"], "name": c["name"],
+                          "input": _unwrap_input(c["args"]),
+                          "status": "completed"})
+            continue
         items.append({"id": _iid("fc"), "type": "function_call",
                       "call_id": c["id"], "name": c["name"],
                       "arguments": c["args"], "status": "completed"})
@@ -278,7 +339,10 @@ def handle(request, body, t0, *, iter_chat, resolve_model, record,
                 or (f"resp:{body['previous_response_id']}"
                     if body.get("previous_response_id") else None)
                 or _fingerprint(messages_of(chat_body))
-                or (f"u:{body['user']}" if body.get("user") else None))
+                or (f"u:{u}" if (u := body.get("user")
+                                 or body.get("prompt_cache_key")
+                                 or body.get("safety_identifier"))
+                    else None))
         rid = _iid("resp")
         if body.get("stream"):
             resp = StreamingResponse(
@@ -352,7 +416,8 @@ def _collect(request, body, chat_body, model, skey, rid, items_in,
                usage, t0, None, account=acct_name, endpoint="responses")
         return _err(status if status < 600 else 502,
                     err.get("message", "upstream error"), type_="server_error")
-    items_out = output_items("".join(texts), "".join(think), agg)
+    items_out = output_items("".join(texts), "".join(think), agg,
+                             custom_tool_names(body))
     resp = response_object(rid, model, body, items_out, usage)
     _persist(body, rid, model, "completed", acct_name, skey,
              items_in, items_out, resp)
@@ -379,6 +444,7 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
          iter_chat, record, t0):
     rl = reqlog_for(request, body)
     em = _Emit()
+    custom = custom_tool_names(body)
     agg, usage, err = ToolAgg(), None, None
     acct_name, ttft = None, None
     base = response_object(rid, model, body, [], None, status="in_progress")
@@ -422,12 +488,21 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
         elif open_kind == "fc" and fc_open:
             c = agg.calls.get(fc_open["call_id"],
                               {"name": fc_open["name"], "args": ""})
-            yield em.ev("response.function_call_arguments.done",
-                        item_id=fc_open["id"], output_index=out_idx,
-                        arguments=c["args"])
-            item = {"id": fc_open["id"], "type": "function_call",
-                    "call_id": fc_open["call_id"], "name": c["name"],
-                    "arguments": c["args"], "status": "completed"}
+            if fc_open.get("custom"):
+                inp = _unwrap_input(c["args"])
+                yield em.ev("response.custom_tool_call_input.done",
+                            item_id=fc_open["id"], output_index=out_idx,
+                            input=inp)
+                item = {"id": fc_open["id"], "type": "custom_tool_call",
+                        "call_id": fc_open["call_id"], "name": c["name"],
+                        "input": inp, "status": "completed"}
+            else:
+                yield em.ev("response.function_call_arguments.done",
+                            item_id=fc_open["id"], output_index=out_idx,
+                            arguments=c["args"])
+                item = {"id": fc_open["id"], "type": "function_call",
+                        "call_id": fc_open["call_id"], "name": c["name"],
+                        "arguments": c["args"], "status": "completed"}
             fc_items.append(item)
             yield em.ev("response.output_item.done", output_index=out_idx,
                         item=item)
@@ -458,11 +533,16 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
         nonlocal out_idx, open_kind, fc_open
         out_idx += 1
         open_kind = "fc"
-        fc_open = {"id": _iid("fc"), "call_id": call_id, "name": name}
+        fc_open = {"id": _iid("fc"), "call_id": call_id, "name": name,
+                   "custom": name in custom}
+        item = {"id": fc_open["id"], "call_id": call_id, "name": name,
+                "status": "in_progress"}
+        if fc_open["custom"]:
+            item.update(type="custom_tool_call", input="")
+        else:
+            item.update(type="function_call", arguments="")
         yield em.ev("response.output_item.added", output_index=out_idx,
-                    item={"id": fc_open["id"], "type": "function_call",
-                          "call_id": call_id, "name": name,
-                          "arguments": "", "status": "in_progress"})
+                    item=item)
 
     yield rl.out(em.ev("response.created", response=base))
     yield rl.out(em.ev("response.in_progress", response=base))
@@ -509,7 +589,9 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
                             yield rl.out(x)
                 if delta and fc_open:
                     yield rl.out(em.ev(
-                        "response.function_call_arguments.delta",
+                        "response.custom_tool_call_input.delta"
+                        if fc_open.get("custom")
+                        else "response.function_call_arguments.delta",
                         item_id=fc_open["id"], output_index=out_idx,
                         delta=delta))
             if ev.HasField("usage"):
@@ -537,7 +619,8 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
         record(request, body, model, False, status, msg, usage, t0, ttft,
                account=acct_name, endpoint="responses")
     else:
-        items_out = output_items("".join(text_parts), "".join(think_parts), agg)
+        items_out = output_items("".join(text_parts), "".join(think_parts),
+                                 agg, custom)
         # keep generated ids stable with what we streamed
         k = 0
         for it in items_out:
@@ -545,7 +628,8 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
                 it["id"] = rs_id
             elif it["type"] == "message":
                 it["id"] = msg_id
-            elif it["type"] == "function_call" and k < len(fc_items):
+            elif it["type"] in ("function_call", "custom_tool_call") \
+                    and k < len(fc_items):
                 it.update(fc_items[k])
                 k += 1
         resp = response_object(rid, model, body, items_out, usage)

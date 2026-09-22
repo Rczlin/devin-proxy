@@ -304,9 +304,14 @@ def stream_chat(client, base_url, api_key, request, timeout=None):
                     ended = True
                     err = _trailer_error(raw)
                     if err:
+                        trailer_txt = raw.decode("utf-8", "replace")[:4000]
                         yield {"kind": "upstream_error", "message": err,
-                               "trailer": raw.decode("utf-8", "replace")[:4000],
-                               "soft": _is_soft(err)}
+                               "trailer": trailer_txt,
+                               # the provider-side error code lives only in
+                               # the trailer (e.g. "invalid_argument" for a
+                               # malformed forwarded request) — request-scoped
+                               # failures must not cool the account down
+                               "soft": _is_soft(err) or _is_soft(trailer_txt)}
                     continue
                 n_frames += 1
                 msg = proto.GetChatMessageResponse()
