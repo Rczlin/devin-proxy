@@ -235,57 +235,141 @@ def clear_requests():
         _conn().commit()
 
 
-def stats_overview():
+def stats_overview(hours=24):
+    """Windowed stats for the dashboard. hours<=0/None = all time.
+
+    The time series is bucketed adaptively (5m/30m/1h/4h/1d) and returned
+    gap-free — every bucket in [since, now] is present, zeros included."""
     with _lock:
         c = _conn()
         now = time.time()
         today = now - (now + _tz_offset()) % 86400
-        row = c.execute("""
-          SELECT COUNT(*) total,
-                 SUM(ok) ok_count,
-                 SUM(prompt_tokens) in_tok,
-                 SUM(completion_tokens) out_tok,
-                 AVG(latency_ms) avg_lat,
-                 AVG(ttft_ms) avg_ttft
-          FROM requests""").fetchone()
-        today_row = c.execute("""
-          SELECT COUNT(*) total, SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok
-          FROM requests WHERE ts>=?""", (today,)).fetchone()
-        by_model = c.execute("""
-          SELECT COALESCE(resolved_model,model) m, COUNT(*) n,
+        if hours:
+            since = now - hours * 3600
+            if hours <= 3:
+                bucket = 300
+            elif hours <= 24:
+                bucket = 1800
+            elif hours <= 96:
+                bucket = 3600
+            elif hours <= 336:
+                bucket = 14400
+            else:
+                bucket = 86400
+        else:
+            lo = c.execute("SELECT MIN(ts) t FROM requests").fetchone()["t"]
+            since = lo or (now - 86400)
+            days = max(1, int((now - since) / 86400) + 1)
+            bucket = 86400 * max(1, -(-days // 60))
+        # bucket start alignment: day+ buckets land on local midnight,
+        # sub-day buckets on whole UTC multiples (hour marks in CST too)
+        tz = _tz_offset() if bucket >= 86400 else 0
+        base = int(since + tz) - int(since + tz) % bucket - tz
+        where, wargs = " WHERE ts>=?", [since]
+
+        tot = c.execute(f"""
+          SELECT COUNT(*) n, SUM(ok) ok_n, SUM(stream) st,
                  SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
-                 AVG(latency_ms) avg_lat,
-                 SUM(1-ok) errs
-          FROM requests GROUP BY m ORDER BY n DESC LIMIT 20""").fetchall()
-        since = time.time() - 24 * 3600
-        hourly = c.execute("""
-          SELECT CAST((ts - ?)/3600 AS INT) h, COUNT(*) n,
-                 SUM(prompt_tokens+completion_tokens) tok, SUM(1-ok) errs
-          FROM requests WHERE ts>=? GROUP BY h ORDER BY h""",
-          (since, since)).fetchall()
+                 AVG(latency_ms) avg_lat, AVG(ttft_ms) avg_ttft
+          FROM requests{where}""", wargs).fetchone()
+
+        def _pct(p):
+            n = tot["ok_n"] or 0
+            if not n:
+                return 0
+            r = c.execute(
+                f"SELECT latency_ms FROM requests{where} AND ok=1"
+                " ORDER BY latency_ms LIMIT 1 OFFSET ?",
+                wargs + [min(n - 1, int(n * p))]).fetchone()
+            return r[0] if r else 0
+
+        rows = c.execute(f"""
+          SELECT CAST((ts - ?)/{bucket} AS INT) b, COUNT(*) n,
+                 SUM(1-ok) errs, SUM(prompt_tokens) in_tok,
+                 SUM(completion_tokens) out_tok, AVG(latency_ms) avg_lat
+          FROM requests{where} GROUP BY b""", [base] + wargs).fetchall()
+        byb = {r["b"]: r for r in rows}
+        nb = max(0, int((now - base) // bucket))
+        series = [{"t": base + b * bucket,
+                   "n": r["n"] if (r := byb.get(b)) else 0,
+                   "errs": (r["errs"] or 0) if r else 0,
+                   "in_tok": (r["in_tok"] or 0) if r else 0,
+                   "out_tok": (r["out_tok"] or 0) if r else 0,
+                   "avg_lat": round(r["avg_lat"] or 0) if r else 0}
+                  for b in range(nb + 1)]
+
+        by_model = c.execute(f"""
+          SELECT COALESCE(resolved_model,model) m, COUNT(*) n,
+                 SUM(1-ok) errs, SUM(prompt_tokens) in_tok,
+                 SUM(completion_tokens) out_tok, AVG(latency_ms) avg_lat,
+                 AVG(ttft_ms) avg_ttft, MAX(ts) last_used
+          FROM requests{where} GROUP BY m ORDER BY n DESC LIMIT 24""",
+            wargs).fetchall()
+        by_account = c.execute(f"""
+          SELECT account a, COUNT(*) n, SUM(1-ok) errs,
+                 SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
+                 AVG(latency_ms) avg_lat, MAX(ts) last_used
+          FROM requests{where} AND account IS NOT NULL
+          GROUP BY a ORDER BY n DESC""", wargs).fetchall()
+        by_key = c.execute(f"""
+          SELECT key_name k, COUNT(*) n, SUM(1-ok) errs,
+                 SUM(prompt_tokens+completion_tokens) tok, MAX(ts) last_used
+          FROM requests{where} GROUP BY key_name ORDER BY n DESC""",
+            wargs).fetchall()
+        by_endpoint = c.execute(f"""
+          SELECT COALESCE(endpoint,'chat') ep, COUNT(*) n, SUM(1-ok) errs
+          FROM requests{where} GROUP BY ep ORDER BY n DESC""",
+            wargs).fetchall()
+        recent_errors = c.execute(f"""
+          SELECT id,ts,model,resolved_model,status,error,account,key_name,
+                 latency_ms,flags
+          FROM requests{where} AND ok=0 ORDER BY id DESC LIMIT 12""",
+            wargs).fetchall()
+        rpm = c.execute("SELECT COUNT(*) c FROM requests WHERE ts>=?",
+                        (now - 60,)).fetchone()["c"]
+        tok5 = c.execute(
+            "SELECT SUM(prompt_tokens+completion_tokens) t FROM requests"
+            " WHERE ts>=?", (now - 300,)).fetchone()["t"] or 0
         truncated = c.execute(
-            "SELECT COUNT(*) c FROM requests WHERE flags LIKE '%truncated%'",
-        ).fetchone()["c"]
+            f"SELECT COUNT(*) c FROM requests{where}"
+            " AND flags LIKE '%truncated%'", wargs).fetchone()["c"]
         retried = c.execute(
-            "SELECT COUNT(*) c FROM requests WHERE flags LIKE '%retried%'",
-        ).fetchone()["c"]
+            f"SELECT COUNT(*) c FROM requests{where}"
+            " AND flags LIKE '%retried%'", wargs).fetchone()["c"]
+        all_total = c.execute("SELECT COUNT(*) c FROM requests").fetchone()["c"]
+        today_row = c.execute("""
+          SELECT COUNT(*) total, SUM(prompt_tokens) in_tok,
+                 SUM(completion_tokens) out_tok
+          FROM requests WHERE ts>=?""", (today,)).fetchone()
         db_size = os.path.getsize(_DB_PATH) if os.path.exists(_DB_PATH) else 0
     return {
-        "total": row["total"] or 0,
-        "errors": (row["total"] or 0) - (row["ok_count"] or 0),
+        "hours": hours or 0,
+        "bucket_s": bucket,
+        "since": since,
+        "now": now,
+        "total": tot["n"] or 0,
+        "errors": (tot["n"] or 0) - (tot["ok_n"] or 0),
+        "streams": tot["st"] or 0,
+        "input_tokens": tot["in_tok"] or 0,
+        "output_tokens": tot["out_tok"] or 0,
+        "avg_latency_ms": round(tot["avg_lat"] or 0),
+        "avg_ttft_ms": round(tot["avg_ttft"] or 0),
+        "p50_ms": _pct(0.5),
+        "p95_ms": _pct(0.95),
+        "rpm": rpm,
+        "tpm": round(tok5 / 5),
         "truncated": truncated,
         "retried": retried,
-        "input_tokens": row["in_tok"] or 0,
-        "output_tokens": row["out_tok"] or 0,
-        "avg_latency_ms": round(row["avg_lat"] or 0),
-        "avg_ttft_ms": round(row["avg_ttft"] or 0),
         "today": {"requests": today_row["total"] or 0,
                   "input_tokens": today_row["in_tok"] or 0,
                   "output_tokens": today_row["out_tok"] or 0},
+        "alltime": {"requests": all_total},
+        "series": series,
         "by_model": [dict(r) for r in by_model],
-        "hourly": [{"hour_ago": 23 - r["h"], "requests": r["n"],
-                    "tokens": r["tok"] or 0, "errors": r["errs"] or 0}
-                   for r in hourly],
+        "by_account": [dict(r) for r in by_account],
+        "by_key": [dict(r) for r in by_key],
+        "by_endpoint": [dict(r) for r in by_endpoint],
+        "recent_errors": [dict(r) for r in recent_errors],
         "db_size": db_size,
         "max_rows": _MAX_ROWS,
     }

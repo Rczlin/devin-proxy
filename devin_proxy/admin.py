@@ -96,8 +96,24 @@ def make_router(app):
         return HTMLResponse(open(_HTML, encoding="utf-8").read())
 
     @router.get("/api/overview", dependencies=[Depends(admin_key)])
-    def overview():
-        return store.stats_overview()
+    def overview(hours: int = 24):
+        d = store.stats_overview(hours if 0 < hours <= 24 * 366 else None)
+        accs = app.state.pool.accounts()
+        now = time.time()
+        p = app.state.pool.summary()
+        p["in_flight"] = sum(a.in_flight for a in accs)
+        p["accounts"] = [{
+            "id": a.id, "label": a.display(), "plan": a.plan,
+            "state": "disabled" if a.disabled else (
+                "cooldown" if a.cooldown_until > now else "ready"),
+            "in_flight": a.in_flight,
+            "max_concurrent": a.max_concurrent,
+            "cooldown_s": max(0, round(a.cooldown_until - now)),
+            "fails": a.consecutive_fails,
+        } for a in accs]
+        d["pool"] = p
+        d["uptime_s"] = time.time() - started
+        return d
 
     @router.get("/api/requests", dependencies=[Depends(admin_key)])
     def requests(limit: int = 50, offset: int = 0, model: str = None,
