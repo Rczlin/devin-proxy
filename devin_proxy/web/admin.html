@@ -126,6 +126,15 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 .livedot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pl 2s infinite;vertical-align:1px}
 @keyframes pl{50%{opacity:.35}}
 .fchip{display:inline-flex;align-items:center;gap:6px;background:#1f6feb22;border:1px solid var(--accent);color:var(--accent);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
+/* request log row ops: sticky right column + compact buttons */
+#rq-body tr[onclick]{cursor:pointer}
+th.ops,td.ops{position:sticky;right:0;text-align:right;white-space:nowrap;background:var(--panel);box-shadow:-1px 0 0 var(--border)}
+tr:hover td.ops{background:#1a2129}
+#rq-body tr.rerr{background:#f851490a}
+#rq-body tr.rerr td.ops{background:#1f1d24}
+#rq-body tr.rerr:hover td.ops{background:#252230}
+.ops .mini{padding:1px 9px;font-size:12px;background:transparent;color:var(--dim);border-radius:5px}
+.ops .mini:hover{color:var(--accent);border-color:var(--accent)}
 @media(max-width:760px){.side{width:56px}.side h1 span:last-child,.nav a span{display:none}.nav a{justify-content:center}}
 </style>
 </head>
@@ -214,7 +223,7 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
       </div>
       <div class="panel" style="padding:0;overflow-x:auto">
         <table><thead><tr>
-          <th>#</th><th>时间</th><th>模型</th><th>接口</th><th>流式</th><th>状态</th><th>输入</th><th>输出</th><th>缓存</th><th>延迟</th><th>TTFT</th><th>TPS</th><th>账号</th><th>Key</th><th></th>
+          <th>#</th><th>时间</th><th>模型</th><th>接口</th><th>流式</th><th>状态</th><th>输入</th><th>输出</th><th>缓存</th><th>延迟</th><th>TTFT</th><th>TPS</th><th>账号</th><th>Key</th><th class="ops">操作</th>
         </tr></thead><tbody id="rq-body"></tbody></table>
       </div>
     </section>
@@ -627,7 +636,7 @@ async function loadReqs(){
   $('#rq-page').textContent=`第 ${Math.floor(reqOffset/PAGE)+1} / ${Math.max(1,Math.ceil(d.total/PAGE))} 页`;
   $('#rq-prev').disabled=reqOffset<=0;
   $('#rq-next').disabled=reqOffset+PAGE>=d.total;
-  $('#rq-body').innerHTML=d.items.map(r=>`<tr${r.ok?'':' style="background:#f851490a"'}>
+  $('#rq-body').innerHTML=d.items.map(r=>`<tr${r.ok?'':' class="rerr"'} onclick="showReq(${r.id})">
     <td>${r.id}</td><td>${fmtT(r.ts)}</td>
     <td><span class="tag model">${esc(r.resolved_model||r.model)}</span></td>
     <td class="muted">${esc(r.endpoint||'chat')}</td>
@@ -636,7 +645,7 @@ async function loadReqs(){
     <td>${r.prompt_tokens}</td><td>${r.completion_tokens}</td><td>${cacheCell(r)}</td>
     <td>${r.latency_ms}ms</td><td>${r.ttft_ms??'-'}</td><td>${r.tps??'-'}</td>
     <td>${esc(r.account||'')}</td><td>${esc(r.key_name||'')}</td>
-    <td><a onclick="showReq(${r.id})">详情</a>${r.has_cap?` <a onclick="dlCapture(${r.id})" title="下载完整抓包">📦</a>`:''}</td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';
+    <td class="ops"><button class="mini" onclick="event.stopPropagation();showReq(${r.id})">详情</button>${r.has_cap?` <button class="mini" onclick="event.stopPropagation();dlCapture(${r.id})" title="导出该请求完整抓包 JSON">📥 抓包</button>`:''}</td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';
 }
 function reqPage(d){reqOffset=Math.max(0,reqOffset+d*PAGE);loadReqs()}
 setInterval(()=>{if($('#p-reqs').classList.contains('on')&&$('#rq-auto').checked)loadReqs().catch(()=>{})},5000);
