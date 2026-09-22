@@ -76,25 +76,38 @@ def _desktop_api_key(db_path):
 
 
 class Credentials:
-    def __init__(self, api_key, api_server_url=DEFAULT_API_SERVER, source=None):
+    def __init__(self, api_key, api_server_url=DEFAULT_API_SERVER, source=None,
+                 webapp_host=None, api_url=None):
         self.api_key = api_key
         self.api_server_url = api_server_url.rstrip("/")
         self.source = source
+        self.webapp_host = webapp_host
+        self.api_url = api_url
 
 
-def load():
+def detect_all():
+    """Every credential source found on this machine/env, in precedence order."""
+    found = []
+    seen = set()
+
+    def add(c):
+        if c and c.api_key and c.api_key not in seen:
+            seen.add(c.api_key)
+            found.append(c)
+
     token_file = os.environ.get("DEVIN_SESSION_TOKEN_FILE")
     if token_file:
         try:
             key = open(token_file, encoding="utf-8").read().strip()
             if key:
-                return Credentials(key, os.environ.get("DEVIN_API_SERVER_URL",
-                                   DEFAULT_API_SERVER), token_file)
+                add(Credentials(key, os.environ.get("DEVIN_API_SERVER_URL",
+                                DEFAULT_API_SERVER), f"token-file:{token_file}"))
         except OSError:
             pass
     env_key = os.environ.get("DEVIN_SESSION_TOKEN") or os.environ.get("WINDSURF_API_KEY")
     if env_key:
-        return Credentials(env_key, os.environ.get("DEVIN_API_SERVER_URL", DEFAULT_API_SERVER), "env")
+        add(Credentials(env_key, os.environ.get("DEVIN_API_SERVER_URL",
+                        DEFAULT_API_SERVER), "env"))
     for path in _credentials_paths():
         try:
             if not os.path.exists(path):
@@ -102,12 +115,15 @@ def load():
             data = _toml_strings(open(path, encoding="utf-8").read())
             key = data.get("windsurf_api_key") or data.get("api_key")
             if key:
-                return Credentials(key, data.get("api_server_url", DEFAULT_API_SERVER), path)
+                add(Credentials(key, data.get("api_server_url", DEFAULT_API_SERVER),
+                                f"cli:{path}",
+                                webapp_host=data.get("devin_webapp_host"),
+                                api_url=data.get("devin_api_url")))
         except Exception:
             continue
     for db in _desktop_dbs():
         if os.path.exists(db):
             key = _desktop_api_key(db)
             if key:
-                return Credentials(key, source=db)
-    return None
+                add(Credentials(key, source=f"desktop:{db}"))
+    return found
