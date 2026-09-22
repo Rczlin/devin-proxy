@@ -174,6 +174,7 @@ def _load():
 
 
 def user_aliases():
+    """-> {alias: "uid" | "uid@effort"} as stored."""
     try:
         d = json.loads(store.meta_get("model_aliases") or "{}")
         return ({str(k).strip(): str(v).strip() for k, v in d.items()
@@ -181,6 +182,52 @@ def user_aliases():
                 if isinstance(d, dict) else {})
     except Exception:
         return {}
+
+
+def _alias_target(v):
+    """'uid@effort' -> (uid, effort); 'uid' -> (uid, None)."""
+    uid, _, eff = str(v or "").partition("@")
+    eff = eff.strip().lower()
+    return uid.strip(), (eff if eff in EFFORT_SUFFIX else None)
+
+
+def alias_effort(name):
+    """Per-alias default effort, e.g. 'opus=claude-opus-5@low'."""
+    ua = user_aliases()
+    if str(name or "").strip() in ua:
+        return _alias_target(ua[str(name).strip()])[1]
+    return None
+
+
+def default_effort():
+    """Global default effort (admin setting), or None."""
+    e = (store.meta_get("default_effort") or "").strip().lower()
+    return e if e in EFFORT_SUFFIX else None
+
+
+def auto_effort(name):
+    """Effort to auto-apply when the request didn't specify
+    reasoning.effort: the alias's own setting wins, else the global
+    default — skipped when the requested name (or the configured
+    default model) already pins a variant suffix like '-high'."""
+    n = str(name or "").strip()
+    if not n:
+        n = (store.meta_get("default_model") or "").strip()
+        if not n:
+            return default_effort()
+    if split_effort(n)[1] is not None:
+        return None
+    ua = user_aliases()
+    if n in ua:
+        uid, eff = _alias_target(ua[n])
+        if eff:
+            return eff
+        if split_effort(uid)[1] is not None:
+            return None
+        return default_effort()
+    if n in uids():
+        return None
+    return default_effort()
 
 
 def entries():
@@ -252,7 +299,8 @@ def _resolve(name, use_defaults=True):
         return None
     ua = user_aliases()
     if n in ua:
-        return ua[n]
+        t, _ = _alias_target(ua[n])
+        return t if t in uids() else (family_default(t) or t)
     spec = ALIAS_DEFS.get(n)
     if n in ALIAS_DEFS:
         if spec is None:
@@ -291,11 +339,15 @@ def aliases():
     """alias -> resolved uid. Builtin aliases are listed only while their
     target exists in the catalog (or the catalog is still empty)."""
     known = uids()
-    out = dict(user_aliases())
-    for a, spec in ALIAS_DEFS.items():
-        t = resolve(a)
-        if t and (not known or t in known):
+    out = {}
+    for a in user_aliases():
+        t = _resolve(a)
+        if t:
             out[a] = t
+    for a in ALIAS_DEFS:
+        t = _resolve(a)
+        if t and (not known or t in known):
+            out.setdefault(a, t)
     for a in _remote_aliases():
         t = resolve(a)
         if t and (not known or t in known):
@@ -329,6 +381,7 @@ def grouped():
     for f in out:
         meta = next((x for x in FAMILIES if x[0] == f["prefix"]), None)
         f["desc"] = meta[3] if meta else ""
+        f["default"] = meta[4] if meta else "medium"
         f["order"] = min(m["order"] for m in f["models"])
     return sorted(out, key=lambda f: (f["order"], f["prefix"]))
 

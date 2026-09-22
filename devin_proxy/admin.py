@@ -128,6 +128,7 @@ def make_router(app):
                 "aliases": models_mod.aliases(),
                 "user_aliases": models_mod.user_aliases(),
                 "default_model": models_mod.default_uid(),
+                "default_effort": models_mod.default_effort(),
                 "sync": models_mod.sync_info(),
                 "stats": store.list_models()}
 
@@ -138,8 +139,9 @@ def make_router(app):
 
     class ModelSettings(BaseModel):
         default_model: Optional[str] = None
+        default_effort: Optional[str] = None
         models_url: Optional[str] = None
-        aliases: Optional[str] = None     # "alias=uid" per line, or JSON dict
+        aliases: Optional[str] = None     # "alias=uid[@effort]" per line, or JSON
 
     @router.patch("/api/models/settings", dependencies=[Depends(admin_key)])
     def models_settings(body: ModelSettings):
@@ -149,6 +151,11 @@ def make_router(app):
                     and d not in models_mod.aliases():
                 raise HTTPException(400, "unknown model")
             store.meta_set("default_model", d)
+        if body.default_effort is not None:
+            e = body.default_effort.strip().lower()
+            if e and e not in models_mod.EFFORT_SUFFIX:
+                raise HTTPException(400, "unknown effort")
+            store.meta_set("default_effort", e)
         if body.models_url is not None:
             u = body.models_url.strip()
             if u and not u.startswith(("http://", "https://")):
@@ -171,8 +178,13 @@ def make_router(app):
                         k, v = line.split("=", 1)
                         if k.strip() and v.strip():
                             parsed[k.strip()] = v.strip()
+            for k, v in parsed.items():
+                eff = v.rpartition("@")[2].strip().lower()
+                if "@" in v and eff not in models_mod.EFFORT_SUFFIX:
+                    raise HTTPException(400, f"{k}: unknown effort @{eff}")
             store.meta_set("model_aliases", json.dumps(parsed))
         return {"ok": True, "default_model": models_mod.default_uid(),
+                "default_effort": models_mod.default_effort(),
                 "aliases": models_mod.aliases(),
                 "models_url": models_mod.models_url()}
 

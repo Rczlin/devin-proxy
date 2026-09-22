@@ -146,6 +146,23 @@ al = M.aliases()
 assert al["opus"] == "claude-opus-5-high" and "default" in al
 print("resolve/aliases OK:", al)
 
+# ---- auto effort: global default + per-alias @effort ----
+store.meta_set("default_effort", "")
+assert M.auto_effort("claude-sonnet-5") is None       # unset -> no remap
+assert M.auto_effort("claude-sonnet-5-high") is None  # explicit variant
+store.meta_set("default_effort", "high")
+assert M.auto_effort("claude-sonnet-5") == "high"     # family -> default
+assert M.auto_effort("opus") == "high"                # builtin alias
+assert M.auto_effort("claude-sonnet-5-low") is None   # pinned variant
+store.meta_set("model_aliases", '{"fast": "claude-sonnet-5@low",'
+                                ' "big": "claude-opus-5-max"}')
+assert M.auto_effort("fast") == "low"                 # per-alias effort
+assert M.auto_effort("big") is None                   # alias pins variant
+assert M.resolve("fast") == "claude-sonnet-5-medium"  # family target
+store.meta_set("default_effort", "")
+store.meta_set("model_aliases", "{}")
+print("auto_effort OK")
+
 # ---- served_by (scheduling restriction) ----
 allowed, known = M.served_by({"acct-b-only"})
 assert allowed == {2} and known == {1, 2}
@@ -194,28 +211,50 @@ print("admin /api/models OK:", len(d["models"]), "models,",
 
 d = tc.get("/v1/models", headers=H).json()
 ids = {m["id"] for m in d["data"]}
-assert "claude-sonnet-5-medium" in ids and "sonnet" in ids
-one = next(m for m in d["data"] if m["id"] == "claude-sonnet-5-medium")
+# collapsed: one entry per family, variants hidden behind reasoning.effort
+assert "claude-sonnet-5" in ids and "claude-sonnet-5-medium" not in ids
+assert "sonnet" in ids
+one = next(m for m in d["data"] if m["id"] == "claude-sonnet-5")
 assert one["owned_by"] == "Anthropic" and one["capabilities"]["thinking"]
 assert one["context_window"] == 400000 and one["source"] == "remote"
+assert "medium" in one["efforts"] and "high" in one["efforts"]
 al = next(m for m in d["data"] if m["id"] == "sonnet")
 assert al["alias_of"] == "claude-sonnet-5-medium"
 print("/v1/models OK:", len(d["data"]), "entries")
+# ?variants=1 exposes the full uid list
+d = tc.get("/v1/models?variants=1", headers=H).json()
+ids = {m["id"] for m in d["data"]}
+assert "claude-sonnet-5-medium" in ids
+print("/v1/models?variants=1 OK:", len(d["data"]), "entries")
 
-# settings: default model + user alias
+# settings: default model + default effort + user alias
 r = tc.patch("/admin/api/models/settings", headers=H, json={
-    "default_model": "swe-2-high", "aliases": "mine=swe-2-high\n"}).json()
-assert r["default_model"] == "swe-2-high" and r["aliases"]["mine"]
+    "default_model": "swe-2-high", "default_effort": "low",
+    "aliases": "mine=swe-2@high\n"}).json()
+assert r["default_model"] == "swe-2-high" and r["default_effort"] == "low"
+assert r["aliases"]["mine"] == "swe-2-high"
 assert M.resolve("mine") == "swe-2-high"
+assert M.alias_effort("mine") == "high"
 r = tc.patch("/admin/api/models/settings", headers=H,
              json={"default_model": "no-such-model-xyz"})
 assert r.status_code == 400
+r = tc.patch("/admin/api/models/settings", headers=H,
+             json={"default_effort": "bogus"})
+assert r.status_code == 400
+r = tc.patch("/admin/api/models/settings", headers=H,
+             json={"aliases": "bad=swe-2@bogus"})
+assert r.status_code == 400
+tc.patch("/admin/api/models/settings", headers=H,
+         json={"default_model": "", "default_effort": "", "aliases": ""})
 print("settings OK")
 
 # per-key model allowlist still filters /v1/models
 k = tc.post("/admin/api/keys", headers=H,
             json={"name": "t", "models": "swe-2-high"}).json()["key"]
 d = tc.get("/v1/models",
+           headers={"Authorization": f"Bearer {k}"}).json()
+assert {m["id"] for m in d["data"]} == {"swe-2"}
+d = tc.get("/v1/models?variants=1",
            headers={"Authorization": f"Bearer {k}"}).json()
 assert {m["id"] for m in d["data"]} == {"swe-2-high"}
 print("key allowlist filter OK")

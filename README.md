@@ -150,8 +150,11 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   context-window / vision / thinking / credit / pricing badges and shows
   how many accounts advertise each model. Scheduling uses this too: a
   request only goes to accounts that actually advertised the model.
-  Settings: default model, custom aliases (`alias=uid`), and an extra
-  JSON catalog URL (`DEVIN_PROXY_MODELS_URL`) merged into the list
+  Settings: default model, default effort (auto-applied to
+  family/alias requests that don't pin a variant), custom aliases
+  (`alias=uid`, optionally `alias=uid@effort` for a per-alias default
+  effort), and an extra JSON catalog URL (`DEVIN_PROXY_MODELS_URL`)
+  merged into the list
 - **Playground** — test any model streaming or not, straight from the UI;
   optionally pin to a specific account
 - **API Keys** — mint `sk-dp-…` keys for callers (SHA-256 hashed in the
@@ -176,20 +179,27 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   `response.completed`, …)
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`,
   `GET /v1/responses/{id}/input_items`
-- `GET /v1/models` — the synced catalog + aliases, with per-model
-  `display_name`, `family`, `effort`, `context_window`,
+- `GET /v1/models` — the synced catalog collapsed to one entry per
+  family (`id` = family name like `claude-sonnet-5`, `efforts` lists the
+  available variants) + aliases, with `display_name`, `context_window`,
   `max_output_tokens`, `credit_cost`, `cost_summary`, `capabilities`
-  and `source` (filtered to the caller key's allowlist when set)
+  and `source` taken from the family's default variant. `?variants=1`
+  returns every variant uid instead. Filtered to the caller key's
+  allowlist when set
 - `GET /healthz` — `{"ok": true}` only
 - `/admin` — sign-in page → cookie session → `/admin/app` console
 
-Model: pass a variant uid as reported by the catalog
-(`claude-sonnet-5-medium`, `swe-2-high`, …), a bare family name
-(`swe-2`, `claude-opus-5` — resolves to the family's default variant),
-or an alias (`claude`, `sonnet`, `opus`, `gemini`, `gpt`, `codex`,
-`swe`, plus custom ones). Unknown names pass through to upstream as-is.
-`reasoning.effort` / `reasoning_effort` (`minimal|none|low|medium|high|
-xhigh|max`) remaps the uid's effort suffix when the variant exists.
+Model: pass a family name as listed by `/v1/models` (`claude-sonnet-5`,
+`swe-2`, …), a specific variant uid (`claude-sonnet-5-medium`,
+`swe-2-high`), or an alias (`claude`, `sonnet`, `opus`, `gemini`,
+`gpt`, `codex`, `swe`, plus upstream and custom ones). A bare family
+name resolves to the family's default variant; `reasoning.effort` /
+`reasoning_effort` (`minimal|none|low|medium|high|xhigh|max`) then
+auto-applies the matching variant by remapping the uid's effort suffix.
+When a request doesn't specify an effort, the per-alias `@effort`
+setting wins, else the admin's default effort — names that already pin
+a variant (`…-high`, or an alias whose target does) are left alone.
+Unknown names pass through to upstream as-is.
 
 ## Layout
 
