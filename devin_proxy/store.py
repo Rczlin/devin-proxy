@@ -1,5 +1,7 @@
 """SQLite persistence: request log, usage stats, proxy API keys, accounts."""
+import gzip
 import hashlib
+import json
 import os
 import secrets
 import sqlite3
@@ -13,6 +15,10 @@ if os.name == "nt" and "DEVIN_PROXY_DB" not in os.environ:
                             "devin-proxy", "devin-proxy.db")
 
 _MAX_ROWS = int(os.environ.get("DEVIN_PROXY_MAX_ROWS", "50000"))
+# Full-fidelity captures (untruncated wire data) are kept for ALL failed
+# requests but only the newest _CAP_KEEP successful ones — a successful
+# stream can be megabytes and the db should stay portable.
+_CAP_KEEP = int(os.environ.get("DEVIN_PROXY_CAP_KEEP", "300"))
 
 _lock = threading.Lock()
 _con = None
@@ -50,6 +56,12 @@ def _conn():
         );
         CREATE INDEX IF NOT EXISTS idx_req_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_req_model ON requests(model);
+        CREATE TABLE IF NOT EXISTS captures (
+          request_id INTEGER PRIMARY KEY,
+          ts REAL NOT NULL,
+          ok INTEGER DEFAULT 1,
+          data BLOB            -- gzip(json) full-fidelity capture
+        );
 
         CREATE TABLE IF NOT EXISTS api_keys (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -175,7 +187,7 @@ def log_request(model, resolved_model, stream, ok, status, error,
                 upstream_req_id=None):
     global _insert_count
     with _lock:
-        _conn().execute(
+        cur = _conn().execute(
             "INSERT INTO requests (ts,model,resolved_model,stream,ok,status,error,"
             "prompt_tokens,completion_tokens,latency_ms,ttft_ms,client,key_name,"
             "account,endpoint,messages_json,request_json,events_json,sse_json,"
@@ -193,7 +205,53 @@ def log_request(model, resolved_model, stream, ok, status, error,
                 "DELETE FROM requests WHERE id < "
                 "(SELECT MIN(id) FROM (SELECT id FROM requests ORDER BY id DESC LIMIT ?))",
                 (_MAX_ROWS,))
+            _conn().execute(
+                "DELETE FROM captures WHERE request_id NOT IN "
+                "(SELECT id FROM requests)")
         _conn().commit()
+        return cur.lastrowid
+
+
+def save_capture(request_id, ok, payload):
+    """Store a full-fidelity capture (dict -> gzip blob) for one request row.
+    Failure captures are kept forever; success captures are pruned to the
+    newest _CAP_KEEP. Never raises — capture must not break the request."""
+    try:
+        blob = gzip.compress(json.dumps(payload, ensure_ascii=False,
+                                        default=str).encode())
+    except Exception:
+        return
+    with _lock:
+        _conn().execute(
+            "INSERT OR REPLACE INTO captures (request_id,ts,ok,data)"
+            " VALUES (?,?,?,?)",
+            (request_id, time.time(), int(ok), blob))
+        _conn().execute(
+            "DELETE FROM captures WHERE ok=1 AND request_id NOT IN "
+            "(SELECT request_id FROM captures WHERE ok=1"
+            " ORDER BY request_id DESC LIMIT ?)", (_CAP_KEEP,))
+        _conn().commit()
+
+
+def get_capture(request_id):
+    with _lock:
+        r = _conn().execute("SELECT data FROM captures WHERE request_id=?",
+                            (request_id,)).fetchone()
+    if not r:
+        return None
+    try:
+        return json.loads(gzip.decompress(r["data"]).decode("utf-8"))
+    except Exception:
+        return None
+
+
+def export_captures():
+    """[{request_id, ok, data(gzip blob)}] for the diagnostic bundle."""
+    with _lock:
+        rows = _conn().execute(
+            "SELECT request_id,ok,data FROM captures"
+            " ORDER BY request_id").fetchall()
+    return [dict(r) for r in rows]
 
 
 def _where(model=None, ok=None, q=None, account=None, flag=None):
@@ -220,7 +278,9 @@ def _where(model=None, ok=None, q=None, account=None, flag=None):
 _REQ_LIST_COLS = ("id,ts,model,resolved_model,stream,ok,status,error,"
                   "prompt_tokens,completion_tokens,cached_tokens,"
                   "cache_creation_tokens,latency_ms,ttft_ms,gen_ms,tps,"
-                  "client,key_name,account,endpoint,flags")
+                  "client,key_name,account,endpoint,flags,"
+                  "(SELECT COUNT(*) FROM captures c"
+                  " WHERE c.request_id=requests.id) has_cap")
 
 
 def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None,
@@ -245,6 +305,7 @@ def get_request(rid):
 def clear_requests():
     with _lock:
         _conn().execute("DELETE FROM requests")
+        _conn().execute("DELETE FROM captures")
         _conn().commit()
 
 
@@ -506,7 +567,9 @@ def counts():
         reqs = _conn().execute("SELECT COUNT(*) c FROM requests").fetchone()["c"]
         keys = _conn().execute("SELECT COUNT(*) c FROM api_keys").fetchone()["c"]
         accs = _conn().execute("SELECT COUNT(*) c FROM accounts").fetchone()["c"]
-    return {"requests": reqs, "keys": keys, "accounts": accs}
+        caps = _conn().execute("SELECT COUNT(*) c FROM captures").fetchone()["c"]
+    return {"requests": reqs, "keys": keys, "accounts": accs,
+            "captures": caps}
 
 
 # ---------- upstream accounts ----------
@@ -673,3 +736,52 @@ def meta_set(k, v):
             "INSERT INTO meta (k,v) VALUES (?,?) "
             "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
         _conn().commit()
+
+
+# ---------- diagnostic bundle ----------
+
+def export_requests(limit=500, hours=0):
+    """Full request rows for offline analysis — every column, newest first."""
+    sql, args = "SELECT * FROM requests", []
+    if hours and hours > 0:
+        sql += " WHERE ts>=?"
+        args.append(time.time() - hours * 3600)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(max(1, min(limit, _MAX_ROWS)))
+    with _lock:
+        return [dict(r) for r in _conn().execute(sql, args).fetchall()]
+
+
+def export_accounts():
+    """accounts minus `token` — credentials never enter a bundle."""
+    cols = ("id,name,email,api_server_url,devin_webapp_host,devin_api_url,"
+            "source,plan,created,disabled,fail_count,consecutive_fails,"
+            "cooldown_until,last_error,last_used,last_ok,req_count,"
+            "max_concurrent,models")
+    with _lock:
+        return [dict(r) for r in _conn().execute(
+            f"SELECT {cols} FROM accounts ORDER BY id").fetchall()]
+
+
+def export_keys():
+    """api_keys metadata only — hash/prefix identify a key, none are usable."""
+    cols = ("id,name,prefix,tail,created,disabled,last_used,models,"
+            "max_concurrent")
+    with _lock:
+        return [dict(r) for r in _conn().execute(
+            f"SELECT {cols} FROM api_keys ORDER BY id").fetchall()]
+
+
+def export_meta():
+    """meta kv minus secrets (master_key; tomb:* are deleted-key hashes)."""
+    with _lock:
+        rows = _conn().execute("SELECT k,v FROM meta").fetchall()
+    return {r["k"]: r["v"] for r in rows
+            if r["k"] != "master_key" and not r["k"].startswith("tomb:")}
+
+
+def export_responses(limit=500):
+    with _lock:
+        return [dict(r) for r in _conn().execute(
+            "SELECT * FROM responses ORDER BY created DESC LIMIT ?",
+            (max(1, min(limit, 5000)),)).fetchall()]

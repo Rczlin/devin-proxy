@@ -322,6 +322,32 @@ def handle(request, body, t0, *, iter_chat, resolve_model, record,
                    f"request mapping failed: {e}", None, t0, None,
                    endpoint="responses")
             raise
+        rl0 = reqlog_for(request, body)
+        try:
+            sent = {t["function"]["name"] for t in chat_body["tools"]}
+            dropped = [{"name": t.get("name")
+                               or (t.get("function") or {}).get("name"),
+                        "type": t.get("type"),
+                        "n_sub": len(t.get("tools") or []) or None}
+                       for t in (body.get("tools") or [])
+                       if isinstance(t, dict)
+                       and (t.get("name")
+                            or (t.get("function") or {}).get("name"))
+                       not in sent]
+            in_types = {}
+            inp = body.get("input")
+            for it in (inp if isinstance(inp, list) else []):
+                ty = (it.get("type") or ("message" if it.get("role") else "?")
+                      if isinstance(it, dict) else "?")
+                in_types[ty] = in_types.get(ty, 0) + 1
+            rl0.ev("mapped", prev=body.get("previous_response_id"),
+                   n_items=len(items), input_types=in_types or None,
+                   n_msgs=len(chat_body.get("messages") or []),
+                   n_tools=len(chat_body["tools"]),
+                   dropped_tools=dropped[:100] or None,
+                   store=body.get("store"))
+        except Exception:
+            pass
         model = resolve_model(chat_body)
         row = getattr(request.state, "key_row", None)
         allowed = set(row["models"]) if row and row.get("models") else None

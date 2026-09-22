@@ -1,10 +1,12 @@
 """FastAPI app: OpenAI /v1/chat/completions + /v1/responses -> Devin Cascade."""
+import base64
 import hashlib
 import json
 import os
 import secrets
 import threading
 import time
+import traceback
 import uuid
 
 import httpx
@@ -15,6 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from . import accounts as accounts_mod
 from . import creds as creds_mod
 from . import models as models_mod
+from . import proto
 from . import store
 from . import upstream
 
@@ -26,6 +29,12 @@ _READ_TIMEOUT = float(os.environ.get("DEVIN_PROXY_READ_TIMEOUT", "1800"))
 _LOG_CAP = int(os.environ.get("DEVIN_PROXY_LOG_CAP", "200000"))
 _EV_CAP = 12000          # one event / one SSE payload
 _REQ_CAP = 60000         # raw request body
+_RAW_CAP = 8000          # unparsed-body forensics prefix
+# Full-fidelity wire capture (inbound body, upstream pb request, every
+# upstream frame, outbound SSE — untruncated). 0 disables; _CAP_MAX bounds
+# one request's total captured bytes so a runaway stream can't eat memory.
+_CAPTURE = os.environ.get("DEVIN_PROXY_CAPTURE", "1") not in ("0", "false")
+_CAP_MAX = int(os.environ.get("DEVIN_PROXY_CAP_MAX", str(32 * 1024 * 1024)))
 
 try:
     import h2  # noqa: F401
@@ -39,16 +48,35 @@ class ReqLog:
     every SSE payload sent downstream. Attached to request.state and persisted
     into the requests row by _record. Never raises."""
 
-    def __init__(self, body=None):
+    def __init__(self, body=None, raw=None):
         self.t0 = time.perf_counter()
         self.events, self.sse, self.flags = [], [], set()
         self.request_json = None
         self._ev_sz = self._sse_sz = 0
         self._ev_full = self._sse_full = False
+        self.raw_len = self.raw_sha = None
+        # untruncated wire capture — claude-tap style. events/sse above are
+        # the bounded summaries; this is the full packet-level record.
+        self.cap = {"inbound": None, "attempts": [], "downstream": []}
+        self._cap_sz = 0
+        self._cap_full = not _CAPTURE
+        if raw is not None:
+            self.raw_len = len(raw)
+            self.raw_sha = hashlib.sha256(raw).hexdigest()[:16]
         if body is not None:
             try:
+                s = json.dumps(body, ensure_ascii=False, default=str)
+                if len(s) > _REQ_CAP:
+                    self.flags.add("request_capped")
+                self.request_json = s[:_REQ_CAP]
+            except Exception:
+                pass
+        elif raw is not None:
+            # unparsable body — keep a bounded raw prefix for forensics
+            try:
                 self.request_json = json.dumps(
-                    body, ensure_ascii=False, default=str)[:_REQ_CAP]
+                    {"_unparsed": raw[:_RAW_CAP].decode("utf-8", "replace"),
+                     "_body_len": len(raw)})
             except Exception:
                 pass
 
@@ -81,15 +109,69 @@ class ReqLog:
         except Exception:
             pass
 
+    def _cap_room(self, n):
+        """Size guard for the untruncated capture. False once _CAP_MAX hit —
+        the flag marks the bundle so analysis knows data was dropped."""
+        if self._cap_full:
+            return False
+        if self._cap_sz + n > _CAP_MAX:
+            self.flags.add("capture_capped")
+            self._cap_full = True
+            return False
+        self._cap_sz += n
+        return True
+
+    def cap_inbound(self, request, raw):
+        try:
+            body = base64.b64encode(raw or b"").decode()
+            if self._cap_room(len(body)):
+                self.cap["inbound"] = {
+                    "method": request.method,
+                    "url": str(request.url),
+                    "headers": _safe_headers(request),
+                    "body_b64": body,
+                }
+        except Exception:
+            pass
+
+    def cap_attempt(self, att):
+        """att: dict the caller keeps filling (frames appended via cap_frame)."""
+        try:
+            if self._cap_room(len(att.get("request_pb_b64") or "")):
+                self.cap["attempts"].append(att)
+                return att
+        except Exception:
+            pass
+        return None
+
+    def cap_frame(self, att, kind, data):
+        """One raw upstream payload (kind: frame|trailer|http_body|
+        resp_headers). `data` is bytes (already gunzipped for frames)."""
+        try:
+            b64 = base64.b64encode(data).decode()
+            if self._cap_room(len(b64)):
+                att.setdefault("frames", []).append({"k": kind, "b64": b64})
+        except Exception:
+            pass
+
+    def has_capture(self):
+        try:
+            return bool(self.cap["inbound"] or self.cap["attempts"]
+                        or self.cap["downstream"])
+        except Exception:
+            return False
+
     def out(self, payload):
         """Record one outbound SSE frame (or the final response body).
         Returns the payload so `yield rl.out(s)` stays transparent."""
         try:
+            s_full = payload if isinstance(payload, str) else json.dumps(
+                payload, ensure_ascii=False, default=str)
+            if self._cap_room(len(s_full)):
+                self.cap["downstream"].append(s_full)
             if self._sse_full:
                 return payload
-            s = payload if isinstance(payload, str) else json.dumps(
-                payload, ensure_ascii=False, default=str)
-            s = s.strip()
+            s = s_full.strip()
             if s.startswith("data:"):
                 s = s[5:].strip()
             if len(s) > _EV_CAP:
@@ -128,15 +210,37 @@ class ReqLog:
         return ",".join(sorted(self.flags)) or None
 
 
-def reqlog_for(request, body=None):
+_HDR_MASK = ("authorization", "cookie", "token", "secret", "key")
+
+
+def _safe_headers(request):
+    """Inbound headers for forensics — secret-bearing names are masked,
+    not dropped, so the client fingerprint stays visible."""
+    out = {}
+    for i, (k, v) in enumerate(request.headers.items()):
+        if i >= 64:
+            out["…"] = f"{len(request.headers) - 64} more"
+            break
+        kl = k.lower()
+        out[k] = "***" if any(s in kl for s in _HDR_MASK) else v[:300]
+    return out
+
+
+def reqlog_for(request, body=None, raw=None):
     """Get (or lazily create) the ReqLog for this request."""
     rl = getattr(request.state, "reqlog", None)
     if rl is None:
-        rl = ReqLog(body)
+        rl = ReqLog(body, raw)
         request.state.reqlog = rl
         try:
-            rl.ev("request", ua=(request.headers.get("user-agent") or "")[:160],
-                  path=str(request.url.path))
+            if raw is not None:
+                rl.cap_inbound(request, raw)
+            rl.ev("request",
+                  ua=(request.headers.get("user-agent") or "")[:160],
+                  path=str(request.url.path),
+                  model=body.get("model") if isinstance(body, dict) else None,
+                  body_len=rl.raw_len, body_sha=rl.raw_sha,
+                  headers=_safe_headers(request))
         except Exception:
             pass
     return rl
@@ -317,7 +421,7 @@ def create_app(api_key=None):
             out_tok = u.get("completion_tokens") or 0
             tps = round(out_tok * 1000 / max(basis, 1), 1) \
                 if out_tok else None
-            store.log_request(
+            rid = store.log_request(
                 model=body.get("model"), resolved_model=model,
                 stream=bool(body.get("stream")), ok=ok, status=status,
                 error=(error or "")[:500],
@@ -341,6 +445,10 @@ def create_app(api_key=None):
                 sse_json=rl.sse_dump(),
                 flags=rl.flags_str(),
             )
+            if rl.has_capture():
+                rl.cap["request_id"] = rid
+                rl.cap["ok"] = ok
+                store.save_capture(rid, ok, rl.cap)
         except Exception:
             pass
 
@@ -560,14 +668,72 @@ def create_app(api_key=None):
                             "kind": "build_error"}
                 if log:
                     log.ev("build_error", account=acct.display(),
-                           error=str(e)[:500])
+                           error=str(e)[:500],
+                           status=getattr(getattr(e, "response", None),
+                                          "status_code", None),
+                           tb=traceback.format_exc()[-3000:])
                 pool.release(acct)
                 pool.mark_fail(acct, last_err)
                 continue
+            cap_att = None
+            if log:
+                req_pb = req.SerializeToString()
+                sent = {t.name for t in req.tools}
+                dropped = [{"name": (t.get("function") or {}).get("name")
+                                   or t.get("name"),
+                            "type": t.get("type"),
+                            "n_sub": len(t.get("tools") or []) or None}
+                           for t in (body.get("tools") or [])
+                           if isinstance(t, dict)
+                           and ((t.get("function") or {}).get("name")
+                                or t.get("name")) not in sent]
+                src = {v: k for k, v in upstream.SOURCE.items()}
+                # SOURCE aliases system->user(1), but system prompts never
+                # land in chat_message_prompts (they go to req.prompt)
+                src[upstream.SOURCE["user"]] = "user"
+                log.ev("built", model=model, server=acct.api_server_url,
+                       msgs=[{"r": src.get(p.source, p.source),
+                              "c": len(p.prompt or ""),
+                              "tc": len(p.tool_calls),
+                              "img": len(p.images)}
+                             for p in req.chat_message_prompts[:200]],
+                       sys_chars=len(req.prompt or ""),
+                       n_tools=len(req.tools),
+                       tools=[t.name for t in req.tools][:100],
+                       dropped_tools=dropped[:100] or None,
+                       max_tokens=req.completion_config.max_tokens,
+                       req_bytes=len(req_pb),
+                       cascade_id=req.cascade_id,
+                       session_id=req.metadata.session_id or None)
+                # full wire capture: the exact protobuf we POST upstream —
+                # but metadata.api_key/user_jwt are credentials, so capture
+                # a redacted copy (fields present, values "***")
+                try:
+                    cap_req = proto.GetChatMessageRequest()
+                    cap_req.CopyFrom(req)
+                    cap_req.metadata.api_key = "***"
+                    if cap_req.metadata.user_jwt:
+                        cap_req.metadata.user_jwt = "***"
+                    cap_att = log.cap_attempt({
+                        "attempt": attempt, "account": acct.display(),
+                        "server": acct.api_server_url, "model": model,
+                        "request_pb_b64": base64.b64encode(
+                            cap_req.SerializeToString()).decode(),
+                        "redacted": "metadata.api_key/user_jwt"})
+                except Exception:
+                    cap_att = None
+                try:
+                    from google.protobuf.json_format import MessageToDict
+                    if cap_att is not None:
+                        cap_att["request"] = MessageToDict(cap_req)
+                except Exception:
+                    pass
             got_content, saw_stop, terminal, buf = False, False, None, []
             try:
                 for ev in upstream.stream_chat(
-                        app.state.http, acct.api_server_url, acct.token, req):
+                        app.state.http, acct.api_server_url, acct.token, req,
+                        capture=(lambda k, d: log.cap_frame(cap_att, k, d))
+                        if cap_att is not None else None):
                     if isinstance(ev, dict):
                         if log:
                             if ev.get("kind") == "truncated":
@@ -596,7 +762,8 @@ def create_app(api_key=None):
                 e2 = {"kind": "exception", "message": str(e)}
                 if log:
                     log.ev("exception", account=acct.display(),
-                           error=repr(e)[:800])
+                           error=repr(e)[:800],
+                           tb=traceback.format_exc()[-3000:])
                 if got_content and stream:
                     pool.mark_fail(acct, e2)
                     yield acct, e2
@@ -707,19 +874,21 @@ def create_app(api_key=None):
     @app.post("/v1/chat/completions", dependencies=[Depends(check_key)])
     async def chat(request: Request):
         t0 = time.perf_counter()
+        raw = await request.body()
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except Exception as e:
-            reqlog_for(request, {})
+            rl = reqlog_for(request, raw=raw)
+            rl.ev("parse_error", error=str(e)[:300])
             _record(request, {}, "", False, 400, f"invalid JSON body: {e}",
                     None, t0, None, endpoint="chat")
             raise HTTPException(400, f"invalid JSON body: {e}")
         if not isinstance(body, dict):
-            reqlog_for(request, {"raw": str(body)[:2000]})
+            reqlog_for(request, {"raw": str(body)[:2000]}, raw)
             _record(request, {}, "", False, 400, "body must be a JSON object",
                     None, t0, None, endpoint="chat")
             raise HTTPException(400, "request body must be a JSON object")
-        reqlog_for(request, body)
+        reqlog_for(request, body, raw)
         skey = session_key_for(request, body)
         model = resolve_model(body)
         if not model_allowed(request, body.get("model"), model):
@@ -862,7 +1031,8 @@ def create_app(api_key=None):
             raise
         except Exception as e:
             err = {"kind": "proxy_error", "message": str(e)}
-            rl.ev("proxy_exception", error=repr(e)[:800])
+            rl.ev("proxy_exception", error=repr(e)[:800],
+                  tb=traceback.format_exc()[-3000:])
         if not started:
             yield rl.out(chunk({"role": "assistant"}))
 
@@ -897,19 +1067,21 @@ def create_app(api_key=None):
     @app.post("/v1/responses", dependencies=[Depends(check_key)])
     async def create_response(request: Request):
         t0 = time.perf_counter()
+        raw = await request.body()
         try:
-            body = await request.json()
+            body = json.loads(raw)
         except Exception as e:
-            reqlog_for(request, {})
+            rl = reqlog_for(request, raw=raw)
+            rl.ev("parse_error", error=str(e)[:300])
             _record(request, {}, "", False, 400, f"invalid JSON body: {e}",
                     None, t0, None, endpoint="responses")
             raise HTTPException(400, f"invalid JSON body: {e}")
         if not isinstance(body, dict):
-            reqlog_for(request, {"raw": str(body)[:2000]})
+            reqlog_for(request, {"raw": str(body)[:2000]}, raw)
             _record(request, {}, "", False, 400, "body must be a JSON object",
                     None, t0, None, endpoint="responses")
             raise HTTPException(400, "request body must be a JSON object")
-        reqlog_for(request, body)
+        reqlog_for(request, body, raw)
         release = acquire_key_slot(request)
         if release is None:
             _record(request, body, resolve_model(body), False, 429,

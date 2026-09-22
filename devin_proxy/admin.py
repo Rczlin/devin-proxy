@@ -4,6 +4,7 @@ The console is always locked: /admin serves only a minimal login page,
 POST /admin/api/login trades the master key for an HttpOnly session cookie,
 and /admin/app (the SPA) plus every /admin/api/* endpoint require that
 cookie (or the master key as Bearer / ?key=)."""
+import gzip
 import hashlib
 import hmac
 import json
@@ -12,7 +13,7 @@ import sys
 import time
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
                                StreamingResponse)
 from pydantic import BaseModel
@@ -28,6 +29,41 @@ _LOGIN_HTML = os.path.join(os.path.dirname(__file__), "web", "login.html")
 
 _SESS_COOKIE = "dp_admin"
 _SESS_TTL = 7 * 86400
+
+# bundled into the diagnostic zip — decodes captures/req-<id>.json
+_DECODER = '''\
+"""Decode a request capture from a devin-proxy diagnostic bundle.
+Usage: python decode_capture.py captures/req-<id>.json
+(proto_schema.py must sit next to this script.)"""
+import base64, json, sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from proto_schema import GetChatMessageRequest, GetChatMessageResponse
+
+cap = json.load(open(sys.argv[1], encoding="utf-8"))
+inb = cap.get("inbound") or {}
+print("inbound:", inb.get("method"), inb.get("url"))
+body = base64.b64decode(inb.get("body_b64") or "")
+print("  body:", body[:500])
+for att in cap.get("attempts") or []:
+    req = GetChatMessageRequest()
+    req.ParseFromString(base64.b64decode(att["request_pb_b64"]))
+    print(f"--- attempt {att.get('attempt')} acct={att.get('account')} "
+          f"server={att.get('server')} model={req.chat_model_uid} "
+          f"tools={[t.name for t in req.tools]} "
+          f"prompts={len(req.chat_message_prompts)}")
+    for f in att.get("frames") or []:
+        raw = base64.b64decode(f["b64"])
+        if f["k"] == "frame":
+            m = GetChatMessageResponse(); m.ParseFromString(raw)
+            chunk = m.delta_text or m.delta_thinking or ""
+            print("  frame:", repr(chunk[:120]),
+                  "stop=%s" % m.stop_reason if m.stop_reason else "")
+        else:
+            print(f"  {f['k']}:", raw[:400])
+for i, s in enumerate(cap.get("downstream") or []):
+    print(f"down[{i}]:", s[:200])
+'''
+
 
 
 def make_router(app):
@@ -131,10 +167,163 @@ def make_router(app):
             raise HTTPException(404, "not found")
         return r
 
+    @router.get("/api/requests/{rid}/capture",
+                dependencies=[Depends(admin_key)])
+    def request_capture(rid: int):
+        """Download the full-fidelity capture for one request — raw inbound
+        body/headers, exact upstream protobuf + every wire frame, outbound
+        SSE. Untruncated."""
+        c = store.get_capture(rid)
+        if c is None:
+            raise HTTPException(404, "no capture stored for this request")
+        body = json.dumps(c, ensure_ascii=False, indent=1, default=str)
+        return Response(
+            content=body, media_type="application/json",
+            headers={"Content-Disposition":
+                     f'attachment; filename="req-{rid}-capture.json"'})
+
     @router.post("/api/requests/clear", dependencies=[Depends(admin_key)])
     def clear_requests():
         store.clear_requests()
         return {"ok": True}
+
+    def _git_head():
+        try:
+            import subprocess
+            here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                                 cwd=here, capture_output=True, timeout=3,
+                                 text=True)
+            return out.stdout.strip() or None
+        except Exception:
+            return None
+
+    @router.get("/api/export", dependencies=[Depends(admin_key)])
+    def export_bundle(limit: int = 500, hours: int = 0):
+        """Diagnostic bundle zip: full request rows (inbound body, upstream
+        event timeline, outbound SSE frames), stored Responses objects,
+        account/pool state, model catalog, meta config and env info.
+        Credentials are never included — tokens/master key are stripped."""
+        import io
+        import platform
+        import zipfile
+
+        from . import __version__
+        from . import app as app_mod
+
+        reqs = store.export_requests(limit=limit, hours=hours)
+        env = {
+            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "version": __version__,
+            "python": sys.version.split()[0],
+            "platform": platform.platform(),
+            "uptime_s": round(time.time() - started, 1),
+            "db_path": store._DB_PATH,
+            "db_size": os.path.getsize(store._DB_PATH)
+            if os.path.exists(store._DB_PATH) else None,
+            "max_rows": store._MAX_ROWS,
+            "capture_enabled": app_mod._CAPTURE,
+            "capture_max_bytes": app_mod._CAP_MAX,
+            "capture_keep_successes": store._CAP_KEEP,
+            "git_head": _git_head(),
+            "env": {k: ("***" if any(s in k for s in ("KEY", "TOKEN", "SECRET"))
+                    else v)
+                    for k, v in os.environ.items() if k.startswith("DEVIN_")},
+            "counts": store.counts(),
+        }
+        models = {
+            "entries": models_mod.entries(include_hidden=True),
+            "aliases": models_mod.aliases(),
+            "user_aliases": models_mod.user_aliases(),
+            "default_model": models_mod.default_uid(),
+            "default_effort": models_mod.default_effort(),
+            "family_efforts": models_mod.family_efforts(),
+            "hidden_aliases": sorted(models_mod.hidden_aliases()),
+            "hidden_models": sorted(models_mod.hidden_models()),
+            "sync": models_mod.sync_info(),
+        }
+        stats = {"overview": store.stats_overview(None),
+                 "pool": app.state.pool.summary(),
+                 "per_model": store.list_models(),
+                 "per_account": store.account_stats()}
+
+        readme = (
+            "devin-proxy diagnostic bundle\n"
+            f"generated: {env['generated_at']}  version: {__version__}  "
+            f"git: {env['git_head'] or '-'}\n\n"
+            "contents:\n"
+            "  env.json         runtime, env vars (secrets masked), db info\n"
+            "  requests.jsonl   logged requests, ALL columns — one row per\n"
+            "                   line: request_json = inbound body, events_json\n"
+            "                   = upstream frame timeline (attempt/msg/\n"
+            "                   upstream_err/trailer), sse_json = outbound SSE\n"
+            "  responses.jsonl  stored /v1/responses objects (input items +\n"
+            "                   response) used by previous_response_id chains\n"
+            "  accounts.json    upstream pool state — tokens NOT included\n"
+            "  keys.json        api key metadata (hashes/secrets excluded)\n"
+            "  sessions.json    session_key -> account pins\n"
+            "  models.json      model catalog snapshot + alias/effort config\n"
+            "  meta.json        persisted settings (master_key excluded)\n"
+            "  stats.json       aggregate stats (overview/pool/per-model)\n"
+            "  captures/        FULL-FIDELITY packet capture per request\n"
+            "                   (untruncated — claude-tap style):\n"
+            "                   inbound   = raw request bytes + masked headers\n"
+            "                   attempts[]= {account, server, request_pb_b64,\n"
+            "                     request (decoded GetChatMessageRequest),\n"
+            "                     frames[] = {k: resp_headers|frame|trailer|\n"
+            "                     http_body, b64: raw wire payload}}\n"
+            "                   downstream = every SSE frame sent to client\n\n"
+            "tips: requests.jsonl rows with ok=0 are failures; the upstream\n"
+            "trailer error lives in events_json[].detail / .trailer — and\n"
+            "verbatim (untruncated) in captures/req-<id>.json trailer frames.\n"
+            "Decode captures offline: python decode_capture.py <file>.json\n"
+            "(proto_schema.py is this build's proto definition — required).\n")
+
+        def jl(rows):
+            return "".join(json.dumps(r, ensure_ascii=False, default=str)
+                           + "\n" for r in rows)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED,
+                             compresslevel=6) as z:
+            # ship the proto schema + a decoder so the packet captures are
+            # self-contained: `python decode_capture.py captures/req-1.json`
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                z.write(os.path.join(here, "proto.py"), "proto_schema.py")
+            except Exception:
+                pass
+            z.writestr("decode_capture.py", _DECODER)
+            for c in store.export_captures():
+                try:
+                    z.writestr(f"captures/req-{c['request_id']}.json",
+                               gzip.decompress(c["data"]))
+                except Exception as e:
+                    z.writestr(f"captures/req-{c['request_id']}.err",
+                               f"undecodable capture: {e}")
+            z.writestr("README.txt", readme)
+            z.writestr("env.json", json.dumps(env, ensure_ascii=False,
+                                              indent=1, default=str))
+            z.writestr("requests.jsonl", jl(reqs))
+            z.writestr("responses.jsonl", jl(store.export_responses()))
+            z.writestr("accounts.json", json.dumps(
+                store.export_accounts(), ensure_ascii=False, indent=1))
+            z.writestr("keys.json", json.dumps(
+                store.export_keys(), ensure_ascii=False, indent=1))
+            z.writestr("sessions.json", json.dumps(
+                app.state.pool.sessions(), ensure_ascii=False, indent=1,
+                default=str))
+            z.writestr("models.json", json.dumps(models, ensure_ascii=False,
+                                                 indent=1, default=str))
+            z.writestr("meta.json", json.dumps(store.export_meta(),
+                                               ensure_ascii=False, indent=1,
+                                               default=str))
+            z.writestr("stats.json", json.dumps(stats, ensure_ascii=False,
+                                                indent=1, default=str))
+        fn = "devin-proxy-diag-" + time.strftime("%Y%m%d-%H%M%S") + ".zip"
+        return StreamingResponse(
+            iter([buf.getvalue()]), media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{fn}"'})
 
     @router.get("/api/models", dependencies=[Depends(admin_key)])
     def models():
