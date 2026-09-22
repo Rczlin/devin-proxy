@@ -112,6 +112,13 @@ def _conn():
             "events_json": "TEXT",
             "sse_json": "TEXT",
             "flags": "TEXT",
+            "cached_tokens": "INTEGER DEFAULT 0",
+            "cache_creation_tokens": "INTEGER DEFAULT 0",
+            "gen_ms": "INTEGER",
+            "tps": "REAL",
+            "upstream_model": "TEXT",
+            "upstream_msg_id": "TEXT",
+            "upstream_req_id": "TEXT",
         })
         _add_columns("api_keys", {
             "models": "TEXT",
@@ -162,19 +169,24 @@ def _hash(key):
 def log_request(model, resolved_model, stream, ok, status, error,
                 prompt_tokens, completion_tokens, latency_ms, ttft_ms,
                 client, key_name, messages_json, account=None, endpoint=None,
-                request_json=None, events_json=None, sse_json=None, flags=None):
+                request_json=None, events_json=None, sse_json=None, flags=None,
+                cached_tokens=0, cache_creation_tokens=0, gen_ms=None,
+                tps=None, upstream_model=None, upstream_msg_id=None,
+                upstream_req_id=None):
     global _insert_count
     with _lock:
         _conn().execute(
             "INSERT INTO requests (ts,model,resolved_model,stream,ok,status,error,"
             "prompt_tokens,completion_tokens,latency_ms,ttft_ms,client,key_name,"
             "account,endpoint,messages_json,request_json,events_json,sse_json,"
-            "flags)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "flags,cached_tokens,cache_creation_tokens,gen_ms,tps,"
+            "upstream_model,upstream_msg_id,upstream_req_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), model, resolved_model, int(stream), int(ok), status, error,
              prompt_tokens, completion_tokens, latency_ms, ttft_ms, client, key_name,
              account, endpoint, messages_json, request_json, events_json, sse_json,
-             flags))
+             flags, cached_tokens, cache_creation_tokens, gen_ms, tps,
+             upstream_model, upstream_msg_id, upstream_req_id))
         _insert_count += 1
         if _insert_count % 100 == 0:
             _conn().execute(
@@ -206,8 +218,9 @@ def _where(model=None, ok=None, q=None, account=None, flag=None):
 
 
 _REQ_LIST_COLS = ("id,ts,model,resolved_model,stream,ok,status,error,"
-                  "prompt_tokens,completion_tokens,latency_ms,ttft_ms,client,"
-                  "key_name,account,endpoint,flags")
+                  "prompt_tokens,completion_tokens,cached_tokens,"
+                  "cache_creation_tokens,latency_ms,ttft_ms,gen_ms,tps,"
+                  "client,key_name,account,endpoint,flags")
 
 
 def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None,
@@ -270,7 +283,10 @@ def stats_overview(hours=24):
         tot = c.execute(f"""
           SELECT COUNT(*) n, SUM(ok) ok_n, SUM(stream) st,
                  SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
-                 AVG(latency_ms) avg_lat, AVG(ttft_ms) avg_ttft
+                 SUM(cached_tokens) cached_tok,
+                 SUM(cache_creation_tokens) cache_wr,
+                 AVG(latency_ms) avg_lat, AVG(ttft_ms) avg_ttft,
+                 AVG(tps) avg_tps
           FROM requests{where}""", wargs).fetchone()
 
         def _pct(p):
@@ -302,6 +318,7 @@ def stats_overview(hours=24):
           SELECT COALESCE(resolved_model,model) m, COUNT(*) n,
                  SUM(1-ok) errs, SUM(prompt_tokens) in_tok,
                  SUM(completion_tokens) out_tok, AVG(latency_ms) avg_lat,
+                 SUM(cached_tokens) cached, AVG(tps) avg_tps,
                  AVG(ttft_ms) avg_ttft, MAX(ts) last_used
           FROM requests{where} GROUP BY m ORDER BY n DESC LIMIT 24""",
             wargs).fetchall()
@@ -352,6 +369,12 @@ def stats_overview(hours=24):
         "streams": tot["st"] or 0,
         "input_tokens": tot["in_tok"] or 0,
         "output_tokens": tot["out_tok"] or 0,
+        "cached_tokens": tot["cached_tok"] or 0,
+        "cache_creation_tokens": tot["cache_wr"] or 0,
+        "cache_hit_pct": round(100 * (tot["cached_tok"] or 0)
+                               / max(1, (tot["cached_tok"] or 0)
+                                     + (tot["in_tok"] or 0)), 1),
+        "avg_tps": round(tot["avg_tps"] or 0, 1),
         "avg_latency_ms": round(tot["avg_lat"] or 0),
         "avg_ttft_ms": round(tot["avg_ttft"] or 0),
         "p50_ms": _pct(0.5),
