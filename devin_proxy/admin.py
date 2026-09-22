@@ -6,6 +6,7 @@ and /admin/app (the SPA) plus every /admin/api/* endpoint require that
 cookie (or the master key as Bearer / ?key=)."""
 import hashlib
 import hmac
+import json
 import os
 import sys
 import time
@@ -19,8 +20,8 @@ from starlette.concurrency import run_in_threadpool
 
 from . import accounts as accounts_mod
 from . import creds as creds_mod
+from . import models as models_mod
 from . import store, upstream
-from .app import KNOWN_UIDS, MODEL_ALIASES
 
 _HTML = os.path.join(os.path.dirname(__file__), "web", "admin.html")
 _LOGIN_HTML = os.path.join(os.path.dirname(__file__), "web", "login.html")
@@ -121,8 +122,59 @@ def make_router(app):
 
     @router.get("/api/models", dependencies=[Depends(admin_key)])
     def models():
-        return {"models": KNOWN_UIDS + sorted(MODEL_ALIASES),
+        models_mod.maybe_refresh(app.state.http, app.state.pool)
+        return {"families": models_mod.grouped(),
+                "models": [e["uid"] for e in models_mod.entries()],
+                "aliases": models_mod.aliases(),
+                "user_aliases": models_mod.user_aliases(),
+                "default_model": models_mod.default_uid(),
+                "sync": models_mod.sync_info(),
                 "stats": store.list_models()}
+
+    @router.post("/api/models/refresh", dependencies=[Depends(admin_key)])
+    def models_refresh():
+        accs = [a for a in app.state.pool.accounts() if not a.disabled]
+        return models_mod.refresh(app.state.http, accs, force=True)
+
+    class ModelSettings(BaseModel):
+        default_model: Optional[str] = None
+        models_url: Optional[str] = None
+        aliases: Optional[str] = None     # "alias=uid" per line, or JSON dict
+
+    @router.patch("/api/models/settings", dependencies=[Depends(admin_key)])
+    def models_settings(body: ModelSettings):
+        if body.default_model is not None:
+            d = body.default_model.strip()
+            if d and d not in models_mod.uids() \
+                    and d not in models_mod.aliases():
+                raise HTTPException(400, "unknown model")
+            store.meta_set("default_model", d)
+        if body.models_url is not None:
+            u = body.models_url.strip()
+            if u and not u.startswith(("http://", "https://")):
+                raise HTTPException(400, "url must be http(s)")
+            store.meta_set("models_url", u)
+        if body.aliases is not None:
+            parsed = {}
+            txt = body.aliases.strip()
+            try:
+                d = json.loads(txt) if txt.startswith("{") else None
+            except Exception:
+                d = None
+            if isinstance(d, dict):
+                parsed = {str(k).strip(): str(v).strip()
+                          for k, v in d.items()
+                          if str(k).strip() and str(v).strip()}
+            else:
+                for line in txt.splitlines():
+                    if "=" in line:
+                        k, v = line.split("=", 1)
+                        if k.strip() and v.strip():
+                            parsed[k.strip()] = v.strip()
+            store.meta_set("model_aliases", json.dumps(parsed))
+        return {"ok": True, "default_model": models_mod.default_uid(),
+                "aliases": models_mod.aliases(),
+                "models_url": models_mod.models_url()}
 
     @router.post("/api/playground", dependencies=[Depends(admin_key)])
     async def playground(request: Request):

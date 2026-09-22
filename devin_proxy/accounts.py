@@ -213,7 +213,7 @@ class Pool:
     # ---------- scheduling ----------
 
     def pick(self, session_key=None, exclude=frozenset(), force_id=None,
-             models=None):
+             models=None, remote=None):
         with self._lock:
             now = time.time()
             if force_id is not None:
@@ -224,7 +224,9 @@ class Pool:
                 return None
             avail = [a for a in self._accs.values()
                      if not a.disabled and a.id not in exclude
-                     and not a.at_cap() and a.serves(models)]
+                     and not a.at_cap() and a.serves(models)
+                     and (remote is None or a.id in remote[0]
+                          or a.id not in remote[1])]
             if not avail:
                 return None
             if session_key:
