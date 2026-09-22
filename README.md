@@ -61,15 +61,21 @@ git push -u origin main
 Production deploy — compose only, no local build:
 
 ```bash
-cp .env.example .env   # fill in DEVIN_SESSION_TOKEN (+ DEVIN_PROXY_KEY)
+cp .env.example .env            # set DEVIN_PROXY_KEY (locks /v1 + admin)
+# put your session token in ./devin-token.txt — the windsurf_api_key
+# value from %APPDATA%\devin\credentials.toml on a signed-in machine
+docker compose pull
 docker compose up -d
 ```
 
 `docker-compose.yml` pulls `ghcr.io/rczlin/devin-proxy:latest` (built by
-the Action), loads `.env` via `env_file`, and mounts `/data` so the
-request log + API keys survive restarts. Get `DEVIN_SESSION_TOKEN` from
-`%APPDATA%\devin\credentials.toml` (`windsurf_api_key`) on a machine
-where the Devin CLI is signed in.
+the Action, public — no registry login needed), mounts the token file as
+a docker secret (`/run/secrets/devin_token`, read via
+`DEVIN_SESSION_TOKEN_FILE`), loads `.env`, and keeps the request log +
+API keys on the `/data` volume.
+
+The token goes in a file, not `.env`, because compose interpolates `$`
+in env_file values and the session token contains one.
 
 ## Admin console
 
