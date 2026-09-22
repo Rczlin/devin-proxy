@@ -49,6 +49,7 @@ _fd = descriptor_pb2.FileDescriptorProto(
             _f("base64_data", 1, STR), _f("mime_type", 2, STR),
         ]),
         _msg("ChatMessagePrompt", [
+            _f("prompt_id", 1, STR),
             _f("source", 2, I32), _f("prompt", 3, STR),
             _f("num_tokens", 4, I32), _f("is_user_input", 5, I32),
             _f("tool_calls", 6, MSG, REP, ".devin.ChatToolCall"),
@@ -70,12 +71,27 @@ _fd = descriptor_pb2.FileDescriptorProto(
             _f("parameters_json", 3, STR),
         ]),
         _msg("UsageValue", [_f("v", 2, FLT)]),
+        _msg("MetricText", [
+            _f("label", 1, STR), _f("s", 2, STR),
+        ]),
         _msg("UsageMetric", [
+            _f("text", 3, MSG, type_name=".devin.MetricText"),
             _f("value", 4, MSG, type_name=".devin.UsageValue"),
             _f("metric", 5, STR),
         ]),
         _msg("UsageReport", [
+            _f("title", 1, STR),
             _f("metrics", 2, MSG, REP, ".devin.UsageMetric"),
+        ]),
+        _msg("RespHeader", [
+            _f("name", 1, STR), _f("value", 2, STR),
+        ]),
+        _msg("RespInfo", [
+            _f("f2", 2, I32), _f("f3", 3, I32), _f("f4", 4, I32),
+            _f("input_tokens", 5, I32), _f("output_tokens", 6, I32),
+            _f("msg_id", 7, STR),
+            _f("headers", 8, MSG, REP, ".devin.RespHeader"),
+            _f("model_uid", 9, STR),
         ]),
         _msg("GetChatMessageRequest", [
             _f("metadata", 1, MSG, type_name=".devin.Metadata"),
@@ -88,14 +104,17 @@ _fd = descriptor_pb2.FileDescriptorProto(
             _f("cascade_id", 16, STR),
             _f("planner_mode", 20, I32),
             _f("chat_model_uid", 21, STR),
+            _f("query_label", 28, STR),
         ]),
         _msg("GetChatMessageResponse", [
             _f("message_id", 1, STR), _f("delta_text", 3, STR),
-            _f("stop_reason", 5, I32),
+            _f("seq", 4, I32), _f("stop_reason", 5, I32),
             _f("delta_tool_calls", 6, MSG, REP, ".devin.ChatToolCall"),
+            _f("info", 7, MSG, type_name=".devin.RespInfo"),
             _f("delta_thinking", 9, STR), _f("thinking_signature", 10, STR),
-            _f("thinking_redacted", 11, I32), _f("signature_type", 21, STR),
-            _f("usage", 28, MSG, type_name=".devin.UsageReport"),
+            _f("thinking_redacted", 11, I32), _f("elapsed", 12, DBL),
+            _f("gen_id", 17, STR), _f("signature_type", 21, STR),
+            _f("usage", 28, MSG, REP, ".devin.UsageReport"),
         ]),
         _msg("GetUserJwtRequest", [
             _f("metadata", 1, MSG, type_name=".devin.Metadata"),
@@ -154,6 +173,9 @@ ChatMessagePrompt = cls("ChatMessagePrompt")
 CompletionConfiguration = cls("CompletionConfiguration")
 TrajectoryReference = cls("TrajectoryReference")
 ChatToolDefinition = cls("ChatToolDefinition")
+RespHeader = cls("RespHeader")
+RespInfo = cls("RespInfo")
+MetricText = cls("MetricText")
 GetChatMessageRequest = cls("GetChatMessageRequest")
 GetChatMessageResponse = cls("GetChatMessageResponse")
 GetUserJwtRequest = cls("GetUserJwtRequest")

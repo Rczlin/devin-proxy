@@ -7,7 +7,6 @@ import time
 import uuid
 
 import httpx
-from google.protobuf import timestamp_pb2
 
 from . import proto
 
@@ -23,28 +22,33 @@ SOURCE = {"user": 1, "assistant": 2, "tool": 4, "system": 1}
 
 CLIENT_IDE = "devin-cli"
 CLIENT_VERSION = "3000.11.1"
+# The real devin-cli brands itself "chisel" in metadata fields 12/28
+# (extension name / ide type). Matching it keeps upstream feature gates and
+# routing identical to first-party traffic.
+CLIENT_NAME = "chisel"
 
 
-def build_metadata(api_key, user_jwt=""):
-    ts = timestamp_pb2.Timestamp()
-    ts.GetCurrentTime()
+def build_metadata(api_key, user_jwt="", session_id=None):
+    """Mirror the real CLI's metadata wire shape: f1/2 devin-cli+version,
+    f12/f28 'chisel', plus f3/4/5/7/21. The genuine client does NOT send
+    request_id, timestamp, trigger_id or ide_name_3 — and session_id only
+    exists as a stable per-conversation value (never a fresh uuid per
+    request)."""
     platform = {"win32": "windows", "darwin": "darwin"}.get(sys.platform, "linux")
-    return proto.Metadata(
+    md = proto.Metadata(
         ide_name=CLIENT_IDE,
         ide_version=CLIENT_VERSION,
         api_key=api_key,
         locale="en",
         os=platform,
         extension_version=CLIENT_VERSION,
-        request_id=int(time.time() * 1000),
-        session_id=str(uuid.uuid4()),
-        ide_name_2=CLIENT_IDE,
-        timestamp=ts,
+        ide_name_2=CLIENT_NAME,
         user_jwt=user_jwt,
-        trigger_id=str(uuid.uuid4()),
-        ide_name_3="Unset",
-        ide_name_4=CLIENT_IDE,
+        ide_name_4=CLIENT_NAME,
     )
+    if session_id:
+        md.session_id = session_id
+    return md
 
 
 _jwt_cache = {}          # (base_url, api_key) -> {"jwt": str, "exp": float}
@@ -171,13 +175,17 @@ def fetch_model_configs(client, base_url, api_key, timeout=20):
 
 
 def make_prompt(role, text="", tool_call_id=None, tool_calls=None, images=None,
-                thinking=None):
+                thinking=None, prompt_id=None):
+    # Real CLI prompts carry only f1 (per-message uuid), f2 source, f3 text —
+    # no num_tokens/is_user_input. The uuid must stay stable across turns so
+    # upstream can recognize replayed history; callers pass a content-derived
+    # id.
     msg = proto.ChatMessagePrompt(
         source=SOURCE[role],
         prompt=text or "",
-        num_tokens=max(1, len(text or "") // 4),
-        is_user_input=1,
     )
+    if prompt_id:
+        msg.prompt_id = prompt_id
     if thinking:
         msg.thinking = thinking
     if tool_call_id:
@@ -200,14 +208,21 @@ def make_tool(t):
 
 
 def build_request(api_key, user_jwt, model_uid, system_prompt, prompts,
-                  tools=None, max_tokens=None, temperature=None, top_p=None):
+                  tools=None, max_tokens=None, temperature=None, top_p=None,
+                  cascade_id=None, trajectory_id=None, session_id=None,
+                  query_label=None):
+    """cascade_id / trajectory_id / session_id should be stable per
+    conversation — the real CLI mints them once per session and replays
+    them on every turn. Callers without a session get fresh uuids."""
     req = proto.GetChatMessageRequest(
-        metadata=build_metadata(api_key, user_jwt),
+        metadata=build_metadata(api_key, user_jwt, session_id),
         request_type=5,                     # CASCADE
-        cascade_id=str(uuid.uuid4()),
+        cascade_id=cascade_id or str(uuid.uuid4()),
         planner_mode=1,                     # DEFAULT
         chat_model_uid=model_uid,
     )
+    if query_label:
+        req.query_label = query_label
     if system_prompt:
         req.prompt = system_prompt
     req.chat_message_prompts.extend(prompts)
@@ -222,7 +237,7 @@ def build_request(api_key, user_jwt, model_uid, system_prompt, prompts,
     for t in tools or []:
         req.tools.append(make_tool(t))
     req.trajectory_ref.CopyFrom(proto.TrajectoryReference(
-        trajectory_id=str(uuid.uuid4()), f3=4, f4=14))
+        trajectory_id=trajectory_id or str(uuid.uuid4()), f3=4, f4=14))
     return req
 
 
@@ -330,16 +345,53 @@ def stream_chat(client, base_url, api_key, request, timeout=None):
 
 
 def extract_usage(msg):
-    """GetChatMessageResponse.usage -> {prompt_tokens, completion_tokens, ...}"""
+    """GetChatMessageResponse.usage (repeated report groups) + info frame ->
+    {prompt_tokens, completion_tokens, cached_tokens, cache_creation_tokens,
+    model, upstream_*}. prompt_tokens is the UNCACHED input count — the
+    upstream reports cache reads separately (cached_input_tokens)."""
     out = {}
-    for m in msg.usage.metrics:
-        n = round(m.value.v)
-        if m.metric == "input_tokens":
-            out["prompt_tokens"] = n
-        elif m.metric == "output_tokens":
-            out["completion_tokens"] = n
-        elif "cached" in m.metric or "cache_read" in m.metric:
-            out["cached_tokens"] = n
-        elif "cache_creation" in m.metric or "cache_write" in m.metric:
-            out["cache_creation_tokens"] = n
+    for rep in msg.usage:
+        for m in rep.metrics:
+            n = round(m.value.v)
+            if m.metric == "input_tokens":
+                out["prompt_tokens"] = n
+            elif m.metric == "output_tokens":
+                out["completion_tokens"] = n
+            elif "cached" in m.metric or "cache_read" in m.metric:
+                out["cached_tokens"] = n
+            elif "cache_creation" in m.metric or "cache_write" in m.metric:
+                out["cache_creation_tokens"] = n
+            elif m.metric == "model" and m.text.s:
+                out["model"] = m.text.s
+            elif n:
+                out.setdefault("extra", {})[m.metric] = n
+    if msg.HasField("info"):
+        info = msg.info
+        if info.model_uid:
+            out["upstream_model_uid"] = info.model_uid
+        if info.msg_id:
+            out["upstream_msg_id"] = info.msg_id
+        for h in info.headers:
+            if h.name.lower() == "request-id":
+                out["upstream_req_id"] = h.value
+    if msg.elapsed:
+        out["elapsed_s"] = round(msg.elapsed, 3)
+    return out or None
+
+
+def upstream_info(msg):
+    """The f7 RespInfo frame (upstream msg_/req_ ids, model uid) arrives on
+    separate stream frames from the usage report — callers merge this into
+    the usage dict whenever a frame carries it."""
+    if not msg.HasField("info"):
+        return None
+    i = msg.info
+    out = {}
+    if i.model_uid:
+        out["upstream_model_uid"] = i.model_uid
+    if i.msg_id:
+        out["upstream_msg_id"] = i.msg_id
+    for h in i.headers:
+        if h.name.lower() == "request-id":
+            out["upstream_req_id"] = h.value
     return out or None

@@ -232,11 +232,12 @@ def to_chat_body(body):
 
 def _usage_obj(u):
     u = u or {}
+    # upstream input_tokens excludes cache reads; OpenAI counts them in
+    inp = u.get("prompt_tokens", 0) + u.get("cached_tokens", 0)
     return {
-        "input_tokens": u.get("prompt_tokens", 0),
+        "input_tokens": inp,
         "output_tokens": u.get("completion_tokens", 0),
-        "total_tokens": u.get("prompt_tokens", 0)
-        + u.get("completion_tokens", 0),
+        "total_tokens": inp + u.get("completion_tokens", 0),
         "input_tokens_details": {"cached_tokens": u.get("cached_tokens", 0)},
         "output_tokens_details": {"reasoning_tokens": 0},
     }
@@ -408,8 +409,11 @@ def _collect(request, body, chat_body, model, skey, rid, items_in,
             think.append(ev.delta_thinking)
         for tc in ev.delta_tool_calls:
             agg.feed(tc)
-        if ev.HasField("usage"):
-            usage = upstream.extract_usage(ev)
+        if len(ev.usage):
+            usage = {**(usage or {}), **upstream.extract_usage(ev)}
+        ui = upstream.upstream_info(ev)
+        if ui:
+            usage = {**(usage or {}), **ui}
     if err:
         status = err.get("http_error", 502)
         record(request, body, model, False, status, err.get("message"),
@@ -594,8 +598,11 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
                         else "response.function_call_arguments.delta",
                         item_id=fc_open["id"], output_index=out_idx,
                         delta=delta))
-            if ev.HasField("usage"):
-                usage = upstream.extract_usage(ev)
+            if len(ev.usage):
+                usage = {**(usage or {}), **upstream.extract_usage(ev)}
+            ui = upstream.upstream_info(ev)
+            if ui:
+                usage = {**(usage or {}), **ui}
     except GeneratorExit:
         rl.flag("client_aborted")
         rl.ev("client_aborted")

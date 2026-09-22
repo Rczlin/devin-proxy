@@ -173,4 +173,50 @@ row = last_req()
 assert row["ok"] == 0 and "unavailable" in (row["error"] or "")
 print("6. http error          OK")
 
+# --- 7. cache usage + info -> persisted columns ----------------------------
+u = proto.GetChatMessageResponse()
+u.message_id = "m7"
+u.delta_text = "cached answer"
+u.stop_reason = 5
+u.info.model_uid = "claude-sonnet-5-medium"
+u.info.msg_id = "msg_0177"
+u.info.input_tokens = 2
+u.info.output_tokens = 6
+h = u.info.headers.add(); h.name = "Request-Id"; h.value = "req_0177"
+rep = u.usage.add(); rep.title = "Token Usage"
+mt = rep.metrics.add(); mt.metric = "input_tokens"; mt.value.v = 2
+mt = rep.metrics.add(); mt.metric = "output_tokens"; mt.value.v = 6
+mt = rep.metrics.add(); mt.metric = "cached_input_tokens"; mt.value.v = 3108
+rep2 = u.usage.add(); rep2.title = "Response Statistics"
+mt = rep2.metrics.add(); mt.metric = "model"
+mt.text.s = "Claude Sonnet 5 Medium"
+SCENARIO["bytes"] = frame(u.SerializeToString()) + trailer()
+app.state.http = httpx.Client(transport=httpx.MockTransport(handler))
+reset()
+r = c.post("/v1/chat/completions",
+           json={"model": "claude", "stream": True,
+                 "stream_options": {"include_usage": True},
+                 "messages": [{"role": "user", "content": "hi"}]},
+           headers={"Authorization": "Bearer k"})
+assert r.status_code == 200, r.text
+row = last_req()
+assert row["ok"] == 1, dict(row)
+assert row["cached_tokens"] == 3108, dict(row)
+assert row["upstream_model"] == "claude-sonnet-5-medium", dict(row)
+assert row["upstream_msg_id"] == "msg_0177", dict(row)
+assert row["upstream_req_id"] == "req_0177", dict(row)
+assert row["gen_ms"] is not None and row["tps"] and row["tps"] > 0, dict(row)
+lines = sse_lines(r)
+uobj = [json.loads(x) for x in lines if '"usage"' in x]
+assert uobj, "usage chunk missing"
+assert uobj[0]["usage"]["prompt_tokens_details"]["cached_tokens"] == 3108
+assert uobj[0]["usage"]["prompt_tokens"] == 3110   # uncached + cached
+# admin list endpoint exposes cache columns
+items, total = store.list_requests(5, 0)
+assert items[0]["cached_tokens"] == 3108 and items[0]["tps"], dict(items[0])
+ov = store.stats_overview(24)
+assert ov["cached_tokens"] >= 3108 and ov["cache_hit_pct"] > 0, ov
+print("7. cache+tps persist   OK  cached=%d tps=%s hit=%s%%"
+      % (row["cached_tokens"], row["tps"], ov["cache_hit_pct"]))
+
 print("\nAll tests passed.")

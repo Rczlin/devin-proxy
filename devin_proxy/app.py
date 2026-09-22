@@ -157,8 +157,15 @@ def _msg_summary(ev):
                            for tc in ev.delta_tool_calls]
     if ev.stop_reason:
         d["stop"] = int(ev.stop_reason)
-    if ev.HasField("usage"):
+    if len(ev.usage):
         d["usage"] = upstream.extract_usage(ev)
+    if ev.HasField("info") and (ev.info.msg_id or ev.info.model_uid):
+        d["upstream"] = {"msg": ev.info.msg_id or None,
+                         "model": ev.info.model_uid or None,
+                         "in": ev.info.input_tokens or None,
+                         "out": ev.info.output_tokens or None}
+    if ev.elapsed:
+        d["elapsed_s"] = round(ev.elapsed, 2)
     if ev.thinking_signature:
         d["think_sig"] = ev.thinking_signature[:200]
     return d
@@ -301,14 +308,30 @@ def create_app(api_key=None):
         try:
             rl = reqlog_for(request, body)
             msgs = body.get("messages") or body.get("input") or []
+            u = usage or {}
+            latency = int((time.perf_counter() - t0) * 1000)
+            # generation time excludes queueing when we have TTFT; the
+            # non-stream path has no TTFT so total latency is the basis
+            gen_ms = latency - ttft if ttft is not None else None
+            basis = gen_ms if gen_ms is not None else latency
+            out_tok = u.get("completion_tokens") or 0
+            tps = round(out_tok * 1000 / max(basis, 1), 1) \
+                if out_tok else None
             store.log_request(
                 model=body.get("model"), resolved_model=model,
                 stream=bool(body.get("stream")), ok=ok, status=status,
                 error=(error or "")[:500],
-                prompt_tokens=(usage or {}).get("prompt_tokens", 0),
-                completion_tokens=(usage or {}).get("completion_tokens", 0),
-                latency_ms=int((time.perf_counter() - t0) * 1000),
+                prompt_tokens=u.get("prompt_tokens", 0),
+                completion_tokens=out_tok,
+                cached_tokens=u.get("cached_tokens", 0),
+                cache_creation_tokens=u.get("cache_creation_tokens", 0),
+                latency_ms=latency,
                 ttft_ms=ttft,
+                gen_ms=gen_ms,
+                tps=tps,
+                upstream_model=u.get("upstream_model_uid") or u.get("model"),
+                upstream_msg_id=u.get("upstream_msg_id"),
+                upstream_req_id=u.get("upstream_req_id"),
                 client=request.client.host if request.client else None,
                 key_name=getattr(request.state, "key_name", None),
                 account=account, endpoint=endpoint,
@@ -331,7 +354,9 @@ def create_app(api_key=None):
                or request.headers.get("x-conversation-id"))
         if sid:
             return "s:" + str(sid)[:128]
-        user = body.get("user") or body.get("prompt_cache_key")
+        meta = body.get("metadata")
+        user = (body.get("user") or body.get("prompt_cache_key")
+                or (meta.get("user_id") if isinstance(meta, dict) else None))
         if user:
             return "u:" + str(user)[:128]
         msgs = body.get("messages") or []
@@ -348,6 +373,32 @@ def create_app(api_key=None):
             return None
         return "h:" + hashlib.sha256(
             "|".join(parts).encode()).hexdigest()[:32]
+
+    # The real CLI keeps one cascade_id / trajectory_id / session_id per
+    # conversation and replays them every turn; upstream joins requests by
+    # these ids. Derive stable uuids from the session key so proxied
+    # conversations look the same (a fresh id per request is the anomaly).
+    _ID_NS = uuid.uuid5(uuid.NAMESPACE_DNS, "devin-proxy")
+
+    def conv_ids(skey):
+        if not skey:
+            return {}
+        u = lambda k: str(uuid.uuid5(_ID_NS, f"{k}:{skey}"))
+        return {"cascade_id": u("cascade"), "trajectory_id": u("traj"),
+                "session_id": u("sess")}
+
+    def prompt_id_of(p):
+        """Content-derived per-message uuid — identical replayed history
+        gets identical prompt ids, like the real CLI's stable uuids."""
+        h = hashlib.sha256()
+        h.update(str(p.source).encode())
+        h.update(b"\x00" + (p.tool_call_id or "").encode())
+        for tc in p.tool_calls:
+            h.update(b"\x00" + tc.id.encode() + tc.name.encode()
+                     + tc.arguments.encode())
+        h.update(b"\x00" + (p.prompt or "").encode())
+        h.update(b"\x00" + (p.thinking or "").encode())
+        return str(uuid.uuid5(_ID_NS, "m:" + h.hexdigest()))
 
     # ---------- OpenAI -> upstream mapping ----------
 
@@ -410,7 +461,6 @@ def create_app(api_key=None):
                 if p.prompt:
                     last.prompt = (last.prompt + "\n\n" + p.prompt
                                    if last.prompt else p.prompt)
-                last.num_tokens = max(1, len(last.prompt) // 4)
                 last.images.extend(p.images)
                 last.tool_calls.extend(p.tool_calls)
                 if p.thinking:
@@ -431,6 +481,8 @@ def create_app(api_key=None):
                     and p.tool_call_id not in seen:
                 continue
             out.append(p)
+        for p in out:
+            p.prompt_id = prompt_id_of(p)
         return "\n\n".join(system) or None, out
 
     def map_tools(tools):
@@ -450,7 +502,7 @@ def create_app(api_key=None):
                   or models_mod.auto_effort(name))
         return models_mod.apply_effort(uid, effort)
 
-    def build_request(body, model, acct):
+    def build_request(body, model, acct, skey=None):
         system, prompts = map_messages(body.get("messages"))
         tools = map_tools(body.get("tools"))
         if body.get("tool_choice") == "none":
@@ -465,7 +517,8 @@ def create_app(api_key=None):
         return upstream.build_request(
             acct.token, jwt, model, system, prompts, tools,
             max_tokens=max_tokens,
-            temperature=body.get("temperature"), top_p=body.get("top_p"))
+            temperature=body.get("temperature"), top_p=body.get("top_p"),
+            **conv_ids(skey))
 
     def iter_chat(body, session_key=None, force_account=None, stream=True,
                   log=None):
@@ -498,7 +551,7 @@ def create_app(api_key=None):
                 log.ev("attempt", n=attempt, account=acct.display(),
                        account_id=acct.id)
             try:
-                req = build_request(body, model, acct)
+                req = build_request(body, model, acct, skey=session_key)
             except Exception as e:
                 last_err = {"message": f"{acct.display()}: {e}",
                             "http_error": getattr(
@@ -580,10 +633,16 @@ def create_app(api_key=None):
         yield None, last_err
 
     def oai_usage(u):
-        return {"prompt_tokens": u.get("prompt_tokens", 0),
-                "completion_tokens": u.get("completion_tokens", 0),
-                "total_tokens": u.get("prompt_tokens", 0)
-                + u.get("completion_tokens", 0)}
+        # upstream input_tokens is the UNCACHED count; OpenAI semantics put
+        # cache reads inside prompt_tokens with a details breakdown
+        inp = u.get("prompt_tokens", 0) + u.get("cached_tokens", 0)
+        out = {"prompt_tokens": inp,
+               "completion_tokens": u.get("completion_tokens", 0),
+               "total_tokens": inp + u.get("completion_tokens", 0)}
+        if u.get("cached_tokens"):
+            out["prompt_tokens_details"] = {
+                "cached_tokens": u["cached_tokens"]}
+        return out
 
     # ---------- endpoints ----------
 
@@ -708,8 +767,11 @@ def create_app(api_key=None):
                 agg.feed(tc)
             if ev.stop_reason:
                 finish = upstream.STOP_REASONS.get(ev.stop_reason, "stop")
-            if ev.HasField("usage"):
-                usage = upstream.extract_usage(ev)
+            if len(ev.usage):
+                usage = {**(usage or {}), **upstream.extract_usage(ev)}
+            ui = upstream.upstream_info(ev)
+            if ui:
+                usage = {**(usage or {}), **ui}
         if err:
             status = err.get("http_error", 502)
             _record(request, body, model, False, status,
@@ -786,8 +848,11 @@ def create_app(api_key=None):
                              "type": "function", "function": fn}]}))
                 if ev.stop_reason:
                     finish = upstream.STOP_REASONS.get(ev.stop_reason, "stop")
-                if ev.HasField("usage"):
-                    usage = upstream.extract_usage(ev)
+                if len(ev.usage):
+                    usage = {**(usage or {}), **upstream.extract_usage(ev)}
+                ui = upstream.upstream_info(ev)
+                if ui:
+                    usage = {**(usage or {}), **ui}
         except GeneratorExit:
             rl.flag("client_aborted")
             rl.ev("client_aborted")

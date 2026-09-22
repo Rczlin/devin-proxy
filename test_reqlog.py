@@ -12,9 +12,19 @@ assert s["tool_calls"][0]["name"] == "exec" and s["stop"] == 10, s
 print("tool_call summary:", json.dumps(s, ensure_ascii=False))
 
 u = proto.GetChatMessageResponse()
-mt = u.usage.metrics.add(); mt.metric = "input_tokens"; mt.value.v = 1234.0
+rep = u.usage.add(); rep.title = "Token Usage"
+mt = rep.metrics.add(); mt.metric = "input_tokens"; mt.value.v = 1234.0
+mt = rep.metrics.add(); mt.metric = "cached_input_tokens"; mt.value.v = 512.0
+rep2 = u.usage.add(); rep2.title = "Response Statistics"
+mt = rep2.metrics.add(); mt.metric = "model"; mt.text.s = "Claude Sonnet 5 Medium"
+u.info.model_uid = "claude-sonnet-5-medium"; u.info.msg_id = "msg_x"
+h = u.info.headers.add(); h.name = "Request-Id"; h.value = "req_x"
 s = _msg_summary(u)
 assert s["usage"]["prompt_tokens"] == 1234, s
+assert s["usage"]["cached_tokens"] == 512, s
+assert s["usage"]["model"] == "Claude Sonnet 5 Medium", s
+assert s["usage"]["upstream_req_id"] == "req_x", s
+assert s["upstream"]["msg"] == "msg_x", s
 print("usage summary:", json.dumps(s))
 
 rl = ReqLog({"model": "x", "messages": [{"role": "user", "content": "hi"}]})
