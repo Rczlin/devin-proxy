@@ -286,4 +286,40 @@ d = tc.get("/v1/models?variants=1",
 assert {m["id"] for m in d["data"]} == {"swe-2-high"}
 print("key allowlist filter OK")
 
+# ---- alias delete / hide ----
+tc.patch("/admin/api/models/settings", headers=H,
+         json={"aliases": "tmp=swe-2-high"})
+assert M.resolve("tmp") == "swe-2-high"
+r = tc.delete("/admin/api/models/aliases/tmp", headers=H).json()
+assert "tmp" not in r["aliases"]
+assert M.resolve("tmp") == "tmp"                       # gone -> passthrough
+r = tc.delete("/admin/api/models/aliases/opus", headers=H).json()
+assert "opus" not in r["aliases"] and "opus" in r["hidden_aliases"]
+assert M.resolve("opus") == "opus"                     # hidden -> passthrough
+r = tc.post("/admin/api/models/aliases/unhide", headers=H,
+            json={"name": "opus"}).json()
+assert r["aliases"]["opus"] == "claude-opus-5-high"    # restored
+print("alias delete/hide OK")
+
+# ---- variant hide ----
+r = tc.delete("/admin/api/models/entries/claude-sonnet-5-high",
+              headers=H).json()
+assert "claude-sonnet-5-high" in r["hidden_models"]
+assert "claude-sonnet-5-high" not in {e["uid"] for e in M.entries()}
+# hidden variant is no longer an effort target
+assert M.apply_effort("claude-sonnet-5-medium", "high") \
+    == "claude-sonnet-5-medium"
+# admin still sees it (greyed), /v1/models doesn't
+d = tc.get("/admin/api/models", headers=H).json()
+hid = [m for f in d["families"] for m in f["models"] if m.get("hidden")]
+assert hid and hid[0]["uid"] == "claude-sonnet-5-high"
+d = tc.get("/v1/models?variants=1", headers=H).json()
+assert "claude-sonnet-5-high" not in {m["id"] for m in d["data"]}
+r = tc.post("/admin/api/models/entries/unhide", headers=H,
+            json={"uid": "claude-sonnet-5-high"}).json()
+assert r["hidden_models"] == []
+assert M.apply_effort("claude-sonnet-5-medium", "high") \
+    == "claude-sonnet-5-high"
+print("variant hide OK")
+
 print("ALL MODEL TESTS PASSED")

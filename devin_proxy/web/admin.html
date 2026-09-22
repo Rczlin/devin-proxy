@@ -582,11 +582,35 @@ function modelChip(m,fam,isDef){
     m.url?'<span class="tag model">URL</span>':'',
     isDef?'<span class="tag ok">★ 默认</span>':'',
   ].filter(Boolean).join('');
+  if(m.hidden)
+    return `<button class="mchip" style="opacity:.45" onclick="unhideModel('${esc(m.uid)}')"
+      title="${esc(m.uid)} — 已隐藏，点击恢复">
+      <b style="text-decoration:line-through">${esc(m.label)}</b><br><span class="muted" style="font-size:11px">${esc(m.uid)}</span>
+      ${tags?'<br>'+tags:''}</button>`;
   const act=m.effort?`setFamDefault('${esc(fam)}','${esc(m.effort)}')`:`pickModel('${esc(m.uid)}')`;
   const tip=m.effort?'点击设为该家族默认变体':'点击在 Playground 试用';
   return `<button class="mchip" onclick="${act}" title="${esc(m.uid)} — ${tip}">
-    <b>${esc(m.label)}</b><br><span class="muted" style="font-size:11px">${esc(m.uid)}</span>
+    <b>${esc(m.label)}</b><br><span class="muted" style="font-size:11px">${esc(m.uid)}
+      <span style="cursor:pointer" title="隐藏此变体" onclick="event.stopPropagation();hideModel('${esc(m.uid)}')"> ✕</span></span>
     ${tags?'<br>'+tags:''}</button>`;
+}
+async function hideModel(uid){
+  await api('/admin/api/models/entries/'+encodeURIComponent(uid),{method:'DELETE'});
+  toast('已隐藏 '+uid);loadModels().catch(()=>{});
+}
+async function unhideModel(uid){
+  await api('/admin/api/models/entries/unhide',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({uid})});
+  toast('已恢复 '+uid);loadModels().catch(()=>{});
+}
+async function delAlias(a){
+  await api('/admin/api/models/aliases/'+encodeURIComponent(a),{method:'DELETE'});
+  toast('已删除/隐藏 '+a);loadModels().catch(()=>{});
+}
+async function unhideAlias(a){
+  await api('/admin/api/models/aliases/unhide',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({name:a})});
+  toast('已恢复 '+a);loadModels().catch(()=>{});
 }
 async function setFamDefault(fam,eff){
   const d=await (await api('/admin/api/models/settings',{method:'PATCH',
@@ -619,7 +643,8 @@ async function loadModels(){
   $('#alias-edit').value=Object.entries(d.user_aliases||{}).map(([a,t])=>`${a}=${t}`).join('\n');
   $('#model-fams').innerHTML=d.families.map(f=>{
     const prefer=f.default||'medium';
-    const main=f.models.find(m=>m.effort===prefer)||f.models.find(m=>m.effort==='medium')||f.models[0];
+    const vis=f.models.filter(m=>!m.hidden);
+    const main=vis.find(m=>m.effort===prefer)||vis.find(m=>m.effort==='medium')||vis[0]||f.models[0];
     const rest=f.models.filter(m=>m!==main);
     return `<div class="panel"><h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
       <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
@@ -630,9 +655,15 @@ async function loadModels(){
       </div>`;
   }).join('')
     ||'<div class="panel muted">目录为空 — 点「立即同步」从上游账号拉取（或配置远端目录 URL）</div>';
+  const _ua=d.user_aliases||{};
   $('#alias-list').innerHTML=Object.entries(d.aliases||{}).map(([a,t])=>
-    `<button style="margin:0 6px 8px 0" onclick="pickModel('${esc(a)}')" title="→ ${esc(t)}">${esc(a)} <span class="muted">→ ${esc(t)}</span></button>`).join('')
+    `<button style="margin:0 6px 8px 0" onclick="pickModel('${esc(a)}')" title="→ ${esc(t)}">${esc(a)} <span class="muted">→ ${esc(t)}</span>
+      <span class="muted" style="margin-left:6px;cursor:pointer" title="${a in _ua?'删除别名':'隐藏别名'}"
+        onclick="event.stopPropagation();delAlias('${esc(a)}')">✕</span></button>`).join('')
     ||'<span class="muted">目录为空时别名暂不可用</span>';
+  $('#alias-list').innerHTML+=(d.hidden_aliases||[]).map(a=>
+    `<button class="muted" style="margin:0 6px 8px 0;text-decoration:line-through;opacity:.6"
+      onclick="unhideAlias('${esc(a)}')" title="已隐藏 — 点击恢复">${esc(a)}</button>`).join('');
   $('#model-stats').innerHTML=(d.stats||[]).map(m=>
     `<tr><td><span class="tag model">${esc(m.m)}</span></td><td>${m.n}</td><td>${m.errs||0}</td><td>${fmt(m.in_tok)}</td><td>${fmt(m.out_tok)}</td><td>${Math.round(m.avg_lat)}ms</td><td>${fmtT(m.last_used)}</td></tr>`).join('')||'<tr><td colspan=7 class=muted>暂无使用记录</td></tr>';
   const rq=$('#rq-model'),cur=rq.value;

@@ -218,9 +218,31 @@ def default_effort():
     return e if e in EFFORT_SUFFIX else None
 
 
+def hidden_aliases():
+    """Builtin/remote aliases the admin hid (they can't be deleted at
+    the source, so they're filtered out here)."""
+    try:
+        d = json.loads(store.meta_get("alias_hide") or "[]")
+        return {str(x) for x in d} if isinstance(d, list) else set()
+    except Exception:
+        return set()
+
+
+def hidden_models():
+    """Variant uids the admin hid — dropped from the catalog listing and
+    default-variant picks; explicit uid requests still pass through."""
+    try:
+        d = json.loads(store.meta_get("model_hide") or "[]")
+        return {str(x) for x in d} if isinstance(d, list) else set()
+    except Exception:
+        return set()
+
+
 def _family_of_name(n):
     """Alias/bare name -> family slug: builtin alias spec, remote alias,
-    else the name itself."""
+    else the name itself. Hidden aliases don't route."""
+    if n in hidden_aliases():
+        return n
     spec = ALIAS_DEFS.get(n)
     if n in ALIAS_DEFS:
         return spec[0] if spec else None
@@ -259,14 +281,18 @@ def auto_effort(name):
     return fe or default_effort()
 
 
-def entries():
+def entries(include_hidden=False):
     """Merged catalog -> [entry] sorted by family order then effort.
     Remote-only: empty until the first successful sync."""
     _load()
+    all_hid = hidden_models()
+    hid = set() if include_hidden else all_hid
     with _lock:
         rem = dict(_remote["models"])
     out = []
     for uid, m in rem.items():
+        if uid in hid:
+            continue
         e = _entry(uid, family_slug=m.get("family_slug"),
                    family_label=m.get("family_label"),
                    label=m.get("label"))
@@ -278,6 +304,7 @@ def entries():
             e["remote_accounts"] = len(set(m["accounts"]))
         if m.get("url"):
             e["url"] = True
+        e["hidden"] = uid in all_hid
         out.append(e)
     return sorted(out, key=lambda e: (e["order"], _eff_idx(e), e["uid"]))
 
@@ -332,8 +359,9 @@ def _resolve(name, use_defaults=True):
     if n in ua:
         t, _ = _alias_target(ua[n])
         return t if t in uids() else (family_default(t) or t)
+    hidden = hidden_aliases()
     spec = ALIAS_DEFS.get(n)
-    if n in ALIAS_DEFS:
+    if n in ALIAS_DEFS and n not in hidden:
         if spec is None:
             return default_uid() if use_defaults else DEFAULT_UID
         fam, pref, fallback = spec
@@ -341,7 +369,7 @@ def _resolve(name, use_defaults=True):
     if n in uids():
         return n
     ra = _remote_aliases()
-    if n in ra:
+    if n in ra and n not in hidden:
         return family_default(ra[n]) or n
     return family_default(n) or n
 
@@ -370,17 +398,22 @@ def aliases():
     """alias -> resolved uid. Builtin aliases are listed only while their
     target exists in the catalog (or the catalog is still empty)."""
     known = uids()
+    hidden = hidden_aliases()
     out = {}
     for a in user_aliases():
         t = _resolve(a)
         if t:
             out[a] = t
     for a in ALIAS_DEFS:
+        if a in hidden:
+            continue
         t = _resolve(a)
         if t and (not known or t in known):
             out.setdefault(a, t)
     for a in _remote_aliases():
-        t = resolve(a)
+        if a in hidden:
+            continue
+        t = _resolve(a)
         if t and (not known or t in known):
             out.setdefault(a, t)
     return out
@@ -396,14 +429,14 @@ def apply_effort(uid, effort):
     if cur is None:
         return uid
     cand = f"{base}-{suf}"
-    known = uids()
+    known = uids() - hidden_models()
     return cand if (not known or cand in known) else uid
 
 
-def grouped():
+def grouped(include_hidden=False):
     """entries() grouped by family -> [{prefix,label,vendor,desc,models}]."""
     fams = {}
-    for e in entries():
+    for e in entries(include_hidden):
         f = fams.setdefault(e["family"], {
             "prefix": e["family"], "label": e["family_label"],
             "vendor": e["vendor"], "desc": "", "models": []})

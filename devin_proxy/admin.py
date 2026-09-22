@@ -123,15 +123,58 @@ def make_router(app):
     @router.get("/api/models", dependencies=[Depends(admin_key)])
     def models():
         models_mod.maybe_refresh(app.state.http, app.state.pool)
-        return {"families": models_mod.grouped(),
-                "models": [e["uid"] for e in models_mod.entries()],
+        return {"families": models_mod.grouped(include_hidden=True),
+                "models": [e["uid"]
+                           for e in models_mod.entries()],
                 "aliases": models_mod.aliases(),
                 "user_aliases": models_mod.user_aliases(),
                 "default_model": models_mod.default_uid(),
                 "default_effort": models_mod.default_effort(),
                 "family_efforts": models_mod.family_efforts(),
+                "hidden_aliases": sorted(models_mod.hidden_aliases()),
+                "hidden_models": sorted(models_mod.hidden_models()),
                 "sync": models_mod.sync_info(),
                 "stats": store.list_models()}
+
+    @router.delete("/api/models/entries/{uid}",
+                   dependencies=[Depends(admin_key)])
+    def model_hide(uid: str):
+        hid = models_mod.hidden_models() | {uid.strip()}
+        store.meta_set("model_hide", json.dumps(sorted(hid)))
+        return {"ok": True,
+                "hidden_models": sorted(models_mod.hidden_models())}
+
+    @router.post("/api/models/entries/unhide",
+                 dependencies=[Depends(admin_key)])
+    def model_unhide(body: Optional[dict] = None):
+        uid = str((body or {}).get("uid") or "").strip()
+        hid = models_mod.hidden_models() - {uid}
+        store.meta_set("model_hide", json.dumps(sorted(hid)))
+        return {"ok": True, "hidden_models": sorted(hid)}
+
+    @router.delete("/api/models/aliases/{name}",
+                   dependencies=[Depends(admin_key)])
+    def alias_delete(name: str):
+        """Delete a user alias, or hide a builtin/remote one."""
+        name = name.strip()
+        ua = models_mod.user_aliases()
+        if name in ua:
+            ua.pop(name)
+            store.meta_set("model_aliases", json.dumps(ua))
+        else:
+            hid = models_mod.hidden_aliases() | {name}
+            store.meta_set("alias_hide", json.dumps(sorted(hid)))
+        return {"ok": True, "aliases": models_mod.aliases(),
+                "hidden_aliases": sorted(models_mod.hidden_aliases())}
+
+    @router.post("/api/models/aliases/unhide",
+                 dependencies=[Depends(admin_key)])
+    def alias_unhide(body: Optional[dict] = None):
+        name = str((body or {}).get("name") or "").strip()
+        hid = models_mod.hidden_aliases() - {name}
+        store.meta_set("alias_hide", json.dumps(sorted(hid)))
+        return {"ok": True, "aliases": models_mod.aliases(),
+                "hidden_aliases": sorted(hid)}
 
     @router.post("/api/models/refresh", dependencies=[Depends(admin_key)])
     def models_refresh():
