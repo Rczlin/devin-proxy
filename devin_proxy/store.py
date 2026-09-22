@@ -106,8 +106,23 @@ def _conn():
         """)
         _migrate_keys()
         _migrate_requests()
+        _add_columns("api_keys", {
+            "models": "TEXT",
+            "max_concurrent": "INTEGER DEFAULT 0",
+        })
+        _add_columns("accounts", {
+            "max_concurrent": "INTEGER DEFAULT 0",
+            "models": "TEXT",
+        })
         _con.commit()
     return _con
+
+
+def _add_columns(table, cols):
+    existing = {r[1] for r in _con.execute(f"PRAGMA table_info({table})")}
+    for col, ddl in cols.items():
+        if col not in existing:
+            _con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
 
 def _migrate_keys():
@@ -263,12 +278,24 @@ def list_models():
 
 # ---------- api keys ----------
 
-def create_key(name):
+def _models_text(models):
+    """Normalize a model allowlist (iterable or comma string) -> TEXT or None."""
+    if models is None:
+        return None
+    if isinstance(models, str):
+        models = [m.strip() for m in models.split(",")]
+    models = [m for m in models if m]
+    return ",".join(models) if models else None
+
+
+def create_key(name, models=None, max_concurrent=0):
     key = "sk-dp-" + secrets.token_urlsafe(24)
     with _lock:
         _conn().execute(
-            "INSERT INTO api_keys (name,key_hash,prefix,tail,created) VALUES (?,?,?,?,?)",
-            (name, _hash(key), key[:10], key[-4:], time.time()))
+            "INSERT INTO api_keys (name,key_hash,prefix,tail,created,models,"
+            "max_concurrent) VALUES (?,?,?,?,?,?,?)",
+            (name, _hash(key), key[:10], key[-4:], time.time(),
+             _models_text(models), int(max_concurrent or 0)))
         _conn().commit()
     return key
 
@@ -276,8 +303,8 @@ def create_key(name):
 def list_keys():
     with _lock:
         rows = _conn().execute(
-            "SELECT id,name,prefix,tail,created,disabled,last_used "
-            "FROM api_keys ORDER BY id").fetchall()
+            "SELECT id,name,prefix,tail,created,disabled,last_used,models,"
+            "max_concurrent FROM api_keys ORDER BY id").fetchall()
     return [dict(r) for r in rows]
 
 
@@ -287,24 +314,46 @@ def delete_key(kid):
         _conn().commit()
 
 
-def set_key_disabled(kid, disabled):
+def update_key(kid, **fields):
+    cols = {"name", "disabled", "models", "max_concurrent"}
+    sets, args = [], []
+    for k, v in fields.items():
+        if k in cols:
+            if k == "models":
+                v = _models_text(v)
+            elif k == "max_concurrent":
+                v = int(v or 0)
+            elif k == "disabled":
+                v = int(v)
+            sets.append(f"{k}=?")
+            args.append(v)
+    if not sets:
+        return
     with _lock:
-        _conn().execute("UPDATE api_keys SET disabled=? WHERE id=?",
-                        (int(disabled), kid))
+        _conn().execute(f"UPDATE api_keys SET {','.join(sets)} WHERE id=?",
+                        args + [kid])
         _conn().commit()
 
 
+def set_key_disabled(kid, disabled):
+    update_key(kid, disabled=disabled)
+
+
 def key_info(key):
-    """-> (name, disabled) for a presented bearer key, else None."""
+    """-> full key row for a presented bearer key, else None."""
     with _lock:
         r = _conn().execute(
-            "SELECT name,disabled FROM api_keys WHERE key_hash=?",
-            (_hash(key),)).fetchone()
+            "SELECT id,name,disabled,models,max_concurrent FROM api_keys "
+            "WHERE key_hash=?", (_hash(key),)).fetchone()
         if r is not None and not r["disabled"]:
             _conn().execute("UPDATE api_keys SET last_used=? WHERE key_hash=?",
                             (time.time(), _hash(key)))
             _conn().commit()
-    return dict(r) if r else None
+    if r is None:
+        return None
+    d = dict(r)
+    d["models"] = [m for m in (d.get("models") or "").split(",") if m]
+    return d
 
 
 def has_keys():
@@ -347,10 +396,14 @@ def update_account(aid, **fields):
     cols = {"name", "email", "api_server_url", "devin_webapp_host",
             "devin_api_url", "plan", "disabled", "fail_count",
             "consecutive_fails", "cooldown_until", "last_error",
-            "last_used", "last_ok", "req_count"}
+            "last_used", "last_ok", "req_count", "max_concurrent", "models"}
     sets, args = [], []
     for k, v in fields.items():
         if k in cols:
+            if k == "models":
+                v = _models_text(v)
+            elif k == "max_concurrent":
+                v = int(v or 0)
             sets.append(f"{k}=?")
             args.append(v)
     if not sets:

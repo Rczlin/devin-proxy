@@ -1,6 +1,8 @@
 """FastAPI app: OpenAI /v1/chat/completions + /v1/responses -> Devin Cascade."""
 import hashlib
 import json
+import secrets
+import threading
 import time
 import uuid
 
@@ -73,34 +75,101 @@ class ToolAgg:
         return self.order.index(cid), agg, new_name, delta
 
 
+def _master_key(api_key):
+    """The master key is mandatory: explicit --api-key/env wins; otherwise a
+    generated key is persisted in the db so the console and /v1 are never
+    left open."""
+    if api_key:
+        return api_key, "env"
+    saved = store.meta_get("master_key")
+    if saved:
+        return saved, "stored"
+    api_key = "sk-dp-" + secrets.token_urlsafe(24)
+    store.meta_set("master_key", api_key)
+    return api_key, "generated"
+
+
 def create_app(api_key=None):
-    app = FastAPI(title="devin-proxy")
+    api_key, key_src = _master_key(api_key)
+    app = FastAPI(title="api", docs_url=None, redoc_url=None,
+                  openapi_url=None)
     pool = accounts_mod.Pool()
     imported = pool.import_detected(creds_mod.detect_all())
     app.state.pool = pool
     app.state.proxy_key = api_key
     app.state.http = httpx.Client(timeout=httpx.Timeout(300, connect=15))
+    app.state.key_slots = {}
+    app.state.slot_lock = threading.Lock()
     if imported:
         print(f"accounts: imported {imported} detected credential(s)")
     if not pool.accounts():
         print("accounts: none configured — add one in the admin console "
               "or via DEVIN_SESSION_TOKEN")
+    if key_src == "generated":
+        print(f"admin key (generated, saved): {api_key}")
+    elif key_src == "stored":
+        print(f"admin key (from db): {api_key}")
+
+    @app.middleware("http")
+    async def _stealth(request, call_next):
+        resp = await call_next(request)
+        if "server" in resp.headers:
+            del resp.headers["server"]
+        return resp
 
     def check_key(request: Request):
-        """Bearer auth: master --api-key, or any key created in the admin UI."""
+        """Bearer auth: master key, or any key created in the admin UI."""
         auth = request.headers.get("authorization", "")
         token = auth[7:] if auth.startswith("Bearer ") else ""
         request.state.key_name = None
-        if app.state.proxy_key and token == app.state.proxy_key:
+        request.state.key_row = None
+        if token and token == app.state.proxy_key:
             request.state.key_name = "master"
             return
         if token:
             info = store.key_info(token)
             if info and not info["disabled"]:
                 request.state.key_name = info["name"]
+                request.state.key_row = info
                 return
-        if app.state.proxy_key or store.has_keys():
-            raise HTTPException(401, "unauthorized")
+        raise HTTPException(401, "unauthorized")
+
+    def _key_models(request):
+        """-> set of allowed model names for the caller's key, or None."""
+        row = getattr(request.state, "key_row", None)
+        if row and row.get("models"):
+            return set(row["models"])
+        return None
+
+    def model_allowed(request, requested, resolved):
+        allowed = _key_models(request)
+        return (allowed is None or requested in allowed
+                or resolved in allowed)
+
+    def acquire_key_slot(request):
+        """Per-key concurrency guard -> release fn, or None if at the cap."""
+        row = getattr(request.state, "key_row", None)
+        limit = (row or {}).get("max_concurrent") or 0
+        if not row or not limit:
+            return lambda: None
+        kid = row["id"]
+        with app.state.slot_lock:
+            n = app.state.key_slots.get(kid, 0)
+            if n >= limit:
+                return None
+            app.state.key_slots[kid] = n + 1
+
+        def release():
+            with app.state.slot_lock:
+                app.state.key_slots[kid] = max(
+                    0, app.state.key_slots.get(kid, 0) - 1)
+        return release
+
+    def _release_gen(gen, release):
+        try:
+            yield from gen
+        finally:
+            release()
 
     def _record(request, body, model, ok, status, error, usage, t0, ttft,
                 account=None, endpoint=None):
@@ -234,13 +303,19 @@ def create_app(api_key=None):
         """Failover driver. Yields (acct, event). Terminal upstream error is
         yielded as (acct_or_None, dict). On success returns quietly."""
         model = resolve_model(body)
+        want = {m for m in (body.get("model"), model) if m}
         tried, last_err = set(), {"message": "no accounts configured",
                                   "http_error": 503}
         force_id = force_account.id if force_account else None
         attempts = 1 if force_account else accounts_mod.MAX_ATTEMPTS
         for _ in range(attempts):
-            acct = pool.pick(session_key, exclude=tried, force_id=force_id)
+            acct = pool.pick(session_key, exclude=tried, force_id=force_id,
+                             models=want)
             if acct is None:
+                if pool.accounts():
+                    last_err = {"message": "no eligible account (all busy, "
+                                "cooling down, or model-restricted)",
+                                "http_error": 503}
                 break
             tried.add(acct.id)
             force_id = None
@@ -292,14 +367,16 @@ def create_app(api_key=None):
     # ---------- endpoints ----------
 
     @app.get("/v1/models", dependencies=[Depends(check_key)])
-    def list_models():
-        data = [{"id": m, "object": "model", "created": 0, "owned_by": "devin"}
-                for m in KNOWN_UIDS + list(MODEL_ALIASES)]
+    def list_models(request: Request):
+        allowed = _key_models(request)
+        names = KNOWN_UIDS + list(MODEL_ALIASES)
+        data = [{"id": m, "object": "model", "created": 0, "owned_by": "proxy"}
+                for m in names if allowed is None or m in allowed]
         return {"object": "list", "data": data}
 
     @app.get("/healthz")
     def healthz():
-        return {"ok": True, "accounts": pool.summary()}
+        return {"ok": True}
 
     @app.post("/v1/chat/completions", dependencies=[Depends(check_key)])
     async def chat(request: Request):
@@ -307,11 +384,20 @@ def create_app(api_key=None):
         t0 = time.perf_counter()
         skey = session_key_for(request, body)
         model = resolve_model(body)
+        if not model_allowed(request, body.get("model"), model):
+            raise HTTPException(403, "model not permitted for this key")
+        release = acquire_key_slot(request)
+        if release is None:
+            raise HTTPException(429, "key concurrency limit reached")
         if body.get("stream"):
             return StreamingResponse(
-                _sse_stream(request, body, model, skey, t0),
+                _release_gen(_sse_stream(request, body, model, skey, t0),
+                             release),
                 media_type="text/event-stream")
-        return JSONResponse(_collect(request, body, model, skey, t0))
+        try:
+            return JSONResponse(_collect(request, body, model, skey, t0))
+        finally:
+            release()
 
     def _collect(request, body, model, skey, t0, force_account=None):
         texts, think, agg = [], [], ToolAgg()
@@ -441,10 +527,13 @@ def create_app(api_key=None):
     async def create_response(request: Request):
         body = await request.json()
         t0 = time.perf_counter()
+        release = acquire_key_slot(request)
+        if release is None:
+            raise HTTPException(429, "key concurrency limit reached")
         return responses_mod.handle(
             request, body, t0,
             iter_chat=iter_chat, resolve_model=resolve_model,
-            record=_record)
+            record=_record, release=release)
 
     @app.get("/v1/responses/{rid}", dependencies=[Depends(check_key)])
     def get_response(rid: str):

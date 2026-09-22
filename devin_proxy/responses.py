@@ -231,29 +231,57 @@ def response_object(rid, model, body, items_out, usage, status="completed",
 
 # ---------- handler ----------
 
-def handle(request, body, t0, *, iter_chat, resolve_model, record):
+def _release_wrap(gen, release):
     try:
-        chat_body, items, chain_skey = to_chat_body(body)
-    except ValueError as e:
-        return _err(400, str(e), code="previous_response_not_found")
-    model = resolve_model(chat_body)
-    conv = body.get("conversation")
-    if isinstance(conv, dict):
-        conv = conv.get("id")
-    skey = (chain_skey
-            or (f"conv:{conv}" if conv else None)
-            or (f"resp:{body['previous_response_id']}"
-                if body.get("previous_response_id") else None)
-            or _fingerprint(messages_of(chat_body))
-            or (f"u:{body['user']}" if body.get("user") else None))
-    rid = _iid("resp")
-    if body.get("stream"):
-        return StreamingResponse(
-            _sse(request, body, chat_body, model, skey, rid, items,
-                 iter_chat, record, t0),
-            media_type="text/event-stream")
-    return _collect(request, body, chat_body, model, skey, rid, items,
-                    iter_chat, record, t0)
+        yield from gen
+    finally:
+        if release:
+            release()
+
+
+def handle(request, body, t0, *, iter_chat, resolve_model, record,
+           release=None):
+    released = False
+
+    def done():
+        nonlocal released
+        if release and not released:
+            released = True
+            release()
+    try:
+        try:
+            chat_body, items, chain_skey = to_chat_body(body)
+        except ValueError as e:
+            return _err(400, str(e), code="previous_response_not_found")
+        model = resolve_model(chat_body)
+        row = getattr(request.state, "key_row", None)
+        allowed = set(row["models"]) if row and row.get("models") else None
+        if (allowed is not None and chat_body.get("model") not in allowed
+                and model not in allowed):
+            return _err(403, "model not permitted for this key",
+                        code="model_not_permitted")
+        conv = body.get("conversation")
+        if isinstance(conv, dict):
+            conv = conv.get("id")
+        skey = (chain_skey
+                or (f"conv:{conv}" if conv else None)
+                or (f"resp:{body['previous_response_id']}"
+                    if body.get("previous_response_id") else None)
+                or _fingerprint(messages_of(chat_body))
+                or (f"u:{body['user']}" if body.get("user") else None))
+        rid = _iid("resp")
+        if body.get("stream"):
+            resp = StreamingResponse(
+                _release_wrap(
+                    _sse(request, body, chat_body, model, skey, rid, items,
+                         iter_chat, record, t0), release),
+                media_type="text/event-stream")
+            released = True     # generator wrapper owns the slot now
+            return resp
+        return _collect(request, body, chat_body, model, skey, rid, items,
+                        iter_chat, record, t0)
+    finally:
+        done()
 
 
 def messages_of(chat_body):

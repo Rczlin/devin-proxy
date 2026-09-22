@@ -1,11 +1,19 @@
-"""Admin console: embedded SPA + JSON APIs under /admin."""
+"""Admin console: embedded SPA + JSON APIs under /admin.
+
+The console is always locked: /admin serves only a minimal login page,
+POST /admin/api/login trades the master key for an HttpOnly session cookie,
+and /admin/app (the SPA) plus every /admin/api/* endpoint require that
+cookie (or the master key as Bearer / ?key=)."""
+import hashlib
+import hmac
 import os
 import sys
 import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import (HTMLResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from pydantic import BaseModel
 
 from . import accounts as accounts_mod
@@ -14,24 +22,75 @@ from . import store, upstream
 from .app import KNOWN_UIDS, MODEL_ALIASES
 
 _HTML = os.path.join(os.path.dirname(__file__), "web", "admin.html")
+_LOGIN_HTML = os.path.join(os.path.dirname(__file__), "web", "login.html")
+
+_SESS_COOKIE = "dp_admin"
+_SESS_TTL = 7 * 86400
 
 
 def make_router(app):
     router = APIRouter(prefix="/admin")
     started = time.time()
 
-    def admin_key(request: Request):
-        """Admin auth: the --api-key master key, if configured."""
+    def _sess_token():
+        exp = int(time.time()) + _SESS_TTL
+        sig = hmac.new(app.state.proxy_key.encode(), str(exp).encode(),
+                       hashlib.sha256).hexdigest()
+        return f"{exp}.{sig}"
+
+    def _sess_ok(token):
+        try:
+            exp, sig = token.split(".", 1)
+            exp = int(exp)
+        except (ValueError, AttributeError):
+            return False
+        if exp < time.time():
+            return False
+        want = hmac.new(app.state.proxy_key.encode(), str(exp).encode(),
+                        hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, want)
+
+    def _authed(request: Request):
+        if _sess_ok(request.cookies.get(_SESS_COOKIE, "")):
+            return True
         key = app.state.proxy_key
-        if key:
-            auth = request.headers.get("authorization", "")
-            qk = request.query_params.get("key")
-            if auth != f"Bearer {key}" and qk != key:
-                raise HTTPException(401, "unauthorized")
+        auth = request.headers.get("authorization", "")
+        return bool(key) and (auth == f"Bearer {key}"
+                              or request.query_params.get("key") == key)
+
+    def admin_key(request: Request):
+        if not _authed(request):
+            raise HTTPException(401, "unauthorized")
+
+    class LoginBody(BaseModel):
+        key: str = ""
+
+    @router.post("/api/login")
+    def login(body: LoginBody, request: Request):
+        if not app.state.proxy_key or body.key != app.state.proxy_key:
+            time.sleep(0.4)                 # slow down brute force
+            raise HTTPException(401, "invalid key")
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie(_SESS_COOKIE, _sess_token(), max_age=_SESS_TTL,
+                        httponly=True, samesite="lax",
+                        secure=request.url.scheme == "https")
+        return resp
+
+    @router.post("/api/logout")
+    def logout():
+        resp = JSONResponse({"ok": True})
+        resp.delete_cookie(_SESS_COOKIE)
+        return resp
 
     @router.get("", response_class=HTMLResponse)
     @router.get("/", response_class=HTMLResponse)
     def index():
+        return HTMLResponse(open(_LOGIN_HTML, encoding="utf-8").read())
+
+    @router.get("/app", response_class=HTMLResponse)
+    def console(request: Request):
+        if not _authed(request):
+            return RedirectResponse("/admin")
         return HTMLResponse(open(_HTML, encoding="utf-8").read())
 
     @router.get("/api/overview", dependencies=[Depends(admin_key)])
@@ -85,9 +144,14 @@ def make_router(app):
 
     class NewKey(BaseModel):
         name: str
+        models: Optional[str] = None        # comma list; empty = all models
+        max_concurrent: int = 0             # 0 = unlimited
 
     class KeyPatch(BaseModel):
-        disabled: bool
+        name: Optional[str] = None
+        disabled: Optional[bool] = None
+        models: Optional[str] = None        # "" clears the allowlist
+        max_concurrent: Optional[int] = None
 
     @router.get("/api/keys", dependencies=[Depends(admin_key)])
     def keys():
@@ -98,11 +162,21 @@ def make_router(app):
         name = body.name.strip()
         if not name:
             raise HTTPException(400, "name required")
-        return {"key": store.create_key(name)}
+        return {"key": store.create_key(name, models=body.models,
+                                        max_concurrent=body.max_concurrent)}
 
     @router.patch("/api/keys/{kid}", dependencies=[Depends(admin_key)])
     def patch_key(kid: int, body: KeyPatch):
-        store.set_key_disabled(kid, body.disabled)
+        fields = {}
+        if body.name is not None:
+            fields["name"] = body.name.strip()
+        if body.disabled is not None:
+            fields["disabled"] = body.disabled
+        if body.models is not None:
+            fields["models"] = body.models
+        if body.max_concurrent is not None:
+            fields["max_concurrent"] = body.max_concurrent
+        store.update_key(kid, **fields)
         return {"ok": True}
 
     @router.delete("/api/keys/{kid}", dependencies=[Depends(admin_key)])
@@ -119,6 +193,8 @@ def make_router(app):
     class AccountPatch(BaseModel):
         name: Optional[str] = None
         disabled: Optional[bool] = None
+        max_concurrent: Optional[int] = None
+        models: Optional[str] = None        # "" clears the allowlist
 
     @router.get("/api/accounts", dependencies=[Depends(admin_key)])
     def list_accounts():
@@ -157,6 +233,10 @@ def make_router(app):
             fields["name"] = body.name.strip()
         if body.disabled is not None:
             fields["disabled"] = int(body.disabled)
+        if body.max_concurrent is not None:
+            fields["max_concurrent"] = body.max_concurrent
+        if body.models is not None:
+            fields["models"] = body.models
         app.state.pool.update(aid, **fields)
         return {"account": app.state.pool.get(aid).public()}
 
