@@ -122,6 +122,20 @@ r = c.get("/admin/api/requests", cookies=cookie_hdr)
 assert r.json()["total"] == 0
 print("filtered prune + clear OK")
 
+# --- keyset pagination ---
+for i in range(5):
+    _st.log_request("pg", "pg", 0, 1, 200, None, 0, 0, 1, None, "t", "ci", "[]")
+r = c.get("/admin/api/requests?limit=2", cookies=cookie_hdr)
+d = r.json()
+assert len(d["items"]) == 2 and d["next_cursor"] == d["items"][-1]["id"]
+page1_ids = [x["id"] for x in d["items"]]
+r = c.get(f"/admin/api/requests?limit=2&before={d['next_cursor']}",
+          cookies=cookie_hdr)
+d2 = r.json()
+assert [x["id"] for x in d2["items"]] != page1_ids
+assert all(x["id"] < page1_ids[-1] for x in d2["items"])
+print("keyset pagination OK")
+
 # --- input validation edges (must not 500 or silently misfire) ---
 H = {"Authorization": "Bearer sk-test-master"}
 assert c.get("/admin/api/overview?hours=-5", headers=H).status_code == 400

@@ -223,13 +223,16 @@ def make_router(app):
         return d
 
     @router.get("/api/requests", dependencies=[Depends(admin_key)])
-    def requests(limit: int = 50, offset: int = 0, model: str = None,
-                 ok: int = None, q: str = None, account: str = None,
-                 flag: str = None):
+    def requests(limit: int = 50, offset: int = 0, before: int = None,
+                 model: str = None, ok: int = None, q: str = None,
+                 account: str = None, flag: str = None):
         limit = max(1, min(limit, 200))
         items, total = store.list_requests(limit, offset, model, ok, q,
-                                           account, flag)
-        return {"items": items, "total": total}
+                                           account, flag, before_id=before)
+        # next_cursor lets the UI page by keyset instead of offset —
+        # stable while new requests arrive between pages.
+        return {"items": items, "total": total,
+                "next_cursor": items[-1]["id"] if items else None}
 
     @router.get("/api/requests/export", dependencies=[Depends(admin_key)])
     def requests_export(fmt: str = "jsonl", limit: int = 1000,
