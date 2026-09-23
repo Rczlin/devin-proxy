@@ -212,6 +212,31 @@ diagnostic bundle streams to the client instead of building in memory.
 - `GET /healthz` — `{"ok": true}` only
 - `/admin` — sign-in page → cookie session → `/admin/app` console
 
+Admin JSON API (all under `/admin/api`, cookie or `Authorization: Bearer`
+master key):
+
+- `GET /overview?hours=` `GET /status` `GET /ping` — dashboard stats,
+  runtime/disk info, per-account connectivity probe
+- `GET /requests?limit&offset|before&model&ok&q&account&flag` — paged log
+  (keyset via `before` for stable pages); `GET /requests/{id}`,
+  `GET /requests/{id}/capture`, `GET /requests/export?fmt=csv|jsonl`,
+  `GET /requests/errors?hours=`, `POST /requests/clear` (same filters +
+  `older_than_hours`; unfiltered clears all)
+- `GET /export` — streamed diagnostic zip (requests/responses/captures/
+  accounts/models/meta/stats + decoder, credentials stripped)
+- `GET /accounts` `POST /accounts` `PATCH/DELETE /accounts/{id}`
+  `POST /accounts/{id}/test` `POST /accounts/{id}/refresh`
+  `POST /accounts/import` `POST /accounts/bulk {ids,disabled}`
+- `POST /oauth/start` `GET /oauth` `POST /oauth/{fid}/complete`
+  `DELETE /oauth/{fid}` — PKCE login flow
+- `GET /sessions` `DELETE /sessions/{key}` `POST /sessions/clear`
+- `GET /models` `PATCH /models/settings` `POST /models/refresh`
+  `DELETE /models/entries/{uid}` `POST /models/entries/unhide`
+  `DELETE /models/aliases/{name}` `POST /models/aliases/unhide`
+- `GET /keys` `POST /keys` `PATCH/DELETE /keys/{id}`
+- `POST /playground` — chat through the normal pipeline (no client key)
+- `POST /maintenance/cleanup?aggressive=` — reclaim disk space
+
 Model: pass a family name as listed by `/v1/models` (`claude-sonnet-5`,
 `swe-2`, …), a specific variant uid (`claude-sonnet-5-medium`,
 `swe-2-high`), or an alias (`claude`, `sonnet`, `opus`, `gemini`,
