@@ -778,8 +778,9 @@ def list_keys():
 @_resilient(default=None)
 def delete_key(kid):
     with _lock:
-        _conn().execute("DELETE FROM api_keys WHERE id=?", (kid,))
+        cur = _conn().execute("DELETE FROM api_keys WHERE id=?", (kid,))
         _conn().commit()
+        return cur.rowcount
 
 
 @_resilient(default=None)
@@ -797,11 +798,13 @@ def update_key(kid, **fields):
             sets.append(f"{k}=?")
             args.append(v)
     if not sets:
-        return
+        return 0
     with _lock:
-        _conn().execute(f"UPDATE api_keys SET {','.join(sets)} WHERE id=?",
-                        args + [kid])
+        cur = _conn().execute(
+            f"UPDATE api_keys SET {','.join(sets)} WHERE id=?",
+            args + [kid])
         _conn().commit()
+        return cur.rowcount
 
 
 def set_key_disabled(kid, disabled):
