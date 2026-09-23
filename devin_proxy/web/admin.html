@@ -296,7 +296,7 @@ tr:hover td.ops{background:#1a2129}
       <div class="panel">
         <h3>会话钉扎 <span class="muted">同一会话固定走同一账号，失败自动转移</span>
           <a style="float:right" onclick="clearSessions()">全部解绑</a></h3>
-        <table><thead><tr><th>Session Key</th><th>账号</th><th>更新时间</th><th></th></tr></thead>
+        <table><thead><tr><th>Session Key</th><th>账号</th><th>空闲</th><th>剩余有效期</th><th>更新时间</th><th></th></tr></thead>
         <tbody id="sess-body"></tbody></table>
       </div>
     </section>
@@ -868,11 +868,17 @@ async function loadAccounts(){
         <button class="danger" onclick="delAccount(${a.id},'${esc(a.label)}')">删除</button>
       </td></tr>`}).join('')||'<tr><td colspan=13 class=muted>暂无账号 — 用上方 OAuth 登录或手动添加</td></tr>';
   const s=await (await api('/admin/api/sessions')).json();
-  $('#sess-body').innerHTML=(s.sessions||[]).map(x=>`<tr>
+  $('#sess-body').innerHTML=(s.sessions||[]).map(x=>{
+    const left=x.expires_in_s;
+    const leftTxt=left==null?'-':left<=0?'<span class="tag err">已过期</span>'
+      :left<3600?`<span style="color:var(--yellow)">${Math.round(left/60)}分钟</span>`
+      :`<span class="muted">${(left/3600).toFixed(1)}小时</span>`;
+    return `<tr>
     <td class="muted">${esc(x.session_key)}</td><td>${esc(x.aname||x.email||('#'+x.account_id))}</td>
+    <td class="muted">${x.idle_s!=null?fmtDur(x.idle_s)+'前':'-'}</td><td>${leftTxt}</td>
     <td>${fmtT(x.updated)}</td>
-    <td><a onclick="unpinSess('${esc(x.session_key)}')">解绑</a></td></tr>`).join('')
-    ||'<tr><td colspan=4 class=muted>暂无钉扎会话</td></tr>';
+    <td><a onclick="unpinSess('${esc(x.session_key)}')">解绑</a></td></tr>`}).join('')
+    ||'<tr><td colspan=6 class=muted>暂无钉扎会话</td></tr>';
 }
 async function oauthStart(){
   $('#oa-err').textContent='';

@@ -291,12 +291,16 @@ class Pool:
         store.set_pin(session_key, acct.id)
 
     def sessions(self):
+        now = time.time()
         with self._lock:
             rows = []
             for k, (aid, ts) in self._pins.items():
                 a = self._accs.get(aid)
                 rows.append({"session_key": k, "account_id": aid,
                              "updated": ts,
+                             "idle_s": round(now - (ts or 0)),
+                             "expires_in_s": round(SESSION_TTL
+                                                   - (now - (ts or 0))),
                              "aname": a.name if a else None,
                              "email": a.email if a else None})
             rows.sort(key=lambda r: r["updated"] or 0, reverse=True)
