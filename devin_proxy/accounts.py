@@ -140,12 +140,28 @@ class Pool:
         self._accs = {}
         self._pins = {}          # session_key -> [account_id, updated]
         self._pins_dirty = set() # keys whose `updated` needs flushing to db
+        self._listeners = []     # change callbacks (admin live feed)
         self.reload()
         store.prune_pins(SESSION_TTL)
         store.prune_responses(RESPONSE_TTL)
         for r in store.list_pins():
             self._pins[r["session_key"]] = [r["account_id"], r["updated"] or 0]
         threading.Thread(target=self._pin_flush_loop, daemon=True).start()
+
+    # ---------- change notifications (admin live feed) ----------
+
+    def on_change(self, fn):
+        """Register a callback fired after pool state changes (in_flight,
+        cooldowns, pins, membership). Called from worker threads — must be
+        fast and non-blocking."""
+        self._listeners.append(fn)
+
+    def _notify(self):
+        for fn in getattr(self, "_listeners", ()):
+            try:
+                fn()
+            except Exception:
+                pass
 
     def reload(self):
         with self._lock:
@@ -156,6 +172,7 @@ class Pool:
                 if a.id in prev:
                     a.in_flight = prev[a.id].in_flight
                 self._accs[a.id] = a
+        self._notify()
 
     # ---------- lookup ----------
 
@@ -208,6 +225,7 @@ class Pool:
             for k in [k for k, v in self._pins.items() if v[0] == aid]:
                 self._pins.pop(k, None)
                 self._pins_dirty.discard(k)
+        self._notify()
 
     def update(self, aid, **fields):
         store.update_account(aid, **fields)
@@ -217,6 +235,12 @@ class Pool:
 
     def pick(self, session_key=None, exclude=frozenset(), force_id=None,
              models=None, remote=None):
+        a = self._pick(session_key, exclude, force_id, models, remote)
+        if a is not None:
+            self._notify()          # in_flight bumped -> push live state
+        return a
+
+    def _pick(self, session_key, exclude, force_id, models, remote):
         with self._lock:
             now = time.time()
             if force_id is not None:
@@ -253,6 +277,7 @@ class Pool:
             return
         with self._lock:
             acct.in_flight = max(0, acct.in_flight - 1)
+        self._notify()
 
     def mark_ok(self, acct):
         now = time.time()
@@ -262,6 +287,7 @@ class Pool:
         acct.cooldown_until = 0
         acct.last_error = None
         acct.persist()
+        self._notify()
 
     def mark_fail(self, acct, err):
         now = time.time()
@@ -275,20 +301,25 @@ class Pool:
                 COOLDOWN_BASE * (2 ** (acct.consecutive_fails - 1)),
                 COOLDOWN_MAX)
         acct.persist()
+        self._notify()
 
     def pin(self, session_key, acct):
         if not (session_key and acct):
             return
         now = time.time()
+        new = False
         with self._lock:
             ent = self._pins.get(session_key)
             if ent and ent[0] == acct.id:
                 ent[1] = now
                 self._pins_dirty.add(session_key)
-                return
-            self._pins[session_key] = [acct.id, now]
-            self._pins_dirty.discard(session_key)
-        store.set_pin(session_key, acct.id)
+            else:
+                self._pins[session_key] = [acct.id, now]
+                self._pins_dirty.discard(session_key)
+                new = True
+        if new:
+            store.set_pin(session_key, acct.id)
+        self._notify()
 
     def sessions(self):
         now = time.time()
@@ -311,6 +342,7 @@ class Pool:
             self._pins.pop(session_key, None)
             self._pins_dirty.discard(session_key)
         store.unpin(session_key)
+        self._notify()
 
     def _pin_flush_loop(self):
         while True:

@@ -46,6 +46,7 @@ async function pingUp(){
 }
 
 async function boot(){
+  connectLive();
   try{ await Promise.all([loadDash(),loadConf()]) }catch(e){}
 }
 setInterval(()=>{if($('#p-dash').classList.contains('on')&&$('#dash-auto').checked)loadDash().catch(()=>{})},15000);

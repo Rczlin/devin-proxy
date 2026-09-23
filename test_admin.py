@@ -209,6 +209,49 @@ d = r.json()
 assert "uptime_s" in d and "db" in d and "disk" in d
 print("status OK")
 
+# --- live ws feed ---
+# unauthenticated handshake is refused before accept
+try:
+    with c_fresh.websocket_connect("/admin/api/ws") as ws:
+        ws.receive_text()
+    assert False, "unauth ws connected"
+except Exception:
+    pass
+# a valid cookie sent from a foreign Origin is refused too (CSWSH guard)
+try:
+    with c.websocket_connect(
+            "/admin/api/ws",
+            headers={"cookie": f"dp_admin={cookie}",
+                     "origin": "https://evil.example"}) as ws:
+        ws.receive_text()
+    assert False, "foreign-origin ws connected"
+except Exception:
+    pass
+# same-origin session -> live frame with pool/in_flight
+with c.websocket_connect(
+        "/admin/api/ws",
+        headers={"cookie": f"dp_admin={cookie}",
+                 "origin": "http://testserver"}) as ws:
+    m = json.loads(ws.receive_text())
+    assert m["type"] == "live" and "pool" in m, m
+    assert "in_flight" in m["pool"] and "accounts" in m["pool"]
+    assert "data_v" in m and "uptime_s" in m
+    # a pool mutation pushes a fresh frame immediately (no polling)
+    pool = app.state.pool
+    if pool.accounts():
+        a = pool.accounts()[0]
+        a.in_flight += 1
+        pool._notify()
+        m2 = json.loads(ws.receive_text())
+        assert m2["pool"]["in_flight"] == m["pool"]["in_flight"] + 1, m2
+        a.in_flight -= 1
+# bearer master key authenticates the ws handshake as well
+with c.websocket_connect(
+        "/admin/api/ws",
+        headers={"authorization": "Bearer sk-test-master"}) as ws:
+    assert json.loads(ws.receive_text())["type"] == "live"
+print("live ws feed OK")
+
 # --- export bundle is a valid streaming zip ---
 r = c.get("/admin/api/export?limit=10", cookies={"dp_admin": cookie})
 assert r.status_code == 200

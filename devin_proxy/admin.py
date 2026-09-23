@@ -18,6 +18,7 @@ from .admin_ctx import AdminCtx
 from .admin_export import _DECODER, _ZipStreamer, git_head
 from .admin_routes import (accounts as acct_routes,
                            keys as key_routes,
+                           live as live_routes,
                            models as model_routes,
                            oauth as oauth_routes,
                            play as play_routes,
@@ -270,5 +271,6 @@ def make_router(app):
     acct_routes.register(router, ctx, admin_key)
     oauth_routes.register(router, ctx, admin_key)
     status_routes.register(router, ctx, admin_key)
+    live_routes.register(router, ctx, admin_key)
 
     return router

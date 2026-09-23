@@ -195,3 +195,68 @@ function renderDashErrs(d){
 window.addEventListener('resize',(()=>{let t;return()=>{clearTimeout(t);t=setTimeout(()=>{
   if($('#p-dash').classList.contains('on')&&DASH.data){renderReqChart(DASH.data);renderTokChart(DASH.data)}
 },180)}})());
+
+// ---------- live feed (WebSocket push; replaces poll for pool state) ----------
+let LIVE={ws:null,retry:0,authRetry:false,dv:null,refreshT:null};
+function connectLive(){
+  if(LIVE.ws&&(LIVE.ws.readyState===0||LIVE.ws.readyState===1))return;
+  const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')
+    +location.host+'/admin/api/ws');
+  LIVE.ws=ws;
+  ws.onopen=()=>{LIVE.retry=0;LIVE.authRetry=false;liveDot(true)};
+  ws.onmessage=ev=>{
+    let m;try{m=JSON.parse(ev.data)}catch(e){return}
+    if(m.type!=='live')return;
+    applyLive(m);
+    if(LIVE.dv!==null&&m.data_v!==LIVE.dv)scheduleRefresh();
+    LIVE.dv=m.data_v;
+  };
+  ws.onclose=ev=>{
+    liveDot(false);
+    // 4401 = the handshake cookie expired mid-session. The polling calls
+    // may have already slid-renewed the jar, so retry once before
+    // concluding we're really logged out.
+    if(ev.code===4401){
+      if(LIVE.authRetry){location.href='/admin';return}
+      LIVE.authRetry=true;setTimeout(connectLive,400);return;
+    }
+    LIVE.retry=Math.min(LIVE.retry+1,5);
+    setTimeout(connectLive,1500*LIVE.retry);
+  };
+}
+function liveDot(on){
+  const d=document.querySelector('.livedot');
+  if(d){d.classList.toggle('off',!on);d.title=on?'实时推送已连接':'实时推送已断开，重连中…'}
+}
+function scheduleRefresh(){
+  if(!$('#dash-auto').checked)return;
+  clearTimeout(LIVE.refreshT);
+  LIVE.refreshT=setTimeout(()=>loadDash().catch(()=>{}),1200);
+}
+function applyLive(m){
+  const p=m.pool||{};
+  if(DASH.data){
+    DASH.data.pool=p;DASH.data.uptime_s=m.uptime_s;
+    renderDashCards(DASH.data);renderPool(DASH.data);
+    $('#dash-time').textContent='实时 '+new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  }
+  $('#foot').textContent=`账号 ${p.ready||0}/${p.total||0} 就绪 · 在途 ${p.in_flight||0}`;
+  applyLiveAccs(p);
+}
+// accs page: patch 状态/在途 cells in place; if the pushed row count no
+// longer matches what's rendered an add/remove happened — the next full
+// loadAccounts() fixes it, so just skip.
+function applyLiveAccs(p){
+  if(!$('#p-accs').classList.contains('on'))return;
+  $('#accs-summary').textContent=`共 ${p.total||0} 个 · 就绪 ${p.ready||0} · 冷却 ${p.cooldown||0} · 钉扎会话 ${p.sessions||0}`;
+  const accs=p.accounts||[],rows=$('#acc-body').querySelectorAll('tr');
+  if(accs.length!==rows.length)return;
+  accs.forEach((a,i)=>{
+    const tds=rows[i].querySelectorAll('td');
+    if(tds.length<8)return;
+    tds[5].innerHTML=a.state==='disabled'?'<span class="tag off">禁用</span>'
+      :a.state==='cooldown'?`<span class="tag err">冷却 ${a.cooldown_s}s</span>`
+      :'<span class="tag ok">就绪</span>';
+    tds[7].textContent=`${a.in_flight}/${a.max_concurrent||'∞'}`;
+  });
+}
