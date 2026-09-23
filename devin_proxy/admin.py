@@ -485,7 +485,10 @@ def make_router(app):
     @router.delete("/api/models/entries/{uid}",
                    dependencies=[Depends(admin_key)])
     def model_hide(uid: str):
-        hid = models_mod.hidden_models() | {uid.strip()}
+        uid = uid.strip()
+        if not uid:
+            raise HTTPException(400, "empty model uid")
+        hid = models_mod.hidden_models() | {uid}
         store.meta_set("model_hide", json.dumps(sorted(hid)))
         return {"ok": True,
                 "hidden_models": sorted(models_mod.hidden_models())}
@@ -835,7 +838,8 @@ def make_router(app):
     def sessions():
         return {"sessions": app.state.pool.sessions()}
 
-    @router.delete("/api/sessions/{key}", dependencies=[Depends(admin_key)])
+    @router.delete("/api/sessions/{key:path}",
+                   dependencies=[Depends(admin_key)])
     def session_unpin(key: str):
         app.state.pool.unpin(key)
         return {"ok": True}
