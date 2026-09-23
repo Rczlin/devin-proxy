@@ -695,6 +695,22 @@ def make_router(app):
         app.state.pool.update(aid, **fields)
         return {"account": app.state.pool.get(aid).public()}
 
+    class BulkAccounts(BaseModel):
+        ids: list
+        disabled: Optional[bool] = None
+
+    @router.post("/api/accounts/bulk", dependencies=[Depends(admin_key)])
+    def bulk_accounts(body: BulkAccounts):
+        """Enable/disable a set of accounts in one call."""
+        if body.disabled is None:
+            raise HTTPException(400, "disabled required")
+        n = 0
+        for aid in body.ids:
+            if app.state.pool.get(aid):
+                app.state.pool.update(aid, disabled=int(body.disabled))
+                n += 1
+        return {"ok": True, "updated": n}
+
     @router.delete("/api/accounts/{aid}", dependencies=[Depends(admin_key)])
     def delete_account(aid: int):
         if not app.state.pool.get(aid):

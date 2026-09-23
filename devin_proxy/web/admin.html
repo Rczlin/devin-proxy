@@ -273,8 +273,15 @@ tr:hover td.ops{background:#1a2129}
         <p class="muted" style="margin-top:6px">「从本机导入」会扫描环境变量、token 文件、Devin CLI credentials.toml 与 Devin Desktop 状态库。</p>
       </div>
       <div class="panel" style="padding:0;overflow-x:auto">
+        <div class="row" style="padding:8px 10px;border-bottom:1px solid var(--border)">
+          <label class="muted"><input type="checkbox" id="acc-all" onclick="accSelectAll(this.checked)"> 全选</label>
+          <span class="muted" id="acc-sel"></span>
+          <span style="flex:1"></span>
+          <button onclick="accBulk(0)">批量启用</button>
+          <button onclick="accBulk(1)">批量禁用</button>
+        </div>
         <table><thead><tr>
-          <th>ID</th><th>账号</th><th>Plan</th><th>来源</th><th>状态</th><th>请求</th><th>在途/上限</th><th>模型限制</th><th>失败</th><th>最近使用</th><th>Token</th><th></th>
+          <th></th><th>ID</th><th>账号</th><th>Plan</th><th>来源</th><th>状态</th><th>请求</th><th>在途/上限</th><th>模型限制</th><th>失败</th><th>最近使用</th><th>Token</th><th></th>
         </tr></thead><tbody id="acc-body"></tbody></table>
       </div>
       <div class="panel">
@@ -792,7 +799,7 @@ async function loadAccounts(){
       :a.state==='cooldown'?`<span class="tag err">冷却 ${a.cooldown_s}s</span>`
       :'<span class="tag ok">就绪</span>';
     const u=a.usage||{};
-    return `<tr><td>${a.id}</td>
+    return `<tr><td><input type="checkbox" class="acc-cb" data-id="${a.id}" onclick="accSelChanged()"></td><td>${a.id}</td>
       <td><b>${esc(a.label)}</b>${a.email?`<br><span class="muted">${esc(a.email)}</span>`:''}${a.last_error?`<br><span class="muted" style="color:var(--red)" title="${esc(a.last_error)}">${esc(a.last_error.slice(0,60))}</span>`:''}</td>
       <td>${esc(a.plan||'-')}</td><td class="muted">${esc(a.source||'-')}</td>
       <td>${st}</td><td>${u.n||0}</td>
@@ -806,7 +813,7 @@ async function loadAccounts(){
         <button onclick="editAccLimits(${a.id})">限制</button>
         <button onclick="toggleAccount(${a.id},${a.disabled?0:1})">${a.disabled?'启用':'禁用'}</button>
         <button class="danger" onclick="delAccount(${a.id},'${esc(a.label)}')">删除</button>
-      </td></tr>`}).join('')||'<tr><td colspan=12 class=muted>暂无账号 — 用上方 OAuth 登录或手动添加</td></tr>';
+      </td></tr>`}).join('')||'<tr><td colspan=13 class=muted>暂无账号 — 用上方 OAuth 登录或手动添加</td></tr>';
   const s=await (await api('/admin/api/sessions')).json();
   $('#sess-body').innerHTML=(s.sessions||[]).map(x=>`<tr>
     <td class="muted">${esc(x.session_key)}</td><td>${esc(x.aname||x.email||('#'+x.account_id))}</td>
@@ -857,6 +864,19 @@ async function pingAll(){
   toast(d.ok?`✓ 全部 ${d.results.length} 个账号正常（最慢 ${d.latency_ms}ms）`
        :`✗ ${bad.length}/${d.results.length} 个异常: `+bad.map(r=>r.account).join(', '));
   loadAccounts();
+}
+function accSelectAll(on){document.querySelectorAll('.acc-cb').forEach(cb=>cb.checked=on);accSelChanged()}
+function accSelChanged(){
+  const sel=[...document.querySelectorAll('.acc-cb:checked')].map(cb=>+cb.dataset.id);
+  $('#acc-sel').textContent=sel.length?`已选 ${sel.length} 个`:'';
+}
+function accSelIds(){return [...document.querySelectorAll('.acc-cb:checked')].map(cb=>+cb.dataset.id)}
+async function accBulk(dis){
+  const ids=accSelIds();
+  if(!ids.length)return toast('先勾选账号');
+  const d=await (await api('/admin/api/accounts/bulk',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ids,disabled:!!dis})})).json();
+  toast(`已${dis?'禁用':'启用'} ${d.updated} 个`);$('#acc-all').checked=false;loadAccounts();
 }
 async function testAccount(id){
   toast('检测中…');
