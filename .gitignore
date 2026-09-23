@@ -3,6 +3,9 @@ __pycache__/
 *.log
 *.err
 *.db
+*.db-shm
+*.db-wal
+.devin-proxy-reserve
 .venv/
 .env
 devin-token.txt

@@ -17,10 +17,12 @@ if os.name == "nt" and "DEVIN_PROXY_DB" not in os.environ:
                             "devin-proxy", "devin-proxy.db")
 
 _MAX_ROWS = int(os.environ.get("DEVIN_PROXY_MAX_ROWS", "50000"))
-# Full-fidelity captures (untruncated wire data) are kept for ALL failed
-# requests but only the newest _CAP_KEEP successful ones — a successful
-# stream can be megabytes and the db should stay portable.
+# Full-fidelity captures (untruncated wire data) are pruned to the newest
+# _CAP_KEEP successful and _CAP_FAIL_KEEP failed ones — a single stream can
+# be megabytes and the db should stay portable.
 _CAP_KEEP = int(os.environ.get("DEVIN_PROXY_CAP_KEEP", "300"))
+_CAP_FAIL_KEEP = int(os.environ.get("DEVIN_PROXY_CAP_FAIL_KEEP", "500"))
+_CAP_PRUNE_EVERY = 20      # prune capture retention once per N saves
 
 # ---------- disk-space resilience ----------
 # The proxy must keep serving requests even when the volume backing the db
@@ -38,33 +40,52 @@ _EMERGENCY_ROWS = max(200, min(2000, _MAX_ROWS // 10))
 _MAINT_INTERVAL_S = 45
 _AUTO_CLEANUP_COOLDOWN_S = 20
 
-_lock = threading.Lock()
+_lock = threading.Lock()    # serializes the writer connection
+_rlock = threading.Lock()   # serializes the shared reader connection
+_rinit = threading.Lock()
+_cinit = threading.Lock()   # first-time _conn() init (migrations)
 _con = None
+_rcon = None
+_db_mem = False             # True when storage fell back to :memory:
 _insert_count = 0
+_cap_saves = 0
+_data_version = 0           # bumped on every request-log mutation
+_stats_cache = {}           # hours -> (data_version, overview dict)
+_meta_cache = {}            # meta k -> v (invalidated by meta_set)
 _last_auto_cleanup = 0.0
 _maint_started = False
+_mig_started = False
 
 
 def _conn():
-    global _con
+    global _con, _db_mem
     if _con is None:
-        try:
-            os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-            _con = sqlite3.connect(_DB_PATH, check_same_thread=False)
-        except (OSError, sqlite3.Error) as e:
-            # Disk full (or otherwise unwritable) even before we hold a
-            # connection — fall back to an in-memory db so the proxy can
-            # still start and serve traffic; persistence resumes once the
-            # file becomes writable again and the process is restarted.
-            print(f"devin-proxy: cannot open {_DB_PATH} ({e}); "
-                  "falling back to an in-memory db", flush=True)
-            _con = sqlite3.connect(":memory:", check_same_thread=False)
-        _con.row_factory = sqlite3.Row
-        _con.execute("PRAGMA journal_mode=WAL")
-        _con.execute("PRAGMA busy_timeout=5000")
-        _con.execute("PRAGMA synchronous=NORMAL")
-        _con.execute("PRAGMA temp_store=MEMORY")
-        _con.executescript("""
+        with _cinit:
+            if _con is None:
+                _conn_init()
+    return _con
+
+
+def _conn_init():
+    global _con, _db_mem
+    try:
+        os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+        _con = sqlite3.connect(_DB_PATH, check_same_thread=False)
+    except (OSError, sqlite3.Error) as e:
+        # Disk full (or otherwise unwritable) even before we hold a
+        # connection — fall back to an in-memory db so the proxy can
+        # still start and serve traffic; persistence resumes once the
+        # file becomes writable again and the process is restarted.
+        print(f"devin-proxy: cannot open {_DB_PATH} ({e}); "
+              "falling back to an in-memory db", flush=True)
+        _con = sqlite3.connect(":memory:", check_same_thread=False)
+        _db_mem = True
+    _con.row_factory = sqlite3.Row
+    _con.execute("PRAGMA journal_mode=WAL")
+    _con.execute("PRAGMA busy_timeout=5000")
+    _con.execute("PRAGMA synchronous=NORMAL")
+    _con.execute("PRAGMA temp_store=MEMORY")
+    _con.executescript("""
         CREATE TABLE IF NOT EXISTS requests (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts REAL NOT NULL,
@@ -149,33 +170,104 @@ def _conn():
           v TEXT
         );
         """)
-        _migrate_keys()
-        _migrate_requests()
-        _add_columns("requests", {
-            "request_json": "TEXT",
-            "events_json": "TEXT",
-            "sse_json": "TEXT",
-            "flags": "TEXT",
-            "cached_tokens": "INTEGER DEFAULT 0",
-            "cache_creation_tokens": "INTEGER DEFAULT 0",
-            "gen_ms": "INTEGER",
-            "tps": "REAL",
-            "upstream_model": "TEXT",
-            "upstream_msg_id": "TEXT",
-            "upstream_req_id": "TEXT",
-        })
-        _add_columns("api_keys", {
-            "models": "TEXT",
-            "max_concurrent": "INTEGER DEFAULT 0",
-        })
-        _add_columns("accounts", {
-            "max_concurrent": "INTEGER DEFAULT 0",
-            "models": "TEXT",
-        })
-        _con.commit()
-        _ensure_reserve()
-        _start_maintenance_thread()
-    return _con
+    _migrate_keys()
+    _migrate_requests()
+    _add_columns("requests", {
+        "request_json": "TEXT",
+        "events_json": "TEXT",
+        "sse_json": "TEXT",
+        "flags": "TEXT",
+        "cached_tokens": "INTEGER DEFAULT 0",
+        "cache_creation_tokens": "INTEGER DEFAULT 0",
+        "gen_ms": "INTEGER",
+        "tps": "REAL",
+        "upstream_model": "TEXT",
+        "upstream_msg_id": "TEXT",
+        "upstream_req_id": "TEXT",
+        # Big debug payloads live gzipped in these LAST columns. SQLite
+        # spills record tails to overflow pages, so with the blobs at the
+        # end every small column stays on the leaf page and table scans
+        # (stats/log lists) never walk per-row overflow chains — the old
+        # inline *_json columns made each row ~150 chained pages.
+        "messages_gz": "BLOB",
+        "request_gz": "BLOB",
+        "events_gz": "BLOB",
+        "sse_gz": "BLOB",
+    })
+    _add_columns("api_keys", {
+        "models": "TEXT",
+        "max_concurrent": "INTEGER DEFAULT 0",
+    })
+    _add_columns("accounts", {
+        "max_concurrent": "INTEGER DEFAULT 0",
+        "models": "TEXT",
+    })
+    _con.commit()
+    _ensure_reserve()
+    _start_maintenance_thread()
+    _start_blob_migration()
+
+
+def _reader():
+    """Shared read-only connection for admin/reporting queries. In WAL mode
+    readers never block the writer, so a heavy dashboard scan can't stall
+    request auth/logging on _con. Falls back to _con when storage degraded
+    to :memory: (callers must then hold _lock, not _rlock)."""
+    global _rcon
+    if _rcon is None:
+        with _rinit:
+            if _rcon is None:
+                _conn()
+                if _db_mem or _DB_PATH == ":memory:":
+                    return _con
+                try:
+                    c = sqlite3.connect(_DB_PATH, check_same_thread=False)
+                    c.row_factory = sqlite3.Row
+                    c.execute("PRAGMA busy_timeout=5000")
+                    c.execute("PRAGMA query_only=ON")
+                    _rcon = c
+                except (OSError, sqlite3.Error):
+                    return _con
+    return _rcon
+
+
+def _q(sql, args=()):
+    """fetchall on the reader connection (its own lock; shares _con + _lock
+    in the degraded :memory: case)."""
+    con = _reader()
+    with (_lock if con is _con else _rlock):
+        return con.execute(sql, args).fetchall()
+
+
+def _q1(sql, args=()):
+    rows = _q(sql, args)
+    return rows[0] if rows else None
+
+
+def _gz(s):
+    """str -> gzip blob for the tail columns; None passes through."""
+    if s is None:
+        return None
+    if isinstance(s, str):
+        s = s.encode("utf-8")
+    return gzip.compress(s, compresslevel=6)
+
+
+_BLOB_COLS = (("messages_json", "messages_gz"), ("request_json", "request_gz"),
+              ("events_json", "events_gz"), ("sse_json", "sse_gz"))
+
+
+def _inflate(d):
+    """Row dict -> decode the gzipped tail columns back into their *_json
+    fields (legacy uncompressed values pass through untouched)."""
+    for tcol, gcol in _BLOB_COLS:
+        b = d.pop(gcol, None)
+        if b is not None:
+            try:
+                d[tcol] = gzip.decompress(b).decode("utf-8")
+            except Exception:
+                pass
+    return d
 
 
 def _add_columns(table, cols):
@@ -328,17 +420,27 @@ def free_space(aggressive=True, vacuum=True):
                 "DELETE FROM requests WHERE id < "
                 "(SELECT MIN(id) FROM (SELECT id FROM requests"
                 " ORDER BY id DESC LIMIT ?))", (keep,))
-            con.execute("DELETE FROM captures WHERE request_id NOT IN "
-                       "(SELECT id FROM requests)")
+            con.execute(
+                "DELETE FROM captures WHERE request_id < "
+                "(SELECT MIN(id) FROM (SELECT id FROM requests"
+                " ORDER BY id DESC LIMIT ?))", (keep,))
             if aggressive:
                 con.execute(
-                    "DELETE FROM captures WHERE ok=1 AND request_id NOT IN "
-                    "(SELECT request_id FROM captures WHERE ok=1"
-                    " ORDER BY request_id DESC LIMIT 20)")
+                    "DELETE FROM captures WHERE ok=1 AND request_id < "
+                    "(SELECT MIN(request_id) FROM (SELECT request_id"
+                    " FROM captures WHERE ok=1 ORDER BY request_id DESC"
+                    " LIMIT 20))")
+                con.execute(
+                    "DELETE FROM captures WHERE ok=0 AND request_id < "
+                    "(SELECT MIN(request_id) FROM (SELECT request_id"
+                    " FROM captures WHERE ok=0 ORDER BY request_id DESC"
+                    " LIMIT ?))", (_CAP_FAIL_KEEP,))
             cutoff = time.time() - (3600 if aggressive else 86400)
             con.execute("DELETE FROM responses WHERE created<?", (cutoff,))
             con.execute("DELETE FROM sessions WHERE updated<?", (cutoff,))
             con.commit()
+            global _data_version
+            _data_version += 1
             try:
                 con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except sqlite3.Error:
@@ -372,9 +474,71 @@ def _start_maintenance_thread():
                     free_space(aggressive=True, vacuum=False)
                 elif not st["reserve_active"]:
                     _ensure_reserve()
+                # keep the WAL bounded so reads never merge a huge -wal
+                with _lock:
+                    if _con is not None and not _db_mem:
+                        _con.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception:
                 pass
     threading.Thread(target=loop, daemon=True, name="devin-proxy-maint").start()
+
+
+def _start_blob_migration():
+    """One-time background pass: move the legacy inline *_json blob columns
+    into the gzipped tail columns, freeing their overflow chains. Chunked +
+    yielding so it never hogs the reader or writer lock; once done the file
+    is VACUUMed when there's room (the freed pages would otherwise sit on
+    the freelist and the ~1GB file would never shrink)."""
+    global _mig_started
+    if _mig_started or _db_mem or _DB_PATH == ":memory:":
+        return
+    _mig_started = True
+
+    def run():
+        migrated = 0
+        try:
+            while True:
+                ids = [r["id"] for r in _q(
+                    "SELECT id FROM requests WHERE messages_json IS NOT NULL"
+                    " OR request_json IS NOT NULL OR events_json IS NOT NULL"
+                    " OR sse_json IS NOT NULL ORDER BY id LIMIT 40")]
+                if not ids:
+                    break
+                migrated += len(ids)
+                for rid in ids:
+                    row = _q1(
+                        "SELECT messages_json,request_json,events_json,"
+                        "sse_json FROM requests WHERE id=?", (rid,))
+                    if row is None:
+                        continue
+                    vals = [_gz(row["messages_json"]), _gz(row["request_json"]),
+                            _gz(row["events_json"]), _gz(row["sse_json"])]
+                    with _lock:
+                        _con.execute(
+                            "UPDATE requests SET messages_gz=?,request_gz=?,"
+                            "events_gz=?,sse_gz=?,messages_json=NULL,"
+                            "request_json=NULL,events_json=NULL,sse_json=NULL"
+                            " WHERE id=?", (*vals, rid))
+                        _con.commit()
+                    time.sleep(0.01)
+            with _lock:
+                _con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            return
+        if not migrated:
+            return
+        # VACUUM rebuilds into a temp copy — only when the disk clearly has
+        # room for it; otherwise the freelist is just reused going forward.
+        try:
+            free = shutil.disk_usage(
+                os.path.dirname(_DB_PATH) or ".").free
+            if free > max(512 * 1024 * 1024, _safe_db_size() * 2):
+                with _lock:
+                    _con.execute("VACUUM")
+        except (OSError, sqlite3.Error):
+            pass
+
+    threading.Thread(target=run, daemon=True, name="devin-proxy-blobmig").start()
 
 
 @_resilient(default=None)
@@ -387,43 +551,50 @@ def log_request(model, resolved_model, stream, ok, status, error,
                 upstream_req_id=None):
     """-> new row id, or None if the write couldn't be persisted (e.g. the
     disk is full) — the request itself must still succeed either way."""
-    global _insert_count
+    global _insert_count, _data_version
+    # compress off-lock: ~400KB of debug JSON -> ~40KB, and the CPU work
+    # doesn't hold the writer up.
+    blobs = [_gz(messages_json), _gz(request_json),
+             _gz(events_json), _gz(sse_json)]
     with _lock:
         cur = _conn().execute(
             "INSERT INTO requests (ts,model,resolved_model,stream,ok,status,error,"
             "prompt_tokens,completion_tokens,latency_ms,ttft_ms,client,key_name,"
-            "account,endpoint,messages_json,request_json,events_json,sse_json,"
-            "flags,cached_tokens,cache_creation_tokens,gen_ms,tps,"
-            "upstream_model,upstream_msg_id,upstream_req_id)"
+            "account,endpoint,flags,cached_tokens,cache_creation_tokens,gen_ms,tps,"
+            "upstream_model,upstream_msg_id,upstream_req_id,"
+            "messages_gz,request_gz,events_gz,sse_gz)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (time.time(), model, resolved_model, int(stream), int(ok), status, error,
              prompt_tokens, completion_tokens, latency_ms, ttft_ms, client, key_name,
-             account, endpoint, messages_json, request_json, events_json, sse_json,
-             flags, cached_tokens, cache_creation_tokens, gen_ms, tps,
-             upstream_model, upstream_msg_id, upstream_req_id))
+             account, endpoint, flags, cached_tokens, cache_creation_tokens,
+             gen_ms, tps, upstream_model, upstream_msg_id, upstream_req_id,
+             *blobs))
         _insert_count += 1
         if _insert_count % 100 == 0:
-            _conn().execute(
-                "DELETE FROM requests WHERE id < "
-                "(SELECT MIN(id) FROM (SELECT id FROM requests ORDER BY id DESC LIMIT ?))",
-                (_MAX_ROWS,))
-            _conn().execute(
-                "DELETE FROM captures WHERE request_id NOT IN "
-                "(SELECT id FROM requests)")
+            keep = _conn().execute(
+                "SELECT MIN(id) m FROM (SELECT id FROM requests"
+                " ORDER BY id DESC LIMIT ?)", (_MAX_ROWS,)).fetchone()["m"]
+            if keep is not None:
+                _conn().execute("DELETE FROM requests WHERE id<?", (keep,))
+                _conn().execute(
+                    "DELETE FROM captures WHERE request_id<?", (keep,))
         _conn().commit()
+        _data_version += 1
         return cur.lastrowid
 
 
 @_resilient(default=None)
 def save_capture(request_id, ok, payload):
     """Store a full-fidelity capture (dict -> gzip blob) for one request row.
-    Failure captures are kept forever; success captures are pruned to the
-    newest _CAP_KEEP. Never raises — capture must not break the request."""
+    Success captures prune to the newest _CAP_KEEP, failures to the newest
+    _CAP_FAIL_KEEP. Never raises — capture must not break the request."""
+    global _cap_saves
     if request_id is None:
         return
     try:
         blob = gzip.compress(json.dumps(payload, ensure_ascii=False,
-                                        default=str).encode())
+                                        default=str).encode(),
+                             compresslevel=6)
     except Exception:
         return
     with _lock:
@@ -431,18 +602,26 @@ def save_capture(request_id, ok, payload):
             "INSERT OR REPLACE INTO captures (request_id,ts,ok,data)"
             " VALUES (?,?,?,?)",
             (request_id, time.time(), int(ok), blob))
-        _conn().execute(
-            "DELETE FROM captures WHERE ok=1 AND request_id NOT IN "
-            "(SELECT request_id FROM captures WHERE ok=1"
-            " ORDER BY request_id DESC LIMIT ?)", (_CAP_KEEP,))
+        _cap_saves += 1
+        if _cap_saves % _CAP_PRUNE_EVERY == 0:
+            # range deletes on the request_id PK — cheap, unlike the old
+            # per-save NOT IN scans over the whole (multi-MB) captures table
+            _conn().execute(
+                "DELETE FROM captures WHERE ok=1 AND request_id < "
+                "(SELECT MIN(request_id) FROM (SELECT request_id"
+                " FROM captures WHERE ok=1 ORDER BY request_id DESC"
+                " LIMIT ?))", (_CAP_KEEP,))
+            _conn().execute(
+                "DELETE FROM captures WHERE ok=0 AND request_id < "
+                "(SELECT MIN(request_id) FROM (SELECT request_id"
+                " FROM captures WHERE ok=0 ORDER BY request_id DESC"
+                " LIMIT ?))", (_CAP_FAIL_KEEP,))
         _conn().commit()
 
 
 @_resilient(default=None)
 def get_capture(request_id):
-    with _lock:
-        r = _conn().execute("SELECT data FROM captures WHERE request_id=?",
-                            (request_id,)).fetchone()
+    r = _q1("SELECT data FROM captures WHERE request_id=?", (request_id,))
     if not r:
         return None
     try:
@@ -454,10 +633,7 @@ def get_capture(request_id):
 @_resilient(default=list)
 def export_captures():
     """[{request_id, ok, data(gzip blob)}] for the diagnostic bundle."""
-    with _lock:
-        rows = _conn().execute(
-            "SELECT request_id,ok,data FROM captures"
-            " ORDER BY request_id").fetchall()
+    rows = _q("SELECT request_id,ok,data FROM captures ORDER BY request_id")
     return [dict(r) for r in rows]
 
 
@@ -499,34 +675,30 @@ def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None,
         # unlike OFFSET which rescans and drifts when new rows land mid-page
         where += " AND id<?"
         args.append(before_id)
-    with _lock:
-        if before_id:
-            rows = _conn().execute(
-                f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
-                " ORDER BY id DESC LIMIT ?", args + [limit]).fetchall()
-        else:
-            rows = _conn().execute(
-                f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
-                " ORDER BY id DESC LIMIT ? OFFSET ?",
-                args + [limit, offset]).fetchall()
-        total = _conn().execute(
-            f"SELECT COUNT(*) c FROM requests{where}", args).fetchone()["c"]
+        rows = _q(f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
+                  " ORDER BY id DESC LIMIT ?", args + [limit])
+    else:
+        rows = _q(f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
+                  " ORDER BY id DESC LIMIT ? OFFSET ?",
+                  args + [limit, offset])
+    total = _q1(f"SELECT COUNT(*) c FROM requests{where}", args)["c"]
     return [dict(r) for r in rows], total
 
 
 @_resilient(default=None)
 def get_request(rid):
-    with _lock:
-        r = _conn().execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone()
-    return dict(r) if r else None
+    r = _q1("SELECT * FROM requests WHERE id=?", (rid,))
+    return _inflate(dict(r)) if r else None
 
 
 @_resilient(default=None)
 def clear_requests():
+    global _data_version
     with _lock:
         _conn().execute("DELETE FROM requests")
         _conn().execute("DELETE FROM captures")
         _conn().commit()
+        _data_version += 1
 
 
 @_resilient(default=0)
@@ -535,6 +707,7 @@ def prune_requests(model=None, ok=None, q=None, account=None, flag=None,
     """Delete logged requests matching the same filters as list_requests,
     plus an optional age cutoff. Returns the number of rows removed;
     captures are deleted for exactly those rows."""
+    global _data_version
     where, args = _where(model, ok, q, account, flag)
     if before_ts:
         where += " AND ts<?"
@@ -552,14 +725,25 @@ def prune_requests(model=None, ok=None, q=None, account=None, flag=None,
             _conn().execute(
                 f"DELETE FROM requests WHERE id IN ({ph})", chunk)
         _conn().commit()
+        _data_version += 1
     return len(ids)
 
 
 def stats_overview(hours=24):
     """Windowed stats for the dashboard — never raises. Falls back to an
-    all-zero snapshot if the db can't be read (e.g. mid disk-full)."""
+    all-zero snapshot if the db can't be read (e.g. mid disk-full).
+    Results are cached per window against _data_version, so the UI's
+    polling is free between writes."""
     try:
-        return _stats_overview_impl(hours)
+        ent = _stats_cache.get(hours or 0)
+        if ent and ent[0] == _data_version:
+            return dict(ent[1])
+        ver = _data_version            # read BEFORE computing: a mid-scan
+        d = _stats_overview_impl(hours)  # write just expires this entry
+        if len(_stats_cache) > 64:     # hours is caller-chosen — keep bounded
+            _stats_cache.clear()
+        _stats_cache[hours or 0] = (ver, d)
+        return dict(d)
     except sqlite3.Error as e:
         if _is_space_error(e):
             _maybe_auto_cleanup()
@@ -582,13 +766,23 @@ def _empty_overview(hours):
     }
 
 
+# every column the overview needs — all sit ahead of the *_gz tail blobs,
+# so this single scan reads only leaf pages even on a fat old table
+_STATS_COLS = ("id,ts,model,resolved_model,stream,ok,status,error,"
+               "prompt_tokens,completion_tokens,latency_ms,ttft_ms,"
+               "key_name,account,endpoint,flags,cached_tokens,"
+               "cache_creation_tokens,tps")
+
+
 def _stats_overview_impl(hours=24):
     """Windowed stats for the dashboard. hours<=0/None = all time.
 
-    The time series is bucketed adaptively (5m/30m/1h/4h/1d) and returned
-    gap-free — every bucket in [since, now] is present, zeros included."""
-    with _lock:
-        c = _conn()
+    One scan of the window's rows, then all rollups (totals, adaptive
+    5m/30m/1h/4h/1d gap-free series, per-model/account/key/endpoint
+    breakdowns, p50/p95, recent errors) are computed in Python — that
+    replaced ~14 separate SQL passes which each re-walked the table."""
+    con = _reader()
+    with (_lock if con is _con else _rlock):
         now = time.time()
         today = now - (now + _tz_offset()) % 86400
         if hours:
@@ -604,7 +798,8 @@ def _stats_overview_impl(hours=24):
             else:
                 bucket = 86400
         else:
-            lo = c.execute("SELECT MIN(ts) t FROM requests").fetchone()["t"]
+            lo = con.execute(
+                "SELECT MIN(ts) t FROM requests").fetchone()["t"]
             since = lo or (now - 86400)
             days = max(1, int((now - since) / 86400) + 1)
             bucket = 86400 * max(1, -(-days // 60))
@@ -612,121 +807,177 @@ def _stats_overview_impl(hours=24):
         # sub-day buckets on whole UTC multiples (hour marks in CST too)
         tz = _tz_offset() if bucket >= 86400 else 0
         base = int(since + tz) - int(since + tz) % bucket - tz
-        where, wargs = " WHERE ts>=?", [since]
 
-        tot = c.execute(f"""
-          SELECT COUNT(*) n, SUM(ok) ok_n, SUM(stream) st,
-                 SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
-                 SUM(cached_tokens) cached_tok,
-                 SUM(cache_creation_tokens) cache_wr,
-                 AVG(latency_ms) avg_lat, AVG(ttft_ms) avg_ttft,
-                 AVG(tps) avg_tps
-          FROM requests{where}""", wargs).fetchone()
-
-        def _pct(p):
-            n = tot["ok_n"] or 0
-            if not n:
-                return 0
-            r = c.execute(
-                f"SELECT latency_ms FROM requests{where} AND ok=1"
-                " ORDER BY latency_ms LIMIT 1 OFFSET ?",
-                wargs + [min(n - 1, int(n * p))]).fetchone()
-            return r[0] if r else 0
-
-        rows = c.execute(f"""
-          SELECT CAST((ts - ?)/{bucket} AS INT) b, COUNT(*) n,
-                 SUM(1-ok) errs, SUM(prompt_tokens) in_tok,
-                 SUM(completion_tokens) out_tok, AVG(latency_ms) avg_lat
-          FROM requests{where} GROUP BY b""", [base] + wargs).fetchall()
-        byb = {r["b"]: r for r in rows}
-        nb = max(0, int((now - base) // bucket))
-        series = [{"t": base + b * bucket,
-                   "n": r["n"] if (r := byb.get(b)) else 0,
-                   "errs": (r["errs"] or 0) if r else 0,
-                   "in_tok": (r["in_tok"] or 0) if r else 0,
-                   "out_tok": (r["out_tok"] or 0) if r else 0,
-                   "avg_lat": round(r["avg_lat"] or 0) if r else 0}
-                  for b in range(nb + 1)]
-
-        by_model = c.execute(f"""
-          SELECT COALESCE(resolved_model,model) m, COUNT(*) n,
-                 SUM(1-ok) errs, SUM(prompt_tokens) in_tok,
-                 SUM(completion_tokens) out_tok, AVG(latency_ms) avg_lat,
-                 SUM(cached_tokens) cached, AVG(tps) avg_tps,
-                 AVG(ttft_ms) avg_ttft, MAX(ts) last_used
-          FROM requests{where} GROUP BY m ORDER BY n DESC LIMIT 24""",
-            wargs).fetchall()
-        by_account = c.execute(f"""
-          SELECT account a, COUNT(*) n, SUM(1-ok) errs,
-                 SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
-                 AVG(latency_ms) avg_lat, MAX(ts) last_used
-          FROM requests{where} AND account IS NOT NULL
-          GROUP BY a ORDER BY n DESC""", wargs).fetchall()
-        by_key = c.execute(f"""
-          SELECT key_name k, COUNT(*) n, SUM(1-ok) errs,
-                 SUM(prompt_tokens+completion_tokens) tok, MAX(ts) last_used
-          FROM requests{where} GROUP BY key_name ORDER BY n DESC""",
-            wargs).fetchall()
-        by_endpoint = c.execute(f"""
-          SELECT COALESCE(endpoint,'chat') ep, COUNT(*) n, SUM(1-ok) errs
-          FROM requests{where} GROUP BY ep ORDER BY n DESC""",
-            wargs).fetchall()
-        recent_errors = c.execute(f"""
-          SELECT id,ts,model,resolved_model,status,error,account,key_name,
-                 latency_ms,flags
-          FROM requests{where} AND ok=0 ORDER BY id DESC LIMIT 12""",
-            wargs).fetchall()
-        rpm = c.execute("SELECT COUNT(*) c FROM requests WHERE ts>=?",
-                        (now - 60,)).fetchone()["c"]
-        tok5 = c.execute(
-            "SELECT SUM(prompt_tokens+completion_tokens) t FROM requests"
-            " WHERE ts>=?", (now - 300,)).fetchone()["t"] or 0
-        truncated = c.execute(
-            f"SELECT COUNT(*) c FROM requests{where}"
-            " AND flags LIKE '%truncated%'", wargs).fetchone()["c"]
-        retried = c.execute(
-            f"SELECT COUNT(*) c FROM requests{where}"
-            " AND flags LIKE '%retried%'", wargs).fetchone()["c"]
-        all_total = c.execute("SELECT COUNT(*) c FROM requests").fetchone()["c"]
-        today_row = c.execute("""
-          SELECT COUNT(*) total, SUM(prompt_tokens) in_tok,
-                 SUM(completion_tokens) out_tok
-          FROM requests WHERE ts>=?""", (today,)).fetchone()
+        rows = con.execute(
+            f"SELECT {_STATS_COLS} FROM requests WHERE ts>=?",
+            (since,)).fetchall()
+        all_total = con.execute(
+            "SELECT COUNT(*) c FROM requests").fetchone()["c"]
+        today_row = None
+        if since > today:    # window doesn't reach midnight — query it
+            today_row = con.execute(
+                "SELECT COUNT(*) n, SUM(prompt_tokens) i,"
+                " SUM(completion_tokens) o FROM requests WHERE ts>=?",
+                (today,)).fetchone()
         db_size = _safe_db_size()
+
+    def v(r, c):
+        x = r[c]
+        return x if x is not None else 0
+
+    n = len(rows)
+    ok_rows = [r for r in rows if r["ok"]]
+    ok_n = len(ok_rows)
+    lats = sorted(r["latency_ms"] for r in ok_rows
+                  if r["latency_ms"] is not None)
+    nl = len(lats)
+
+    def pct(p):
+        return lats[min(nl - 1, int(nl * p))] if nl else 0
+
+    def avg(col):
+        s = c = 0
+        for r in rows:
+            x = r[col]
+            if x is not None:
+                s += x
+                c += 1
+        return s / c if c else 0
+
+    # bucketed series
+    byb = {}
+    for r in rows:
+        e = byb.setdefault(int((r["ts"] - base) / bucket),
+                           [0, 0, 0, 0, 0.0, 0])
+        e[0] += 1
+        e[1] += 1 - (r["ok"] or 0)
+        e[2] += v(r, "prompt_tokens")
+        e[3] += v(r, "completion_tokens")
+        if r["latency_ms"] is not None:
+            e[4] += r["latency_ms"]
+            e[5] += 1
+    nb = max(0, int((now - base) // bucket))
+    series = [{"t": base + b * bucket,
+               "n": e[0] if e else 0,
+               "errs": e[1] if e else 0,
+               "in_tok": e[2] if e else 0,
+               "out_tok": e[3] if e else 0,
+               "avg_lat": round(e[4] / e[5]) if e and e[5] else 0}
+              for b in range(nb + 1) for e in [byb.get(b)]]
+
+    # group rollups — one dict per key, all measures accumulated together
+    def _group(keyfn, skip_none=False):
+        out = {}
+        for r in rows:
+            k = keyfn(r)
+            if k is None and skip_none:
+                continue
+            e = out.get(k)
+            if e is None:
+                e = out[k] = {"n": 0, "errs": 0, "in_tok": 0, "out_tok": 0,
+                              "lat_s": 0.0, "lat_n": 0, "cached": 0,
+                              "tps_s": 0.0, "tps_n": 0,
+                              "ttft_s": 0.0, "ttft_n": 0, "last": 0}
+            e["n"] += 1
+            e["errs"] += 1 - (r["ok"] or 0)
+            e["in_tok"] += v(r, "prompt_tokens")
+            e["out_tok"] += v(r, "completion_tokens")
+            e["cached"] += v(r, "cached_tokens")
+            if r["latency_ms"] is not None:
+                e["lat_s"] += r["latency_ms"]
+                e["lat_n"] += 1
+            if r["tps"] is not None:
+                e["tps_s"] += r["tps"]
+                e["tps_n"] += 1
+            if r["ttft_ms"] is not None:
+                e["ttft_s"] += r["ttft_ms"]
+                e["ttft_n"] += 1
+            if r["ts"] and r["ts"] > e["last"]:
+                e["last"] = r["ts"]
+        return out
+
+    def _avg(e, s, n):
+        return e[s] / e[n] if e[n] else 0
+
+    gm = _group(lambda r: r["resolved_model"] or r["model"])
+    by_model = [{"m": k, "n": e["n"], "errs": e["errs"],
+                 "in_tok": e["in_tok"], "out_tok": e["out_tok"],
+                 "avg_lat": _avg(e, "lat_s", "lat_n"),
+                 "cached": e["cached"],
+                 "avg_tps": _avg(e, "tps_s", "tps_n"),
+                 "avg_ttft": _avg(e, "ttft_s", "ttft_n"),
+                 "last_used": e["last"]}
+                for k, e in sorted(gm.items(), key=lambda kv: -kv[1]["n"])
+                [:24]]
+    ga = _group(lambda r: r["account"], skip_none=True)
+    by_account = [{"a": k, "n": e["n"], "errs": e["errs"],
+                   "in_tok": e["in_tok"], "out_tok": e["out_tok"],
+                   "avg_lat": _avg(e, "lat_s", "lat_n"),
+                   "last_used": e["last"]}
+                  for k, e in sorted(ga.items(), key=lambda kv: -kv[1]["n"])]
+    gk = _group(lambda r: r["key_name"])
+    by_key = [{"k": k, "n": e["n"], "errs": e["errs"],
+               "tok": e["in_tok"] + e["out_tok"], "last_used": e["last"]}
+              for k, e in sorted(gk.items(), key=lambda kv: -kv[1]["n"])]
+    ge = _group(lambda r: r["endpoint"] or "chat")
+    by_endpoint = [{"ep": k, "n": e["n"], "errs": e["errs"]}
+                   for k, e in sorted(ge.items(), key=lambda kv: -kv[1]["n"])]
+
+    recent_errors = [
+        {c: r[c] for c in
+         ("id", "ts", "model", "resolved_model", "status", "error",
+          "account", "key_name", "latency_ms", "flags")}
+        for r in sorted((r for r in rows if not r["ok"]),
+                        key=lambda r: r["id"], reverse=True)[:12]]
+
+    rpm = sum(1 for r in rows if r["ts"] >= now - 60)
+    tok5 = sum(v(r, "prompt_tokens") + v(r, "completion_tokens")
+               for r in rows if r["ts"] >= now - 300)
+    truncated = sum(1 for r in rows if "truncated" in (r["flags"] or ""))
+    retried = sum(1 for r in rows if "retried" in (r["flags"] or ""))
+    if today_row is None:    # window covers today — reuse the same rows
+        tw = [r for r in rows if r["ts"] >= today]
+        today_row = {"n": len(tw),
+                     "i": sum(v(r, "prompt_tokens") for r in tw),
+                     "o": sum(v(r, "completion_tokens") for r in tw)}
+
+    in_tok = sum(v(r, "prompt_tokens") for r in rows)
+    out_tok = sum(v(r, "completion_tokens") for r in rows)
+    cached_tok = sum(v(r, "cached_tokens") for r in rows)
+    cache_wr = sum(v(r, "cache_creation_tokens") for r in rows)
     return {
         "hours": hours or 0,
         "bucket_s": bucket,
         "since": since,
         "now": now,
-        "total": tot["n"] or 0,
-        "errors": (tot["n"] or 0) - (tot["ok_n"] or 0),
-        "streams": tot["st"] or 0,
-        "input_tokens": tot["in_tok"] or 0,
-        "output_tokens": tot["out_tok"] or 0,
-        "cached_tokens": tot["cached_tok"] or 0,
-        "cache_creation_tokens": tot["cache_wr"] or 0,
-        "cache_hit_pct": round(100 * (tot["cached_tok"] or 0)
-                               / max(1, (tot["cached_tok"] or 0)
-                                     + (tot["in_tok"] or 0)), 1),
-        "avg_tps": round(tot["avg_tps"] or 0, 1),
-        "avg_latency_ms": round(tot["avg_lat"] or 0),
-        "avg_ttft_ms": round(tot["avg_ttft"] or 0),
-        "p50_ms": _pct(0.5),
-        "p95_ms": _pct(0.95),
+        "total": n,
+        "errors": n - ok_n,
+        "streams": sum(v(r, "stream") for r in rows),
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+        "cached_tokens": cached_tok,
+        "cache_creation_tokens": cache_wr,
+        "cache_hit_pct": round(100 * cached_tok
+                               / max(1, cached_tok + in_tok), 1),
+        "avg_tps": round(avg("tps"), 1),
+        "avg_latency_ms": round(avg("latency_ms")),
+        "avg_ttft_ms": round(avg("ttft_ms")),
+        "p50_ms": pct(0.5),
+        "p95_ms": pct(0.95),
         "rpm": rpm,
         "tpm": round(tok5 / 5),
         "truncated": truncated,
         "retried": retried,
-        "today": {"requests": today_row["total"] or 0,
-                  "input_tokens": today_row["in_tok"] or 0,
-                  "output_tokens": today_row["out_tok"] or 0},
+        "today": {"requests": today_row["n"] or 0,
+                  "input_tokens": today_row["i"] or 0,
+                  "output_tokens": today_row["o"] or 0},
         "alltime": {"requests": all_total},
         "series": series,
-        "by_model": [dict(r) for r in by_model],
-        "by_account": [dict(r) for r in by_account],
-        "by_key": [dict(r) for r in by_key],
-        "by_endpoint": [dict(r) for r in by_endpoint],
-        "recent_errors": [dict(r) for r in recent_errors],
+        "by_model": by_model,
+        "by_account": by_account,
+        "by_key": by_key,
+        "by_endpoint": by_endpoint,
+        "recent_errors": recent_errors,
         "db_size": db_size,
         "max_rows": _MAX_ROWS,
     }
@@ -738,12 +989,11 @@ def _tz_offset():
 
 @_resilient(default=list)
 def list_models():
-    with _lock:
-        rows = _conn().execute("""
-          SELECT COALESCE(resolved_model,model) m, COUNT(*) n,
-                 SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
-                 AVG(latency_ms) avg_lat, MAX(ts) last_used, SUM(1-ok) errs
-          FROM requests GROUP BY m ORDER BY n DESC""").fetchall()
+    rows = _q("""
+      SELECT COALESCE(resolved_model,model) m, COUNT(*) n,
+             SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
+             AVG(latency_ms) avg_lat, MAX(ts) last_used, SUM(1-ok) errs
+      FROM requests GROUP BY m ORDER BY n DESC""")
     return [dict(r) for r in rows]
 
 
@@ -774,10 +1024,8 @@ def create_key(name, models=None, max_concurrent=0):
 
 @_resilient(default=list)
 def list_keys():
-    with _lock:
-        rows = _conn().execute(
-            "SELECT id,name,prefix,tail,created,disabled,last_used,models,"
-            "max_concurrent FROM api_keys ORDER BY id").fetchall()
+    rows = _q("SELECT id,name,prefix,tail,created,disabled,last_used,models,"
+              "max_concurrent FROM api_keys ORDER BY id")
     return [dict(r) for r in rows]
 
 
@@ -857,13 +1105,12 @@ def has_keys():
 @_resilient(default=lambda: {"requests": 0, "keys": 0, "accounts": 0,
                              "captures": 0})
 def counts():
-    with _lock:
-        reqs = _conn().execute("SELECT COUNT(*) c FROM requests").fetchone()["c"]
-        keys = _conn().execute("SELECT COUNT(*) c FROM api_keys").fetchone()["c"]
-        accs = _conn().execute("SELECT COUNT(*) c FROM accounts").fetchone()["c"]
-        caps = _conn().execute("SELECT COUNT(*) c FROM captures").fetchone()["c"]
-    return {"requests": reqs, "keys": keys, "accounts": accs,
-            "captures": caps}
+    r = _q1("SELECT (SELECT COUNT(*) FROM requests) reqs,"
+            " (SELECT COUNT(*) FROM api_keys) keys,"
+            " (SELECT COUNT(*) FROM accounts) accs,"
+            " (SELECT COUNT(*) FROM captures) caps")
+    return {"requests": r["reqs"], "keys": r["keys"],
+            "accounts": r["accs"], "captures": r["caps"]}
 
 
 # ---------- upstream accounts ----------
@@ -922,8 +1169,7 @@ def get_account(aid):
 
 @_resilient(default=list)
 def list_accounts():
-    with _lock:
-        rows = _conn().execute("SELECT * FROM accounts ORDER BY id").fetchall()
+    rows = _q("SELECT * FROM accounts ORDER BY id")
     return [dict(r) for r in rows]
 
 
@@ -937,12 +1183,11 @@ def delete_account(aid):
 
 @_resilient(default=dict)
 def account_stats():
-    with _lock:
-        rows = _conn().execute("""
-          SELECT account a, COUNT(*) n, SUM(ok) ok_n,
-                 SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
-                 AVG(latency_ms) avg_lat, MAX(ts) last_used
-          FROM requests WHERE account IS NOT NULL GROUP BY a""").fetchall()
+    rows = _q("""
+      SELECT account a, COUNT(*) n, SUM(ok) ok_n,
+             SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
+             AVG(latency_ms) avg_lat, MAX(ts) last_used
+      FROM requests WHERE account IS NOT NULL GROUP BY a""")
     return {r["a"]: dict(r) for r in rows}
 
 
@@ -952,15 +1197,14 @@ def error_stats(hours=24, limit=12):
     (first 80 chars, digits stripped so 'timeout after 31.4s' and '…29.9s'
     collapse into one row) -> count + latest ts + an example id."""
     since = time.time() - hours * 3600 if hours else 0
-    with _lock:
-        rows = _conn().execute(
-            """
-          SELECT substr(error,1,80) sig, COUNT(*) n, MAX(ts) last,
-                 MAX(id) example_id
-          FROM requests
-          WHERE ok=0 AND error IS NOT NULL AND ts>=?
-          GROUP BY sig ORDER BY n DESC LIMIT ?""",
-            (since, max(1, min(limit, 100)))).fetchall()
+    rows = _q(
+        """
+      SELECT substr(error,1,80) sig, COUNT(*) n, MAX(ts) last,
+             MAX(id) example_id
+      FROM requests
+      WHERE ok=0 AND error IS NOT NULL AND ts>=?
+      GROUP BY sig ORDER BY n DESC LIMIT ?""",
+        (since, max(1, min(limit, 100))))
     import re
     out = {}
     for r in rows:
@@ -999,11 +1243,10 @@ def touch_pins(pairs):
 
 @_resilient(default=list)
 def list_pins():
-    with _lock:
-        rows = _conn().execute("""
-          SELECT s.session_key, s.account_id, s.updated, a.name aname, a.email
-          FROM sessions s LEFT JOIN accounts a ON a.id=s.account_id
-          ORDER BY s.updated DESC""").fetchall()
+    rows = _q("""
+      SELECT s.session_key, s.account_id, s.updated, a.name aname, a.email
+      FROM sessions s LEFT JOIN accounts a ON a.id=s.account_id
+      ORDER BY s.updated DESC""")
     return [dict(r) for r in rows]
 
 
@@ -1063,9 +1306,17 @@ def prune_responses(ttl_s=86400):
 
 @_resilient(default=None)
 def meta_get(k):
+    """meta values are tiny and read on every /v1 call (model resolve,
+    aliases, efforts) — cache them; meta_set writes through."""
+    try:
+        return _meta_cache[k]
+    except KeyError:
+        pass
     with _lock:
         r = _conn().execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
-    return r["v"] if r else None
+    v = r["v"] if r else None
+    _meta_cache[k] = v
+    return v
 
 
 @_resilient(default=None)
@@ -1075,6 +1326,7 @@ def meta_set(k, v):
             "INSERT INTO meta (k,v) VALUES (?,?) "
             "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, v))
         _conn().commit()
+    _meta_cache[k] = v
 
 
 # ---------- diagnostic bundle ----------
@@ -1088,8 +1340,7 @@ def export_requests(limit=500, hours=0):
         args.append(time.time() - hours * 3600)
     sql += " ORDER BY id DESC LIMIT ?"
     args.append(max(1, min(limit, _MAX_ROWS)))
-    with _lock:
-        return [dict(r) for r in _conn().execute(sql, args).fetchall()]
+    return [_inflate(dict(r)) for r in _q(sql, args)]
 
 
 @_resilient(default=list)
@@ -1099,9 +1350,8 @@ def export_accounts():
             "source,plan,created,disabled,fail_count,consecutive_fails,"
             "cooldown_until,last_error,last_used,last_ok,req_count,"
             "max_concurrent,models")
-    with _lock:
-        return [dict(r) for r in _conn().execute(
-            f"SELECT {cols} FROM accounts ORDER BY id").fetchall()]
+    return [dict(r) for r in
+            _q(f"SELECT {cols} FROM accounts ORDER BY id")]
 
 
 @_resilient(default=list)
@@ -1109,23 +1359,19 @@ def export_keys():
     """api_keys metadata only — hash/prefix identify a key, none are usable."""
     cols = ("id,name,prefix,tail,created,disabled,last_used,models,"
             "max_concurrent")
-    with _lock:
-        return [dict(r) for r in _conn().execute(
-            f"SELECT {cols} FROM api_keys ORDER BY id").fetchall()]
+    return [dict(r) for r in _q(f"SELECT {cols} FROM api_keys ORDER BY id")]
 
 
 @_resilient(default=dict)
 def export_meta():
     """meta kv minus secrets (master_key; tomb:* are deleted-key hashes)."""
-    with _lock:
-        rows = _conn().execute("SELECT k,v FROM meta").fetchall()
+    rows = _q("SELECT k,v FROM meta")
     return {r["k"]: r["v"] for r in rows
             if r["k"] != "master_key" and not r["k"].startswith("tomb:")}
 
 
 @_resilient(default=list)
 def export_responses(limit=500):
-    with _lock:
-        return [dict(r) for r in _conn().execute(
-            "SELECT * FROM responses ORDER BY created DESC LIMIT ?",
-            (max(1, min(limit, 5000)),)).fetchall()]
+    return [dict(r) for r in _q(
+        "SELECT * FROM responses ORDER BY created DESC LIMIT ?",
+        (max(1, min(limit, 5000)),))]

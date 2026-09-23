@@ -140,9 +140,9 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   `DEVIN_PROXY_MAX_ROWS` (default 50000). Each row also stores the raw
   request body, a timestamped **upstream event timeline** (every delta /
   tool-call / stop_reason / trailer error / failover) and **every SSE
-  payload sent to the client** — open 详情 → 上游事件 / SSE 输出 to
-  debug dropped streams. Size capped by `DEVIN_PROXY_LOG_CAP`
-  (default 200 KB per blob)
+  payload sent to the client** — gzip-compressed in the db; open
+  详情 → 上游事件 / SSE 输出 to debug dropped streams. Size capped by
+  `DEVIN_PROXY_LOG_CAP` (default 200 KB per blob, before compression)
 - **断流检测** — a Connect stream that ends without the required
   end-of-stream trailer is logged `truncated` and surfaced to the client
   as an SSE error (never a fake `stop`); non-streaming requests
