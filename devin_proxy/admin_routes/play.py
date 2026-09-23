@@ -12,7 +12,12 @@ def register(router, ctx, admin_key):
     @router.post("/api/playground", dependencies=[Depends(admin_key)])
     async def playground(request: Request):
         """Chat test routed through the normal pipeline (logged, no key needed)."""
-        body = await request.json()
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(400, "body must be a JSON object")
         t0 = time.perf_counter()
         force = None
         if body.get("account_id"):
