@@ -145,6 +145,21 @@ assert c.get("/admin/api/requests/export?fmt=xml", headers=H).status_code == 400
 assert c.get("/admin/api/requests/export?fmt=csv", headers=H).status_code == 200
 print("input validation OK")
 
+# --- bulk account enable/disable ---
+accs = c.get("/admin/api/accounts", headers=H).json()["accounts"]
+if accs:
+    ids = [a["id"] for a in accs]
+    r = c.post("/admin/api/accounts/bulk",
+               json={"ids": ids, "disabled": True}, headers=H)
+    assert r.json()["updated"] == len(ids)
+    assert all(a["disabled"] for a in
+               c.get("/admin/api/accounts", headers=H).json()["accounts"])
+    c.post("/admin/api/accounts/bulk",
+           json={"ids": ids, "disabled": False}, headers=H)
+    assert not any(a["disabled"] for a in
+                   c.get("/admin/api/accounts", headers=H).json()["accounts"])
+    print("bulk account toggle OK")
+
 # --- status + ping shape ---
 r = c.get("/admin/api/status", cookies={"dp_admin": cookie})
 d = r.json()
