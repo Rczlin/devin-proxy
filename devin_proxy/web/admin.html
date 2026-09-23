@@ -215,7 +215,7 @@ tr:hover td.ops{background:#1a2129}
         <select id="rq-ok"><option value="">全部状态</option><option value="1">成功</option><option value="0">失败</option></select>
         <select id="rq-flag"><option value="">全部标记</option><option value="truncated">断流/截断</option><option value="retried">重试恢复</option><option value="no_stop_reason">无 stop</option></select>
         <input id="rq-q" placeholder="搜索 错误/客户端/Key" style="width:180px">
-        <button class="primary" onclick="reqOffset=0;loadReqs()">筛选</button>
+        <button class="primary" onclick="reqReset();loadReqs()">筛选</button>
         <span id="rq-acct-chip"></span>
         <label class="muted" title="每 5 秒刷新当前页"><input type="checkbox" id="rq-auto"> 自动刷新</label>
         <span class="muted" id="rq-total"></span>
@@ -448,9 +448,9 @@ function goPage(p){document.querySelector('[data-p='+p+']').click()}
 function filterByModel(m){
   goPage('reqs');const sel=$('#rq-model');
   if(![...sel.options].some(o=>o.value===m))sel.appendChild(new Option(m,m));
-  sel.value=m;reqOffset=0;loadReqs();
+  sel.value=m;reqReset();loadReqs();
 }
-function filterByAccount(a){goPage('reqs');reqAccount=a;reqOffset=0;renderAcctChip();loadReqs()}
+function filterByAccount(a){goPage('reqs');reqAccount=a;reqReset();renderAcctChip();loadReqs()}
 
 async function loadDash(){
   const d=await (await api('/admin/api/overview?hours='+DASH.hours)).json();
@@ -484,7 +484,7 @@ function renderDashCards(d){
 function cardGo(k){
   if(k==='accs')return goPage('accs');
   if(k==='conf')return goPage('conf');
-  if(k==='trunc'){goPage('reqs');$('#rq-flag').value='truncated';reqOffset=0;loadReqs()}
+  if(k==='trunc'){goPage('reqs');$('#rq-flag').value='truncated';reqReset();loadReqs()}
 }
 function renderPool(d){
   const p=d.pool||{};
@@ -629,10 +629,10 @@ window.addEventListener('resize',(()=>{let t;return()=>{clearTimeout(t);t=setTim
 },180)}})());
 
 // requests
-let reqOffset=0, reqTotal=0, reqAccount='';
+let reqCursor=null, reqHist=[], reqTotal=0, reqAccount='', REQ_LAST_CURSOR=null;   // keyset pagination
 function renderAcctChip(){
   $('#rq-acct-chip').innerHTML=reqAccount
-    ?`<span class="fchip" title="点击清除账号筛选" onclick="reqAccount='';reqOffset=0;renderAcctChip();loadReqs()">账号: ${esc(reqAccount)} ✕</span>`:'';
+    ?`<span class="fchip" title="点击清除账号筛选" onclick="reqAccount='';reqReset();renderAcctChip();loadReqs()">账号: ${esc(reqAccount)} ✕</span>`:'';
 }
 const PAGE=50;
 const FLAG_LABELS={truncated:'断流',retried:'重试',retried_partial:'部分重试',retry_same_account:'同号重试',no_stop_reason:'无stop',client_aborted:'客户端断开',protocol_error:'协议错'};
@@ -647,14 +647,15 @@ function reqFilters(){
   const model=$('#rq-model').value, ok=$('#rq-ok').value, q=$('#rq-q').value.trim(), flag=$('#rq-flag').value;
   return (model?`&model=${encodeURIComponent(model)}`:'')+(ok!==''?`&ok=${ok}`:'')+(q?`&q=${encodeURIComponent(q)}`:'')+(flag?`&flag=${encodeURIComponent(flag)}`:'')+(reqAccount?`&account=${encodeURIComponent(reqAccount)}`:'');
 }
+function reqReset(){reqCursor=null;reqHist=[]}
 async function loadReqs(){
-  const u=`/admin/api/requests?limit=${PAGE}&offset=${reqOffset}`+reqFilters();
+  const u=`/admin/api/requests?limit=${PAGE}`+(reqCursor?`&before=${reqCursor}`:'')+reqFilters();
   const d=await (await api(u)).json();
   reqTotal=d.total;
   $('#rq-total').textContent=`共 ${d.total} 条`;
-  $('#rq-page').textContent=`第 ${Math.floor(reqOffset/PAGE)+1} / ${Math.max(1,Math.ceil(d.total/PAGE))} 页`;
-  $('#rq-prev').disabled=reqOffset<=0;
-  $('#rq-next').disabled=reqOffset+PAGE>=d.total;
+  $('#rq-page').textContent=`第 ${reqHist.length+1} 页`;
+  $('#rq-prev').disabled=!reqHist.length;
+  $('#rq-next').disabled=!(d.items.length===PAGE&&d.next_cursor);
   $('#rq-body').innerHTML=d.items.map(r=>`<tr${r.ok?'':' class="rerr"'} onclick="showReq(${r.id})">
     <td>${r.id}</td><td>${fmtT(r.ts)}</td>
     <td><span class="tag model">${esc(r.resolved_model||r.model)}</span></td>
@@ -665,15 +666,20 @@ async function loadReqs(){
     <td>${r.latency_ms}ms</td><td>${r.ttft_ms??'-'}</td><td>${r.tps??'-'}</td>
     <td>${esc(r.account||'')}</td><td>${esc(r.key_name||'')}</td>
     <td class="ops"><button class="mini" onclick="event.stopPropagation();showReq(${r.id})">详情</button>${r.has_cap?` <button class="mini" onclick="event.stopPropagation();dlCapture(${r.id})" title="导出该请求完整抓包 JSON">📥 抓包</button>`:''}</td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';
+  REQ_LAST_CURSOR=d.next_cursor;
 }
-function reqPage(d){reqOffset=Math.max(0,reqOffset+d*PAGE);loadReqs()}
+function reqPage(d){
+  if(d>0){const c=REQ_LAST_CURSOR;if(!c)return;reqHist.push(reqCursor);reqCursor=c}
+  else{reqCursor=reqHist.pop()??null}
+  loadReqs();
+}
 setInterval(()=>{if($('#p-reqs').classList.contains('on')&&$('#rq-auto').checked)loadReqs().catch(()=>{})},5000);
 async function clearReqs(){
   const f=reqFilters();
   const msg=f?`删除当前筛选命中的 ${reqTotal} 条日志？不可恢复。`:'确定清空全部请求日志？不可恢复。';
   if(!confirm(msg))return;
   const d=await (await api('/admin/api/requests/clear?x=1'+f,{method:'POST'})).json();
-  reqOffset=0;loadReqs();toast(f?`已删除 ${d.deleted} 条`:'已清空');
+  reqReset();loadReqs();toast(f?`已删除 ${d.deleted} 条`:'已清空');
 }
 async function exportReqs(){
   const r=await api('/admin/api/requests/export?fmt=csv&limit=20000'+reqFilters());

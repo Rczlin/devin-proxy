@@ -490,13 +490,23 @@ _REQ_LIST_COLS = ("id,ts,model,resolved_model,stream,ok,status,error,"
 
 @_resilient(default=lambda: ([], 0))
 def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None,
-                  flag=None):
+                  flag=None, before_id=None):
     where, args = _where(model, ok, q, account, flag)
+    if before_id:
+        # keyset pagination: stable under concurrent inserts and indexed,
+        # unlike OFFSET which rescans and drifts when new rows land mid-page
+        where += " AND id<?"
+        args.append(before_id)
     with _lock:
-        rows = _conn().execute(
-            f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
-            " ORDER BY id DESC LIMIT ? OFFSET ?",
-            args + [limit, offset]).fetchall()
+        if before_id:
+            rows = _conn().execute(
+                f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
+                " ORDER BY id DESC LIMIT ?", args + [limit]).fetchall()
+        else:
+            rows = _conn().execute(
+                f"SELECT {_REQ_LIST_COLS} FROM requests{where}"
+                " ORDER BY id DESC LIMIT ? OFFSET ?",
+                args + [limit, offset]).fetchall()
         total = _conn().execute(
             f"SELECT COUNT(*) c FROM requests{where}", args).fetchone()["c"]
     return [dict(r) for r in rows], total
