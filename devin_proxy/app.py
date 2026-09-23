@@ -661,16 +661,18 @@ def create_app(api_key=None):
             try:
                 req = build_request(body, model, acct, skey=session_key)
             except Exception as e:
+                st = getattr(getattr(e, "response", None), "status_code",
+                             None)
                 last_err = {"message": f"{acct.display()}: {e}",
-                            "http_error": getattr(
-                                getattr(e, "response", None), "status_code",
-                                502),
-                            "kind": "build_error"}
+                            "http_error": st or 502,
+                            "kind": "build_error",
+                            # a real 5xx from the auth endpoint is provider-
+                            # side trouble like a chat-path 5xx; transport
+                            # failures (no response) stay hard
+                            "transient": bool(st and st >= 500)}
                 if log:
                     log.ev("build_error", account=acct.display(),
-                           error=str(e)[:500],
-                           status=getattr(getattr(e, "response", None),
-                                          "status_code", None),
+                           error=str(e)[:500], status=st,
                            tb=traceback.format_exc()[-3000:])
                 pool.release(acct)
                 pool.mark_fail(acct, last_err)
