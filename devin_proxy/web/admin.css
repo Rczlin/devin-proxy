@@ -47,6 +47,8 @@ button.danger:hover{border-color:var(--red);color:var(--red)}
 button:disabled{opacity:.4;cursor:default}
 button.mini{padding:2px 10px;font-size:12px;vertical-align:2px}
 button.mini.spinning{color:var(--accent);animation:sp .8s linear infinite}
+select.intv{padding:3px 6px;font-size:12px;width:auto}
+select.intv:disabled{opacity:.45}
 input,select,textarea{background:#0d1117;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:7px 10px;font-size:13px;font-family:inherit}
 input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent)}
 textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font-size:12px}

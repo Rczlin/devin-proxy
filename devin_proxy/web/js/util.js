@@ -28,6 +28,27 @@ async function refreshPage(btn){
   if(btn){btn.disabled=false;btn.classList.remove('spinning')}
 }
 
+// auto-refresh loop: ticks while the page is visible + checkbox on,
+// interval comes from a per-page <select> persisted in localStorage.
+// Awaits each load before scheduling the next tick — no overlap.
+function autoRefresh(checkId,intvId,pageSel,fn){
+  const cb=$('#'+checkId),sel=$('#'+intvId);
+  if(!cb)return;
+  if(sel){
+    const saved=localStorage.getItem('intv:'+intvId);
+    if(saved&&[...sel.options].some(o=>o.value===saved))sel.value=saved;
+    sel.onchange=()=>localStorage.setItem('intv:'+intvId,sel.value);
+    sel.disabled=!cb.checked;
+    cb.addEventListener('change',()=>sel.disabled=!cb.checked);
+  }
+  const tick=async()=>{
+    if(cb.checked&&$(pageSel).classList.contains('on'))await fn().catch(()=>{});
+    const s=sel?(+sel.value||15):15;
+    setTimeout(tick,Math.max(2,s)*1000);
+  };
+  setTimeout(tick,sel?(+sel.value||15)*1000:15000);
+}
+
 // nav
 document.querySelectorAll('.nav a').forEach(a=>a.onclick=()=>{
   document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('on'));
