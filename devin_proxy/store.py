@@ -86,6 +86,8 @@ def _conn():
         );
         CREATE INDEX IF NOT EXISTS idx_req_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_req_model ON requests(model);
+        CREATE INDEX IF NOT EXISTS idx_req_ok ON requests(ok);
+        CREATE INDEX IF NOT EXISTS idx_req_account ON requests(account);
         CREATE TABLE IF NOT EXISTS captures (
           request_id INTEGER PRIMARY KEY,
           ts REAL NOT NULL,
