@@ -351,6 +351,14 @@ def create_app(api_key=None):
         resp = await call_next(request)
         if "server" in resp.headers:
             del resp.headers["server"]
+        # hardening headers — every response. The admin console holds the
+        # master key's power, so deny framing/caching/sniffing outright.
+        h = resp.headers
+        h["X-Content-Type-Options"] = "nosniff"
+        h["X-Frame-Options"] = "DENY"
+        h["Referrer-Policy"] = "no-referrer"
+        if request.url.path.startswith("/admin"):
+            h["Cache-Control"] = "no-store"
         return resp
 
     def check_key(request: Request):

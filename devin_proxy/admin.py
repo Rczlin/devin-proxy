@@ -4,12 +4,15 @@ The console is always locked: /admin serves only a minimal login page,
 POST /admin/api/login trades the master key for an HttpOnly session cookie,
 and /admin/app (the SPA) plus every /admin/api/* endpoint require that
 cookie (or the master key as Bearer / ?key=)."""
+import collections
 import gzip
 import hashlib
 import hmac
+import io
 import json
 import os
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -65,10 +68,63 @@ for i, s in enumerate(cap.get("downstream") or []):
 '''
 
 
+class _ZipStreamer(io.RawIOBase):
+    """File-like object that yields zip bytes as the archive is written.
+
+    zipfile needs a seekable target for the central directory, so we stream
+    into a temp file in chunks and yield as we go — peak memory stays bounded
+    to one chunk instead of holding the whole archive in RAM."""
+
+    def __init__(self, writer):
+        self._writer = writer          # callable(fileobj) — writes the zip
+
+    def readable(self):
+        return True
+
+    def __iter__(self):
+        import tempfile
+        with tempfile.TemporaryFile() as f:
+            self._writer(f)
+            f.seek(0)
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    return
+                yield chunk
+
 
 def make_router(app):
     router = APIRouter(prefix="/admin")
     started = time.time()
+
+    # ---- hardening ----
+    # A per-IP rate limit on the login endpoint so the master key can't
+    # be brute-forced online. (Security headers are added app-wide by the
+    # _stealth middleware in app.py.)
+    _LOGIN_MAX = 5            # attempts allowed per window
+    _LOGIN_WIN = 300          # seconds
+    _login_hits = collections.defaultdict(list)
+    _login_lock = threading.Lock()
+
+    def _login_check(ip):
+        """-> retry-after s if this IP is over the failed-login budget."""
+        now = time.time()
+        with _login_lock:
+            hits = _login_hits.get(ip, [])
+            while hits and hits[0] <= now - _LOGIN_WIN:
+                hits.pop(0)
+            return int(hits[0] + _LOGIN_WIN - now) + 1 \
+                if len(hits) >= _LOGIN_MAX else 0
+
+    def _login_failed(ip):
+        """Record one failed attempt for the IP."""
+        with _login_lock:
+            _login_hits[ip].append(time.time())
+            # bound the map so a spray of source IPs can't grow it forever
+            if len(_login_hits) > 10000:
+                for k, v in list(_login_hits.items()):
+                    if not v:
+                        _login_hits.pop(k, None)
 
     def _sess_token():
         exp = int(time.time()) + _SESS_TTL
@@ -105,9 +161,18 @@ def make_router(app):
 
     @router.post("/api/login")
     def login(body: LoginBody, request: Request):
-        if not app.state.proxy_key or body.key != app.state.proxy_key:
+        ip = request.client.host if request.client else "?"
+        wait = _login_check(ip)
+        if wait:
+            raise HTTPException(429, f"too many attempts, retry in {wait}s",
+                                headers={"Retry-After": str(wait)})
+        ok = app.state.proxy_key and hmac.compare_digest(
+            body.key, app.state.proxy_key)
+        if not ok:
+            _login_failed(ip)
             time.sleep(0.4)                 # slow down brute force
             raise HTTPException(401, "invalid key")
+        _login_hits.pop(ip, None)           # success clears the window
         resp = JSONResponse({"ok": True})
         resp.set_cookie(_SESS_COOKIE, _sess_token(), max_age=_SESS_TTL,
                         httponly=True, samesite="lax",
@@ -283,46 +348,53 @@ def make_router(app):
             return "".join(json.dumps(r, ensure_ascii=False, default=str)
                            + "\n" for r in rows)
 
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED,
-                             compresslevel=6) as z:
-            # ship the proto schema + a decoder so the packet captures are
-            # self-contained: `python decode_capture.py captures/req-1.json`
-            try:
-                here = os.path.dirname(os.path.abspath(__file__))
-                z.write(os.path.join(here, "proto.py"), "proto_schema.py")
-            except Exception:
-                pass
-            z.writestr("decode_capture.py", _DECODER)
-            for c in store.export_captures():
+        def _write(f):
+            with zipfile.ZipFile(f, "w", zipfile.ZIP_DEFLATED,
+                                 compresslevel=6) as z:
+                # ship the proto schema + a decoder so the packet captures
+                # are self-contained:
+                # `python decode_capture.py captures/req-1.json`
                 try:
-                    z.writestr(f"captures/req-{c['request_id']}.json",
-                               gzip.decompress(c["data"]))
-                except Exception as e:
-                    z.writestr(f"captures/req-{c['request_id']}.err",
-                               f"undecodable capture: {e}")
-            z.writestr("README.txt", readme)
-            z.writestr("env.json", json.dumps(env, ensure_ascii=False,
-                                              indent=1, default=str))
-            z.writestr("requests.jsonl", jl(reqs))
-            z.writestr("responses.jsonl", jl(store.export_responses()))
-            z.writestr("accounts.json", json.dumps(
-                store.export_accounts(), ensure_ascii=False, indent=1))
-            z.writestr("keys.json", json.dumps(
-                store.export_keys(), ensure_ascii=False, indent=1))
-            z.writestr("sessions.json", json.dumps(
-                app.state.pool.sessions(), ensure_ascii=False, indent=1,
-                default=str))
-            z.writestr("models.json", json.dumps(models, ensure_ascii=False,
-                                                 indent=1, default=str))
-            z.writestr("meta.json", json.dumps(store.export_meta(),
-                                               ensure_ascii=False, indent=1,
-                                               default=str))
-            z.writestr("stats.json", json.dumps(stats, ensure_ascii=False,
-                                                indent=1, default=str))
+                    here = os.path.dirname(os.path.abspath(__file__))
+                    z.write(os.path.join(here, "proto.py"),
+                            "proto_schema.py")
+                except Exception:
+                    pass
+                z.writestr("decode_capture.py", _DECODER)
+                for c in store.export_captures():
+                    try:
+                        z.writestr(f"captures/req-{c['request_id']}.json",
+                                   gzip.decompress(c["data"]))
+                    except Exception as e:
+                        z.writestr(f"captures/req-{c['request_id']}.err",
+                                   f"undecodable capture: {e}")
+                z.writestr("README.txt", readme)
+                z.writestr("env.json", json.dumps(env, ensure_ascii=False,
+                                                  indent=1, default=str))
+                z.writestr("requests.jsonl", jl(reqs))
+                z.writestr("responses.jsonl", jl(store.export_responses()))
+                z.writestr("accounts.json", json.dumps(
+                    store.export_accounts(), ensure_ascii=False, indent=1))
+                z.writestr("keys.json", json.dumps(
+                    store.export_keys(), ensure_ascii=False, indent=1))
+                z.writestr("sessions.json", json.dumps(
+                    app.state.pool.sessions(), ensure_ascii=False, indent=1,
+                    default=str))
+                z.writestr("models.json",
+                           json.dumps(models, ensure_ascii=False,
+                                      indent=1, default=str))
+                z.writestr("meta.json",
+                           json.dumps(store.export_meta(),
+                                      ensure_ascii=False, indent=1,
+                                      default=str))
+                z.writestr("stats.json",
+                           json.dumps(stats, ensure_ascii=False,
+                                      indent=1, default=str))
         fn = "devin-proxy-diag-" + time.strftime("%Y%m%d-%H%M%S") + ".zip"
+        # stream the archive straight to the client instead of building it
+        # in memory — a big capture set can otherwise balloon RSS.
         return StreamingResponse(
-            iter([buf.getvalue()]), media_type="application/zip",
+            _ZipStreamer(_write), media_type="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{fn}"'})
 
     @router.get("/api/models", dependencies=[Depends(admin_key)])

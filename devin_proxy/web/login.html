@@ -37,6 +37,7 @@ f.onsubmit=async ev=>{
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({key:k.value.trim()})});
     if(r.ok){location.replace('/admin/app');return}
+    if(r.status===429){let m;try{m=(await r.json()).detail}catch{}e.textContent=m||'Too many attempts — try again later';return}
     e.textContent='Invalid key';
   }catch{e.textContent='Network error'}
   k.select();
