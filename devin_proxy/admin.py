@@ -828,20 +828,24 @@ def make_router(app):
     def ping():
         """Connectivity check across every enabled account."""
         pool = app.state.pool
-        results = []
-        for a in pool.accounts():
-            if a.disabled:
-                continue
+        def _probe(a):
             t0 = time.perf_counter()
             try:
                 upstream.get_user_jwt(app.state.http, a.api_server_url,
                                       a.token, force_refresh=True)
-                results.append({"account": a.display(), "ok": True,
-                                "latency_ms": int((time.perf_counter() - t0) * 1000)})
+                return {"account": a.display(), "ok": True,
+                        "latency_ms": int((time.perf_counter() - t0) * 1000)}
             except Exception as e:
-                results.append({"account": a.display(), "ok": False,
-                                "error": str(e)[:200],
-                                "latency_ms": int((time.perf_counter() - t0) * 1000)})
+                return {"account": a.display(), "ok": False,
+                        "error": str(e)[:200],
+                        "latency_ms": int((time.perf_counter() - t0) * 1000)}
+
+        # probe every enabled account concurrently — serial checks get slow
+        # fast when the pool has more than a couple of accounts.
+        from concurrent.futures import ThreadPoolExecutor
+        accs = [a for a in pool.accounts() if not a.disabled]
+        with ThreadPoolExecutor(max_workers=min(8, len(accs) or 1)) as ex:
+            results = list(ex.map(_probe, accs))
         ok = bool(results) and all(r["ok"] for r in results)
         return {"ok": ok, "results": results,
                 "latency_ms": max((r["latency_ms"] for r in results), default=0)}
