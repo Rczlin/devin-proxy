@@ -203,12 +203,18 @@ diagnostic bundle streams to the client instead of building in memory.
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}`,
   `GET /v1/responses/{id}/input_items`
 - `GET /v1/models` — the synced catalog collapsed to one entry per
-  family (`id` = family name like `claude-sonnet-5`, `efforts` lists the
-  available variants) + aliases, with `display_name`, `context_window`,
-  `max_output_tokens`, `credit_cost`, `cost_summary`, `capabilities`
-  and `source` taken from the family's default variant. `?variants=1`
-  returns every variant uid instead. Filtered to the caller key's
-  allowlist when set
+  family (`id` = family name like `claude-sonnet-5`; `efforts` lists the
+  available effort levels, `variants` maps each to its concrete uid,
+  `default_effort`/`default_uid` mark where a bare request lands) +
+  aliases, with `display_name`, `description`, `context_window`,
+  `max_output_tokens`, `credit_cost`, `cost_summary`, `pricing`,
+  `capabilities`, `remote_accounts` and `source` taken from the
+  family's default variant. `?variants=1` returns every variant uid
+  instead (each with `family_label`, `effort_label`, `deployment`,
+  and a `default` flag on the family's effective variant). Aliases
+  inherit their resolved target's metadata (`alias_of`, plus
+  `default_effort` when the alias pins an `@effort`). Filtered to the
+  caller key's allowlist when set
 - `GET /healthz` — `{"ok": true}` only
 - `/admin` — sign-in page → cookie session → `/admin/app` console
 

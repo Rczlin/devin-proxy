@@ -142,7 +142,7 @@ def _entry(uid, **kw):
          "label": kw.get("label") or _label_of(uid, fam, effort),
          "context": None, "max_output": None, "credit": None,
          "images": None, "thinking": None, "alias": None,
-         "cost_summary": None, "pricing": None,
+         "cost_summary": None, "pricing": None, "deployment": None,
          "remote_accounts": 0, "url": False}
     for k, v in kw.items():
         if k in e and v is not None:
@@ -297,7 +297,8 @@ def entries(include_hidden=False):
                    family_label=m.get("family_label"),
                    label=m.get("label"))
         for k in ("context", "max_output", "credit", "images",
-                  "thinking", "alias", "cost_summary", "pricing"):
+                  "thinking", "alias", "cost_summary", "pricing",
+                  "deployment"):
             if m.get(k) is not None:
                 e[k] = m[k]
         if m.get("accounts"):
