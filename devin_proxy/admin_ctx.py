@@ -15,6 +15,7 @@ from fastapi import HTTPException, Request, Response
 
 _SESS_COOKIE = "dp_admin"
 _SESS_TTL = 7 * 86400
+_WS_TICKET_TTL = 60           # seconds to use a minted ws ticket
 
 
 class AdminCtx:
@@ -65,6 +66,30 @@ class AdminCtx:
             return False
         want = hmac.new(self.app.state.proxy_key.encode(),
                         str(exp).encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, want)
+
+    # ---- ws ticket: short-lived, single-purpose credential for the live
+    # feed handshake. Minted only by an already-authed caller — a cross-site
+    # page can't get one (Lax cookie isn't sent cross-site), so a valid
+    # ticket proves an authenticated same-origin session existed and the
+    # ws Origin check can be skipped (robust under proxies that mangle
+    # Host/X-Forwarded-*).
+    def ws_ticket(self):
+        exp = int(time.time()) + _WS_TICKET_TTL
+        sig = hmac.new(self.app.state.proxy_key.encode(),
+                       f"ws:{exp}".encode(), hashlib.sha256).hexdigest()
+        return f"{exp}.{sig}"
+
+    def ws_ticket_ok(self, token):
+        try:
+            exp, sig = token.split(".", 1)
+            exp = int(exp)
+        except (ValueError, AttributeError):
+            return False
+        if exp < time.time():
+            return False
+        want = hmac.new(self.app.state.proxy_key.encode(),
+                        f"ws:{exp}".encode(), hashlib.sha256).hexdigest()
         return hmac.compare_digest(sig, want)
 
     def set_session_cookie(self, response, request):

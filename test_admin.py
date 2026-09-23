@@ -271,6 +271,28 @@ with c.websocket_connect(
         "/admin/api/ws",
         headers={"authorization": "Bearer sk-test-master"}) as ws:
     assert json.loads(ws.receive_text())["type"] == "live"
+# ticket path: mint via authed GET, connect with ?t= only — no cookie,
+# no origin, any proxy header mangling is irrelevant
+r = c.get("/admin/api/ws-ticket", cookies={"dp_admin": cookie})
+assert r.status_code == 200 and r.json()["ticket"]
+tk = r.json()["ticket"]
+with c.websocket_connect("/admin/api/ws?t=" + tk) as ws:
+    assert json.loads(ws.receive_text())["type"] == "live"
+# forged/expired ticket refused
+try:
+    with c.websocket_connect("/admin/api/ws?t=9999999999.deadbeef") as ws:
+        ws.receive_text()
+    assert False, "bad ticket connected"
+except Exception:
+    pass
+try:
+    with c.websocket_connect("/admin/api/ws?t=gibberish") as ws:
+        ws.receive_text()
+    assert False, "garbage ticket connected"
+except Exception:
+    pass
+# ticket endpoint itself requires auth
+assert c_fresh.get("/admin/api/ws-ticket").status_code == 401
 print("live ws feed OK")
 
 # --- export bundle is a valid streaming zip ---
