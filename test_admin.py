@@ -170,6 +170,18 @@ if accs:
                    c.get("/admin/api/accounts", headers=H).json()["accounts"])
     print("bulk account toggle OK")
 
+# --- sliding session renewal ---
+import hmac as _h, hashlib as _hh, time as _t
+exp = int(_t.time()) + 86400      # 1 day left < half of 7d TTL
+sig = _h.new(b"sk-test-master", str(exp).encode(), _hh.sha256).hexdigest()
+r = c.get("/admin/api/overview", cookies={"dp_admin": f"{exp}.{sig}"})
+assert "dp_admin" in r.headers.get("set-cookie", ""), "stale cookie not renewed"
+exp2 = int(_t.time()) + 6 * 86400   # fresh — no renewal
+sig2 = _h.new(b"sk-test-master", str(exp2).encode(), _hh.sha256).hexdigest()
+r = c.get("/admin/api/overview", cookies={"dp_admin": f"{exp2}.{sig2}"})
+assert "dp_admin" not in r.headers.get("set-cookie", "")
+print("sliding session renewal OK")
+
 # --- status + ping shape ---
 r = c.get("/admin/api/status", cookies={"dp_admin": cookie})
 d = r.json()

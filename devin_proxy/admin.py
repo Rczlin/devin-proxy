@@ -155,9 +155,21 @@ def make_router(app):
         return auth.startswith("Bearer ") \
             and hmac.compare_digest(auth[7:], key)
 
-    def admin_key(request: Request):
+    def admin_key(request: Request, response: Response):
         if not _authed(request):
             raise HTTPException(401, "unauthorized")
+        # sliding session renewal: if the cookie is past half its TTL,
+        # silently re-issue it so an active session never expires mid-use
+        tok = request.cookies.get(_SESS_COOKIE, "")
+        try:
+            exp = int(tok.split(".", 1)[0])
+            if 0 < exp - time.time() < _SESS_TTL / 2:
+                response.set_cookie(
+                    _SESS_COOKIE, _sess_token(), max_age=_SESS_TTL,
+                    path="/admin", httponly=True, samesite="lax",
+                    secure=request.url.scheme == "https")
+        except (ValueError, IndexError):
+            pass
 
     class LoginBody(BaseModel):
         key: str = ""
