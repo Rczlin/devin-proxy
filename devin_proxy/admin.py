@@ -217,6 +217,7 @@ def make_router(app):
         } for a in accs]
         d["pool"] = p
         d["uptime_s"] = time.time() - started
+        d["disk"] = store.disk_status()
         return d
 
     @router.get("/api/requests", dependencies=[Depends(admin_key)])

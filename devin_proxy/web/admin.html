@@ -166,6 +166,7 @@ tr:hover td.ops{background:#1a2129}
           <a data-h="1">1小时</a><a data-h="24" class="on">24小时</a>
           <a data-h="168">7天</a><a data-h="720">30天</a><a data-h="0">全部</a>
         </div>
+        <label class="muted" title="每 15 秒自动刷新"><input type="checkbox" id="dash-auto" checked> 自动刷新</label>
         <span style="flex:1"></span>
         <span class="muted"><span class="livedot"></span> <span id="dash-time"></span></span>
       </div>
@@ -461,6 +462,7 @@ async function loadDash(){
 function renderDashCards(d){
   const rate=d.total?100*(d.total-d.errors)/d.total:null;
   const pool=d.pool||{};
+  const disk=d.disk||{};
   const cards=[
     {k:'请求数',v:fmt(d.total),sub:`今日 ${fmt(d.today.requests)} · 累计 ${fmt(d.alltime.requests)}`},
     {k:'成功率',v:rate==null?'-':rate.toFixed(1)+'%',sub:`错误 ${d.errors}`,cls:rate==null?'':rate>=99?'green':rate>=95?'yellow':'red'},
@@ -473,12 +475,14 @@ function renderDashCards(d){
     {k:'在途请求',v:pool.in_flight||0,sub:`钉扎会话 ${pool.sessions||0}`},
     {k:'账号就绪',v:`${pool.ready||0}/${pool.total||0}`,sub:`冷却 ${pool.cooldown||0} · 启用 ${pool.enabled||0}`,cls:pool.total?(pool.ready?'green':'red'):'',click:'accs'},
     {k:'断流 · 重试',v:`${d.truncated||0} · ${d.retried||0}`,sub:'点击筛选断流日志',cls:d.truncated?'red':'',click:'trunc'},
+    ...(disk.total?[{k:'磁盘剩余',v:fmtB(disk.free),sub:`${fmtB((disk.total||0)-(disk.free||0))} 已用 / ${fmtB(disk.total)}`,cls:disk.low?'red':disk.free/disk.total<0.15?'yellow':'',click:'conf'}]:[]),
   ];
   $('#cards').innerHTML=cards.map(c=>
     `<div class="card${c.click?' link':''}"${c.click?` onclick="cardGo('${c.click}')"`:''}><div class="k">${c.k}</div><div class="v ${c.cls}">${c.v}</div><div class="sub" title="${esc(c.sub)}">${esc(c.sub)}</div></div>`).join('');
 }
 function cardGo(k){
   if(k==='accs')return goPage('accs');
+  if(k==='conf')return goPage('conf');
   if(k==='trunc'){goPage('reqs');$('#rq-flag').value='truncated';reqOffset=0;loadReqs()}
 }
 function renderPool(d){
@@ -1186,7 +1190,7 @@ async function pingUp(){
 async function boot(){
   try{ await Promise.all([loadDash(),loadConf()]) }catch(e){}
 }
-setInterval(()=>{if($('#p-dash').classList.contains('on'))loadDash().catch(()=>{})},15000);
+setInterval(()=>{if($('#p-dash').classList.contains('on')&&$('#dash-auto').checked)loadDash().catch(()=>{})},15000);
 boot();
 </script>
 </body>
