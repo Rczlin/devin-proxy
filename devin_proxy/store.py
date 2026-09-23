@@ -540,11 +540,15 @@ def prune_requests(model=None, ok=None, q=None, account=None, flag=None,
     with _lock:
         ids = [r["id"] for r in _conn().execute(
             f"SELECT id FROM requests{where}", args).fetchall()]
-        if ids:
-            ph = ",".join("?" * len(ids))
+        # chunked deletes: SQLite caps bound variables (~999 default, 32766
+        # on new builds) — a big filtered prune would blow past it.
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            ph = ",".join("?" * len(chunk))
             _conn().execute(
-                f"DELETE FROM captures WHERE request_id IN ({ph})", ids)
-            _conn().execute(f"DELETE FROM requests WHERE id IN ({ph})", ids)
+                f"DELETE FROM captures WHERE request_id IN ({ph})", chunk)
+            _conn().execute(
+                f"DELETE FROM requests WHERE id IN ({ph})", chunk)
         _conn().commit()
     return len(ids)
 
