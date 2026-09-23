@@ -213,6 +213,8 @@ function connectLive(){
   };
   ws.onclose=ev=>{
     liveDot(false);
+    if(ev.code!==1000&&ev.code!==1005)
+      console.warn('live ws closed:',ev.code,ev.reason||'');
     // 4401 = the handshake cookie expired mid-session. The polling calls
     // may have already slid-renewed the jar, so retry once before
     // concluding we're really logged out.
