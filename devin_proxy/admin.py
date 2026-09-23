@@ -610,7 +610,11 @@ def make_router(app):
         t0 = time.perf_counter()
         force = None
         if body.get("account_id"):
-            force = app.state.pool.get(int(body["account_id"]))
+            try:
+                aid = int(body["account_id"])
+            except (TypeError, ValueError):
+                raise HTTPException(400, "account_id must be an integer")
+            force = app.state.pool.get(aid)
             if not force:
                 raise HTTPException(404, "account not found")
         request.state.key_name = "admin"
