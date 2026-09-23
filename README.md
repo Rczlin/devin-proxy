@@ -133,7 +133,10 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   Every row/bar is clickable to filter the request log
 - **请求日志** — every request logged (model, endpoint, account, tokens,
   latency, status, caller key, messages); filter by model/status/flag/text/
-  account, paginate, inspect detail, or purge. Retention capped by
+  account, paginate, inspect detail, or purge — either everything, or just
+  the current filter selection (incl. `older_than_hours`). Export the
+  filtered log as CSV/JSONL, or rebuild one request as a runnable curl
+  command from its detail view. Retention capped by
   `DEVIN_PROXY_MAX_ROWS` (default 50000). Each row also stores the raw
   request body, a timestamped **upstream event timeline** (every delta /
   tool-call / stop_reason / trailer error / failover) and **every SSE
@@ -168,7 +171,8 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   restorable), and an extra JSON catalog URL
   (`DEVIN_PROXY_MODELS_URL`) merged into the list
 - **Playground** — test any model streaming or not, straight from the UI;
-  optionally pin to a specific account
+  multi-turn with preserved history, reasoning shown inline, optionally
+  pin to a specific account
 - **API Keys** — mint `sk-dp-…` keys for callers (SHA-256 hashed in the
   DB, shown once); enable/disable/delete. Per-key limits: model allowlist
   (uid or alias — `/v1/models` then returns only those) and a concurrency
@@ -176,6 +180,13 @@ SQLite (`%APPDATA%\devin-proxy\devin-proxy.db`, override with
   `Authorization: Bearer`
 - **状态** — pool summary, upstream connectivity check across accounts,
   DB path/size, uptime
+
+Hardening: the login endpoint is rate-limited per IP (5 failed attempts /
+5 min → 429), the master-key check is constant-time, auth is cookie or
+`Authorization: Bearer` only (the key is never accepted in a URL), every
+response carries `X-Content-Type-Options`/`X-Frame-Options`/
+`Referrer-Policy` (`Cache-Control: no-store` on `/admin`), and the
+diagnostic bundle streams to the client instead of building in memory.
 
 ## Endpoints
 
