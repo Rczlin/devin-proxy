@@ -28,6 +28,8 @@ def register(router, ctx, admin_key):
         name = body.name.strip()
         if not name:
             raise HTTPException(400, "name required")
+        if body.max_concurrent < 0:
+            raise HTTPException(400, "max_concurrent must be >= 0")
         return {"key": store.create_key(name, models=body.models,
                                         max_concurrent=body.max_concurrent)}
 
@@ -41,6 +43,8 @@ def register(router, ctx, admin_key):
         if body.models is not None:
             fields["models"] = body.models
         if body.max_concurrent is not None:
+            if body.max_concurrent < 0:
+                raise HTTPException(400, "max_concurrent must be >= 0")
             fields["max_concurrent"] = body.max_concurrent
         if fields and not store.update_key(kid, **fields):
             raise HTTPException(404, "key not found")

@@ -2,6 +2,7 @@
 CSV/JSONL export, error rollup."""
 import io
 import json
+import math
 import time
 
 from fastapi import Depends, HTTPException, Response
@@ -90,6 +91,10 @@ def register(router, ctx, admin_key):
         """Delete logged requests. With no filters this wipes everything;
         with filters (same as GET /api/requests plus an age cutoff) it prunes
         just the matching rows — keeps the useful history intact."""
+        if (older_than_hours is not None
+                and (not math.isfinite(older_than_hours)
+                     or older_than_hours < 0)):
+            raise HTTPException(400, "older_than_hours must be finite and >= 0")
         if not any(v is not None for v in
                    (model, ok, q, account, flag, older_than_hours)):
             store.clear_requests()
