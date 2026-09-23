@@ -211,6 +211,20 @@ def make_router(app):
             return RedirectResponse("/admin")
         return HTMLResponse(open(_HTML, encoding="utf-8").read())
 
+    _WEB = os.path.dirname(_HTML)
+    _STATic = {"admin.css": "text/css", "admin.js": "application/javascript"}
+
+    @router.get("/static/{name}", dependencies=[Depends(admin_key)])
+    def static_asset(name: str):
+        """SPA assets live next to admin.html — served only to authed
+        sessions so the console code isn't exposed pre-login."""
+        if name not in _STATic:
+            raise HTTPException(404, "not found")
+        return Response(
+            open(os.path.join(_WEB, name), encoding="utf-8").read(),
+            media_type=_STATic[name],
+            headers={"Cache-Control": "no-cache"})
+
     @router.get("/api/overview", dependencies=[Depends(admin_key)])
     def overview(hours: int = 24):
         if hours < 0 or hours > 24 * 366:

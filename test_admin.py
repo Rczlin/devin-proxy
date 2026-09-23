@@ -9,7 +9,10 @@ c = TestClient(app)
 # --- unauthenticated ---
 r = c.get("/admin/api/overview")
 assert r.status_code == 401, r.status_code
-print("unauth overview -> 401 OK")
+# spa assets are behind auth too
+assert c.get("/admin/static/admin.js").status_code == 401
+assert c.get("/admin/static/admin.css").status_code == 401
+print("unauth overview + assets -> 401 OK")
 
 # security headers present on every /admin response
 r = c.get("/admin")
@@ -28,7 +31,11 @@ cookie = r.cookies.get("dp_admin")
 assert cookie
 r = c.get("/admin/api/overview", cookies={"dp_admin": cookie})
 assert r.status_code == 200 and "pool" in r.json()
-print("login + session OK")
+# authed asset fetch works
+for n in ("admin.css", "admin.js"):
+    r2 = c.get("/admin/static/" + n, cookies={"dp_admin": cookie})
+    assert r2.status_code == 200 and len(r2.content) > 1000
+print("login + session + assets OK")
 
 # bearer master key works too
 r = c.get("/admin/api/overview",
