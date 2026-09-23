@@ -212,17 +212,28 @@ def make_router(app):
         return HTMLResponse(open(_HTML, encoding="utf-8").read())
 
     _WEB = os.path.dirname(_HTML)
-    _STATic = {"admin.css": "text/css", "admin.js": "application/javascript"}
+    _MIME = {".css": "text/css", ".js": "application/javascript"}
+    _STATIC_ROOTS = ("admin.css", "js/")
 
-    @router.get("/static/{name}", dependencies=[Depends(admin_key)])
+    @router.get("/static/{name:path}", dependencies=[Depends(admin_key)])
     def static_asset(name: str):
         """SPA assets live next to admin.html — served only to authed
-        sessions so the console code isn't exposed pre-login."""
-        if name not in _STATic:
+        sessions so the console code isn't exposed pre-login. Whitelisted to
+        admin.css and js/*.js; anything else (incl. .. traversal) 404s."""
+        name = name.replace("\\", "/").lstrip("/")
+        if not (name == "admin.css"
+                or (name.startswith("js/") and name.endswith(".js")
+                    and ".." not in name)):
             raise HTTPException(404, "not found")
-        return Response(
-            open(os.path.join(_WEB, name), encoding="utf-8").read(),
-            media_type=_STATic[name],
+        path = os.path.normpath(os.path.join(_WEB, name))
+        if not path.startswith(os.path.abspath(_WEB)):
+            raise HTTPException(404, "not found")
+        try:
+            body = open(path, encoding="utf-8").read()
+        except OSError:
+            raise HTTPException(404, "not found")
+        return Response(body, media_type=_MIME.get(
+            os.path.splitext(name)[1], "text/plain"),
             headers={"Cache-Control": "no-cache"})
 
     @router.get("/api/overview", dependencies=[Depends(admin_key)])
