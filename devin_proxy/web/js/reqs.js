@@ -58,7 +58,7 @@ function reqPage(d){
   else{reqCursor=reqHist.pop()??null}
   loadReqs();
 }
-setInterval(()=>{if($('#p-reqs').classList.contains('on')&&$('#rq-auto').checked)loadReqs().catch(()=>{})},5000);
+autoRefresh('rq-auto','rq-intv','#p-reqs',loadReqs);
 async function clearReqs(){
   const f=reqFilters();
   const msg=f?`删除当前筛选命中的 ${reqTotal} 条日志？不可恢复。`:'确定清空全部请求日志？不可恢复。';

@@ -49,5 +49,5 @@ async function boot(){
   connectLive();
   try{ await Promise.all([loadDash(),loadConf()]) }catch(e){}
 }
-setInterval(()=>{if($('#p-dash').classList.contains('on')&&$('#dash-auto').checked)loadDash().catch(()=>{})},15000);
+autoRefresh('dash-auto','dash-intv','#p-dash',loadDash);
 boot();

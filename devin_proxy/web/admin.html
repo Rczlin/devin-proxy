@@ -30,7 +30,12 @@
           <a data-h="1">1小时</a><a data-h="24" class="on">24小时</a>
           <a data-h="168">7天</a><a data-h="720">30天</a><a data-h="0">全部</a>
         </div>
-        <label class="muted" title="并发/账号状态经 WebSocket 实时推送；勾选后图表统计每 15s 并随推送自动刷新"><input type="checkbox" id="dash-auto" checked> 自动刷新</label>
+        <label class="muted" title="并发/账号状态经 WebSocket 实时推送；勾选后图表统计按选定间隔并随推送自动刷新"><input type="checkbox" id="dash-auto" checked> 自动刷新</label>
+        <select id="dash-intv" class="intv" title="自动刷新间隔（勾选「自动刷新」后生效）" disabled>
+          <option value="5">5s</option><option value="10">10s</option>
+          <option value="15" selected>15s</option><option value="30">30s</option>
+          <option value="60">60s</option>
+        </select>
         <button class="mini" onclick="refreshPage(this)" title="重新加载仪表盘数据">↻ 刷新</button>
         <span style="flex:1"></span>
         <span class="muted"><span class="livedot"></span> <span id="dash-time"></span></span>
@@ -83,7 +88,12 @@
         <input id="rq-id" placeholder="#ID" type="number" style="width:80px" title="输入请求 ID 直接打开详情">
         <button class="primary" onclick="reqReset();loadReqs()">筛选</button>
         <span id="rq-acct-chip"></span>
-        <label class="muted" title="每 5 秒刷新当前页"><input type="checkbox" id="rq-auto"> 自动刷新</label>
+        <label class="muted" title="按选定间隔刷新当前页"><input type="checkbox" id="rq-auto"> 自动刷新</label>
+        <select id="rq-intv" class="intv" title="自动刷新间隔（勾选「自动刷新」后生效）" disabled>
+          <option value="5" selected>5s</option><option value="10">10s</option>
+          <option value="15">15s</option><option value="30">30s</option>
+          <option value="60">60s</option>
+        </select>
         <button class="mini" onclick="refreshPage(this)" title="重新加载请求列表">↻ 刷新</button>
         <span class="muted" id="rq-total"></span>
         <span style="flex:1"></span>
