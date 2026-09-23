@@ -201,7 +201,9 @@ def make_router(app):
 
     @router.get("/api/overview", dependencies=[Depends(admin_key)])
     def overview(hours: int = 24):
-        d = store.stats_overview(hours if 0 < hours <= 24 * 366 else None)
+        if hours < 0 or hours > 24 * 366:
+            raise HTTPException(400, f"hours must be 0..{24*366} (0 = all)")
+        d = store.stats_overview(hours or None)
         accs = app.state.pool.accounts()
         now = time.time()
         p = app.state.pool.summary()
@@ -237,6 +239,8 @@ def make_router(app):
         columns — no request/response bodies; use /api/export for full
         fidelity). Same filters as the list endpoint."""
         import csv
+        if fmt not in ("jsonl", "csv"):
+            raise HTTPException(400, "fmt must be jsonl or csv")
         items, _ = store.list_requests(max(1, min(limit, _MAX_EXPORT)),
                                        0, model, ok, q, account, flag)
         fn = "requests-" + time.strftime("%Y%m%d-%H%M%S")

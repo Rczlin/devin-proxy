@@ -122,6 +122,15 @@ r = c.get("/admin/api/requests", cookies=cookie_hdr)
 assert r.json()["total"] == 0
 print("filtered prune + clear OK")
 
+# --- input validation edges (must not 500 or silently misfire) ---
+H = {"Authorization": "Bearer sk-test-master"}
+assert c.get("/admin/api/overview?hours=-5", headers=H).status_code == 400
+assert c.get("/admin/api/overview?hours=99999999", headers=H).status_code == 400
+assert c.get("/admin/api/overview?hours=24", headers=H).status_code == 200
+assert c.get("/admin/api/requests/export?fmt=xml", headers=H).status_code == 400
+assert c.get("/admin/api/requests/export?fmt=csv", headers=H).status_code == 200
+print("input validation OK")
+
 # --- status + ping shape ---
 r = c.get("/admin/api/status", cookies={"dp_admin": cookie})
 d = r.json()
