@@ -149,9 +149,13 @@ def make_router(app):
         if _sess_ok(request.cookies.get(_SESS_COOKIE, "")):
             return True
         key = app.state.proxy_key
+        if not key:
+            return False
         auth = request.headers.get("authorization", "")
-        return bool(key) and (auth == f"Bearer {key}"
-                              or request.query_params.get("key") == key)
+        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], key):
+            return True
+        qp = request.query_params.get("key")
+        return bool(qp) and hmac.compare_digest(qp, key)
 
     def admin_key(request: Request):
         if not _authed(request):
