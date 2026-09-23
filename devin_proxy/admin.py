@@ -631,12 +631,14 @@ def make_router(app):
             fields["models"] = body.models
         if body.max_concurrent is not None:
             fields["max_concurrent"] = body.max_concurrent
-        store.update_key(kid, **fields)
+        if fields and not store.update_key(kid, **fields):
+            raise HTTPException(404, "key not found")
         return {"ok": True}
 
     @router.delete("/api/keys/{kid}", dependencies=[Depends(admin_key)])
     def del_key(kid: int):
-        store.delete_key(kid)
+        if not store.delete_key(kid):
+            raise HTTPException(404, "key not found")
         return {"ok": True}
 
     # ---------- upstream accounts ----------
