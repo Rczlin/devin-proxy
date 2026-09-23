@@ -33,23 +33,6 @@ def register(router, ctx, admin_key):
     def status():
         c = store.counts()
         ov = store.stats_overview()
-        # dependency + ws-route self-diagnosis: the live feed broke once on a
-        # deploy whose pip-resolved fastapi/starlette combo stopped matching an
-        # include_router'ed websocket. Report versions and whether /admin/api/ws
-        # actually made it onto the app so a regression is one GET away.
-        deps = {}
-        for pkg in ("fastapi", "starlette", "uvicorn"):
-            try:
-                mod = __import__(pkg)
-                deps[pkg] = getattr(mod, "__version__", "?")
-            except Exception:
-                deps[pkg] = None
-        ws_routes = [
-            getattr(r, "path", "")
-            for r in ctx.app.routes
-            if "WebSocket" in type(r).__name__
-               or "websocket" in type(r).__name__.lower()
-        ]
         return {
             "accounts": ctx.app.state.pool.summary(),
             "key_required": bool(ctx.app.state.proxy_key) or store.has_keys(),
@@ -61,8 +44,6 @@ def register(router, ctx, admin_key):
             "keys_count": c["keys"],
             "uptime_s": time.time() - ctx.started,
             "python": sys.version.split()[0],
-            "deps": deps,
-            "ws_routes": ws_routes,
             "disk": store.disk_status(),
         }
 
