@@ -392,6 +392,7 @@ tr:hover td.ops{background:#1a2129}
     <div style="display:flex;justify-content:space-between;margin-top:12px">
       <span>
         <button onclick="copyPane()">📋 复制当前页内容</button>
+        <button onclick="copyCurl()" title="用记录的请求体重建可直接执行的 curl 命令">🔁 复制 curl</button>
         <button onclick="dlCapture()" title="下载该请求的完整抓包(原始请求体/上游protobuf/全部响应帧,不截断)">📥 抓包</button>
       </span>
       <button onclick="modal.classList.remove('on')">关闭</button>
@@ -735,9 +736,11 @@ function renderEvents(js){
     return `<div class="evt ${cl}"><span class="ms">+${e.ms}ms</span><span class="kt">${esc(lb)}</span><span class="dt">${esc(evSummary(e))}</span></div>`;
   }).join(''):'<div class="muted" style="padding:10px">无上游事件记录（旧版本请求无此数据）</div>';
 }
+let MD_REQ=null;
 async function showReq(id){
   mdRid=id;
   const r=await (await api('/admin/api/requests/'+id)).json();
+  MD_REQ=r;
   $('#md-id').textContent='#'+r.id;
   $('#md-flags').innerHTML=flagTags(r.flags);
   const _cacheTot=(r.cached_tokens||0)+(r.prompt_tokens||0);
@@ -761,6 +764,14 @@ async function showReq(id){
 function copyPane(){
   const el=$('#md-p-'+MD_TAB).querySelector('pre,#md-ev,#md-kv');
   navigator.clipboard.writeText(el?el.textContent:'').then(()=>toast('已复制'));
+}
+function copyCurl(){
+  const r=MD_REQ;if(!r)return;
+  let body={};try{body=JSON.parse(r.request_json||'{}')}catch{}
+  const ep=(r.endpoint||'chat').includes('response')?'/v1/responses':'/v1/chat/completions';
+  const sh=s=>"'"+String(s).replace(/'/g,"'\\''")+"'";
+  const cmd=`curl ${location.origin}${ep} \\\n  -H 'Content-Type: application/json' \\\n  -H 'Authorization: Bearer <YOUR_API_KEY>' \\\n  -d ${sh(JSON.stringify(body))}`;
+  navigator.clipboard.writeText(cmd).then(()=>toast('curl 命令已复制（key 需自行填入）'));
 }
 
 // accounts
