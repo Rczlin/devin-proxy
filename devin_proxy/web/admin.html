@@ -444,7 +444,8 @@ document.querySelectorAll('.nav a').forEach(a=>a.onclick=()=>{
   document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('on'));
   document.querySelectorAll('.page').forEach(x=>x.classList.remove('on'));
   a.classList.add('on'); $('#p-'+a.dataset.p).classList.add('on');
-  ({dash:loadDash,reqs:loadReqs,accs:loadAccounts,models:loadModels,play:loadPlayground,keys:loadKeys,conf:loadConf})[a.dataset.p]();
+  const fn=({dash:loadDash,reqs:loadReqs,accs:loadAccounts,models:loadModels,play:loadPlayground,keys:loadKeys,conf:loadConf})[a.dataset.p];
+  fn().catch(e=>toast('加载失败: '+e.message));   // one bad page must not break nav
 });
 
 // ---------- dashboard ----------
@@ -684,7 +685,7 @@ async function loadReqs(){
     <td>${esc(r.account||'')}</td><td>${esc(r.key_name||'')}</td>
     <td class="ops"><button class="mini" onclick="event.stopPropagation();showReq(${r.id})">详情</button>${r.has_cap?` <button class="mini" onclick="event.stopPropagation();dlCapture(${r.id})" title="导出该请求完整抓包 JSON">📥 抓包</button>`:''}</td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';
   REQ_LAST_CURSOR=d.next_cursor;
-  loadErrRollup();
+  loadErrRollup().catch(()=>{});   // non-fatal — the table already rendered
 }
 async function loadErrRollup(){
   const d=await (await api('/admin/api/requests/errors?hours=24')).json();
