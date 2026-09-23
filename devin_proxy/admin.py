@@ -697,7 +697,17 @@ def make_router(app):
             "keys_count": c["keys"],
             "uptime_s": time.time() - started,
             "python": sys.version.split()[0],
+            "disk": store.disk_status(),
         }
+
+    @router.post("/api/maintenance/cleanup", dependencies=[Depends(admin_key)])
+    def maintenance_cleanup(aggressive: bool = False):
+        """Manually reclaim disk space: prune old request/capture/response/
+        session history, checkpoint the WAL and VACUUM. Same recovery path
+        used automatically when the disk fills up."""
+        result = store.free_space(aggressive=aggressive, vacuum=True)
+        result["disk"] = store.disk_status()
+        return result
 
     @router.get("/api/ping", dependencies=[Depends(admin_key)])
     def ping():

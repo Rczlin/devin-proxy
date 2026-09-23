@@ -1,9 +1,11 @@
 """SQLite persistence: request log, usage stats, proxy API keys, accounts."""
+import functools
 import gzip
 import hashlib
 import json
 import os
 import secrets
+import shutil
 import sqlite3
 import threading
 import time
@@ -20,20 +22,48 @@ _MAX_ROWS = int(os.environ.get("DEVIN_PROXY_MAX_ROWS", "50000"))
 # stream can be megabytes and the db should stay portable.
 _CAP_KEEP = int(os.environ.get("DEVIN_PROXY_CAP_KEEP", "300"))
 
+# ---------- disk-space resilience ----------
+# The proxy must keep serving requests even when the volume backing the db
+# is completely full. Two mechanisms cooperate:
+#  - a small sacrificial "reserve" file, deleted the instant we see a
+#    disk-full error, so the emergency cleanup below always has a little
+#    room to write into (freeing space itself needs *some* space: WAL mode
+#    appends before it can delete/checkpoint).
+#  - every state-mutating function is wrapped so a disk-full sqlite error
+#    is swallowed (and triggers that cleanup) instead of bubbling up and
+#    breaking the request that was otherwise served successfully.
+_MIN_FREE_MB = int(os.environ.get("DEVIN_PROXY_MIN_FREE_MB", "128"))
+_RESERVE_MB = int(os.environ.get("DEVIN_PROXY_RESERVE_MB", "8"))
+_EMERGENCY_ROWS = max(200, min(2000, _MAX_ROWS // 10))
+_MAINT_INTERVAL_S = 45
+_AUTO_CLEANUP_COOLDOWN_S = 20
+
 _lock = threading.Lock()
 _con = None
 _insert_count = 0
+_last_auto_cleanup = 0.0
+_maint_started = False
 
 
 def _conn():
     global _con
     if _con is None:
-        os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
-        _con = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        try:
+            os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
+            _con = sqlite3.connect(_DB_PATH, check_same_thread=False)
+        except (OSError, sqlite3.Error) as e:
+            # Disk full (or otherwise unwritable) even before we hold a
+            # connection — fall back to an in-memory db so the proxy can
+            # still start and serve traffic; persistence resumes once the
+            # file becomes writable again and the process is restarted.
+            print(f"devin-proxy: cannot open {_DB_PATH} ({e}); "
+                  "falling back to an in-memory db", flush=True)
+            _con = sqlite3.connect(":memory:", check_same_thread=False)
         _con.row_factory = sqlite3.Row
         _con.execute("PRAGMA journal_mode=WAL")
         _con.execute("PRAGMA busy_timeout=5000")
         _con.execute("PRAGMA synchronous=NORMAL")
+        _con.execute("PRAGMA temp_store=MEMORY")
         _con.executescript("""
         CREATE TABLE IF NOT EXISTS requests (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -141,6 +171,8 @@ def _conn():
             "models": "TEXT",
         })
         _con.commit()
+        _ensure_reserve()
+        _start_maintenance_thread()
     return _con
 
 
@@ -178,6 +210,172 @@ def _hash(key):
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+# ---------- disk-space resilience ----------
+
+def _reserve_path():
+    d = os.path.dirname(_DB_PATH) or "."
+    return os.path.join(d, ".devin-proxy-reserve")
+
+
+def _ensure_reserve():
+    """Best-effort: keep a small sacrificial file on disk. Deleting a file
+    needs no free space of its own, so this guarantees we can always claw
+    back a little room the instant we hit ENOSPC — enough for the DELETE +
+    WAL-checkpoint below to actually run. Never raises."""
+    if _DB_PATH == ":memory:":
+        return
+    path = _reserve_path()
+    need = _RESERVE_MB * 1024 * 1024
+    try:
+        if os.path.exists(path) and os.path.getsize(path) >= need:
+            return
+        with open(path, "wb") as f:
+            f.truncate(need)
+    except OSError:
+        pass  # disk is already full — nothing to spare yet
+
+
+def _release_reserve():
+    """Delete the sacrificial file, instantly freeing _RESERVE_MB."""
+    try:
+        os.remove(_reserve_path())
+        return True
+    except OSError:
+        return False
+
+
+def disk_status():
+    """Free/total bytes on the volume backing the db, plus current size."""
+    d = os.path.dirname(_DB_PATH) or "."
+    try:
+        u = shutil.disk_usage(d)
+        free, total = u.free, u.total
+    except OSError:
+        free = total = None
+    return {
+        "free": free, "total": total,
+        "low": free is not None and free < _MIN_FREE_MB * 1024 * 1024,
+        "reserve_mb": _RESERVE_MB,
+        "reserve_active": os.path.exists(_reserve_path()),
+        "db_size": _safe_db_size(),
+    }
+
+
+def _safe_db_size():
+    try:
+        return os.path.getsize(_DB_PATH) if os.path.exists(_DB_PATH) else 0
+    except OSError:
+        return 0
+
+
+def _is_space_error(exc):
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    msg = str(exc).lower()
+    return any(s in msg for s in ("disk", "full", "no space", "i/o error"))
+
+
+def _maybe_auto_cleanup():
+    """Rate-limited trigger, called from the write-error path so a burst of
+    failing writes doesn't each pay for a full cleanup pass."""
+    global _last_auto_cleanup
+    now = time.time()
+    if now - _last_auto_cleanup < _AUTO_CLEANUP_COOLDOWN_S:
+        return
+    _last_auto_cleanup = now
+    free_space(aggressive=True, vacuum=False)
+
+
+def _resilient(default=None):
+    """Decorator for state-mutating store functions: a disk-full (or other)
+    sqlite error is logged and swallowed instead of propagating — callers
+    on the request path must never fail just because logging/accounting
+    couldn't be persisted."""
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **kw):
+            try:
+                return fn(*a, **kw)
+            except sqlite3.Error as e:
+                if _is_space_error(e):
+                    _maybe_auto_cleanup()
+                else:
+                    print(f"devin-proxy: store.{fn.__name__} failed: {e}",
+                          flush=True)
+                return default() if callable(default) else default
+        return wrapper
+    return deco
+
+
+def free_space(aggressive=True, vacuum=True):
+    """Reclaim disk space: drop the sacrificial reserve, prune old request/
+    capture/response/session history, checkpoint the WAL and (optionally)
+    VACUUM. Safe to call anytime — holds the same lock as every other
+    write, never raises, and is exposed to the admin UI as a manual
+    "free up space" action as well as being used for emergency recovery."""
+    freed_reserve = _release_reserve()
+    before = _safe_db_size()
+    keep = _EMERGENCY_ROWS if aggressive else max(_EMERGENCY_ROWS, _MAX_ROWS // 2)
+    try:
+        with _lock:
+            con = _con
+            if con is None:
+                return {"freed_reserve": freed_reserve, "freed_bytes": 0,
+                        "db_size_before": before, "db_size_after": before}
+            con.execute(
+                "DELETE FROM requests WHERE id < "
+                "(SELECT MIN(id) FROM (SELECT id FROM requests"
+                " ORDER BY id DESC LIMIT ?))", (keep,))
+            con.execute("DELETE FROM captures WHERE request_id NOT IN "
+                       "(SELECT id FROM requests)")
+            if aggressive:
+                con.execute(
+                    "DELETE FROM captures WHERE ok=1 AND request_id NOT IN "
+                    "(SELECT request_id FROM captures WHERE ok=1"
+                    " ORDER BY request_id DESC LIMIT 20)")
+            cutoff = time.time() - (3600 if aggressive else 86400)
+            con.execute("DELETE FROM responses WHERE created<?", (cutoff,))
+            con.execute("DELETE FROM sessions WHERE updated<?", (cutoff,))
+            con.commit()
+            try:
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error:
+                pass
+            if vacuum:
+                try:
+                    con.execute("VACUUM")
+                except sqlite3.Error:
+                    pass
+    except sqlite3.Error:
+        pass
+    after = _safe_db_size()
+    _ensure_reserve()
+    return {"freed_reserve": freed_reserve,
+            "freed_bytes": max(0, before - after),
+            "db_size_before": before, "db_size_after": after}
+
+
+def _start_maintenance_thread():
+    global _maint_started
+    if _maint_started:
+        return
+    _maint_started = True
+
+    def loop():
+        while True:
+            time.sleep(_MAINT_INTERVAL_S)
+            try:
+                st = disk_status()
+                if st["low"]:
+                    free_space(aggressive=True, vacuum=False)
+                elif not st["reserve_active"]:
+                    _ensure_reserve()
+            except Exception:
+                pass
+    threading.Thread(target=loop, daemon=True, name="devin-proxy-maint").start()
+
+
+@_resilient(default=None)
 def log_request(model, resolved_model, stream, ok, status, error,
                 prompt_tokens, completion_tokens, latency_ms, ttft_ms,
                 client, key_name, messages_json, account=None, endpoint=None,
@@ -185,6 +383,8 @@ def log_request(model, resolved_model, stream, ok, status, error,
                 cached_tokens=0, cache_creation_tokens=0, gen_ms=None,
                 tps=None, upstream_model=None, upstream_msg_id=None,
                 upstream_req_id=None):
+    """-> new row id, or None if the write couldn't be persisted (e.g. the
+    disk is full) — the request itself must still succeed either way."""
     global _insert_count
     with _lock:
         cur = _conn().execute(
@@ -212,10 +412,13 @@ def log_request(model, resolved_model, stream, ok, status, error,
         return cur.lastrowid
 
 
+@_resilient(default=None)
 def save_capture(request_id, ok, payload):
     """Store a full-fidelity capture (dict -> gzip blob) for one request row.
     Failure captures are kept forever; success captures are pruned to the
     newest _CAP_KEEP. Never raises — capture must not break the request."""
+    if request_id is None:
+        return
     try:
         blob = gzip.compress(json.dumps(payload, ensure_ascii=False,
                                         default=str).encode())
@@ -233,6 +436,7 @@ def save_capture(request_id, ok, payload):
         _conn().commit()
 
 
+@_resilient(default=None)
 def get_capture(request_id):
     with _lock:
         r = _conn().execute("SELECT data FROM captures WHERE request_id=?",
@@ -245,6 +449,7 @@ def get_capture(request_id):
         return None
 
 
+@_resilient(default=list)
 def export_captures():
     """[{request_id, ok, data(gzip blob)}] for the diagnostic bundle."""
     with _lock:
@@ -283,6 +488,7 @@ _REQ_LIST_COLS = ("id,ts,model,resolved_model,stream,ok,status,error,"
                   " WHERE c.request_id=requests.id) has_cap")
 
 
+@_resilient(default=lambda: ([], 0))
 def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None,
                   flag=None):
     where, args = _where(model, ok, q, account, flag)
@@ -296,12 +502,14 @@ def list_requests(limit=50, offset=0, model=None, ok=None, q=None, account=None,
     return [dict(r) for r in rows], total
 
 
+@_resilient(default=None)
 def get_request(rid):
     with _lock:
         r = _conn().execute("SELECT * FROM requests WHERE id=?", (rid,)).fetchone()
     return dict(r) if r else None
 
 
+@_resilient(default=None)
 def clear_requests():
     with _lock:
         _conn().execute("DELETE FROM requests")
@@ -310,6 +518,33 @@ def clear_requests():
 
 
 def stats_overview(hours=24):
+    """Windowed stats for the dashboard — never raises. Falls back to an
+    all-zero snapshot if the db can't be read (e.g. mid disk-full)."""
+    try:
+        return _stats_overview_impl(hours)
+    except sqlite3.Error as e:
+        if _is_space_error(e):
+            _maybe_auto_cleanup()
+        return _empty_overview(hours)
+
+
+def _empty_overview(hours):
+    now = time.time()
+    return {
+        "hours": hours or 0, "bucket_s": 0, "since": now, "now": now,
+        "total": 0, "errors": 0, "streams": 0, "input_tokens": 0,
+        "output_tokens": 0, "cached_tokens": 0, "cache_creation_tokens": 0,
+        "cache_hit_pct": 0, "avg_tps": 0, "avg_latency_ms": 0,
+        "avg_ttft_ms": 0, "p50_ms": 0, "p95_ms": 0, "rpm": 0, "tpm": 0,
+        "truncated": 0, "retried": 0,
+        "today": {"requests": 0, "input_tokens": 0, "output_tokens": 0},
+        "alltime": {"requests": 0}, "series": [],
+        "by_model": [], "by_account": [], "by_key": [], "by_endpoint": [],
+        "recent_errors": [], "db_size": _safe_db_size(), "max_rows": _MAX_ROWS,
+    }
+
+
+def _stats_overview_impl(hours=24):
     """Windowed stats for the dashboard. hours<=0/None = all time.
 
     The time series is bucketed adaptively (5m/30m/1h/4h/1d) and returned
@@ -419,7 +654,7 @@ def stats_overview(hours=24):
           SELECT COUNT(*) total, SUM(prompt_tokens) in_tok,
                  SUM(completion_tokens) out_tok
           FROM requests WHERE ts>=?""", (today,)).fetchone()
-        db_size = os.path.getsize(_DB_PATH) if os.path.exists(_DB_PATH) else 0
+        db_size = _safe_db_size()
     return {
         "hours": hours or 0,
         "bucket_s": bucket,
@@ -463,6 +698,7 @@ def _tz_offset():
     return -time.timezone if not time.daylight else -time.altzone
 
 
+@_resilient(default=list)
 def list_models():
     with _lock:
         rows = _conn().execute("""
@@ -485,6 +721,7 @@ def _models_text(models):
     return ",".join(models) if models else None
 
 
+@_resilient(default=None)
 def create_key(name, models=None, max_concurrent=0):
     key = "sk-dp-" + secrets.token_urlsafe(24)
     with _lock:
@@ -497,6 +734,7 @@ def create_key(name, models=None, max_concurrent=0):
     return key
 
 
+@_resilient(default=list)
 def list_keys():
     with _lock:
         rows = _conn().execute(
@@ -505,12 +743,14 @@ def list_keys():
     return [dict(r) for r in rows]
 
 
+@_resilient(default=None)
 def delete_key(kid):
     with _lock:
         _conn().execute("DELETE FROM api_keys WHERE id=?", (kid,))
         _conn().commit()
 
 
+@_resilient(default=None)
 def update_key(kid, **fields):
     cols = {"name", "disabled", "models", "max_concurrent"}
     sets, args = [], []
@@ -537,8 +777,12 @@ def set_key_disabled(kid, disabled):
 
 
 def key_info(key):
-    """-> full key row for a presented bearer key, else None."""
+    """-> full key row for a presented bearer key, else None. Authentication
+    must keep working even if the disk is full: the row lookup always runs,
+    and only the best-effort `last_used` timestamp write is guarded so a
+    failed write can never turn a valid key into a rejected request."""
     h = _hash(key)
+    space_error = False
     with _lock:
         r = _conn().execute(
             "SELECT id,name,disabled,models,max_concurrent,last_used "
@@ -546,9 +790,15 @@ def key_info(key):
         now = time.time()
         if (r is not None and not r["disabled"]
                 and now - (r["last_used"] or 0) > 60):
-            _conn().execute("UPDATE api_keys SET last_used=? WHERE key_hash=?",
-                            (now, h))
-            _conn().commit()
+            try:
+                _conn().execute(
+                    "UPDATE api_keys SET last_used=? WHERE key_hash=?",
+                    (now, h))
+                _conn().commit()
+            except sqlite3.Error as e:
+                space_error = _is_space_error(e)
+    if space_error:
+        _maybe_auto_cleanup()  # must run outside _lock — it re-acquires it
     if r is None:
         return None
     d = dict(r)
@@ -556,12 +806,15 @@ def key_info(key):
     return d
 
 
+@_resilient(default=lambda: True)  # fail closed: assume auth required
 def has_keys():
     with _lock:
         return _conn().execute(
             "SELECT COUNT(*) c FROM api_keys").fetchone()["c"] > 0
 
 
+@_resilient(default=lambda: {"requests": 0, "keys": 0, "accounts": 0,
+                             "captures": 0})
 def counts():
     with _lock:
         reqs = _conn().execute("SELECT COUNT(*) c FROM requests").fetchone()["c"]
@@ -574,10 +827,12 @@ def counts():
 
 # ---------- upstream accounts ----------
 
+@_resilient(default=None)
 def add_account(token, name=None, email=None, api_server_url=None,
                 devin_webapp_host=None, devin_api_url=None, source=None,
                 plan=None):
-    """Insert an upstream account; dedup by token. -> row dict or None if dup."""
+    """Insert an upstream account; dedup by token. -> row dict or None if dup
+    (or if the write couldn't be persisted, e.g. disk full)."""
     with _lock:
         try:
             cur = _conn().execute(
@@ -594,6 +849,7 @@ def add_account(token, name=None, email=None, api_server_url=None,
             return None
 
 
+@_resilient(default=None)
 def update_account(aid, **fields):
     cols = {"name", "email", "api_server_url", "devin_webapp_host",
             "devin_api_url", "plan", "disabled", "fail_count",
@@ -616,18 +872,21 @@ def update_account(aid, **fields):
         _conn().commit()
 
 
+@_resilient(default=None)
 def get_account(aid):
     with _lock:
         r = _conn().execute("SELECT * FROM accounts WHERE id=?", (aid,)).fetchone()
     return dict(r) if r else None
 
 
+@_resilient(default=list)
 def list_accounts():
     with _lock:
         rows = _conn().execute("SELECT * FROM accounts ORDER BY id").fetchall()
     return [dict(r) for r in rows]
 
 
+@_resilient(default=None)
 def delete_account(aid):
     with _lock:
         _conn().execute("DELETE FROM accounts WHERE id=?", (aid,))
@@ -635,6 +894,7 @@ def delete_account(aid):
         _conn().commit()
 
 
+@_resilient(default=dict)
 def account_stats():
     with _lock:
         rows = _conn().execute("""
@@ -647,6 +907,7 @@ def account_stats():
 
 # ---------- session pinning ----------
 
+@_resilient(default=None)
 def set_pin(session_key, account_id):
     with _lock:
         _conn().execute(
@@ -657,6 +918,7 @@ def set_pin(session_key, account_id):
         _conn().commit()
 
 
+@_resilient(default=None)
 def touch_pins(pairs):
     """Batch-refresh `updated` on existing pins. pairs: [(updated, key), ...]"""
     if not pairs:
@@ -667,6 +929,7 @@ def touch_pins(pairs):
         _conn().commit()
 
 
+@_resilient(default=list)
 def list_pins():
     with _lock:
         rows = _conn().execute("""
@@ -676,12 +939,14 @@ def list_pins():
     return [dict(r) for r in rows]
 
 
+@_resilient(default=None)
 def unpin(session_key):
     with _lock:
         _conn().execute("DELETE FROM sessions WHERE session_key=?", (session_key,))
         _conn().commit()
 
 
+@_resilient(default=None)
 def prune_pins(ttl_s):
     with _lock:
         _conn().execute("DELETE FROM sessions WHERE updated<?",
@@ -691,6 +956,7 @@ def prune_pins(ttl_s):
 
 # ---------- stored responses (previous_response_id chain) ----------
 
+@_resilient(default=None)
 def save_response(rid, model, status, account, session_key, items_json, response_json):
     with _lock:
         _conn().execute(
@@ -702,12 +968,14 @@ def save_response(rid, model, status, account, session_key, items_json, response
         _conn().commit()
 
 
+@_resilient(default=None)
 def get_response(rid):
     with _lock:
         r = _conn().execute("SELECT * FROM responses WHERE id=?", (rid,)).fetchone()
     return dict(r) if r else None
 
 
+@_resilient(default=lambda: False)
 def delete_response(rid):
     with _lock:
         cur = _conn().execute("DELETE FROM responses WHERE id=?", (rid,))
@@ -715,6 +983,7 @@ def delete_response(rid):
     return cur.rowcount > 0
 
 
+@_resilient(default=None)
 def prune_responses(ttl_s=86400):
     with _lock:
         _conn().execute("DELETE FROM responses WHERE created<?",
@@ -724,12 +993,14 @@ def prune_responses(ttl_s=86400):
 
 # ---------- meta kv ----------
 
+@_resilient(default=None)
 def meta_get(k):
     with _lock:
         r = _conn().execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
     return r["v"] if r else None
 
 
+@_resilient(default=None)
 def meta_set(k, v):
     with _lock:
         _conn().execute(
@@ -740,6 +1011,7 @@ def meta_set(k, v):
 
 # ---------- diagnostic bundle ----------
 
+@_resilient(default=list)
 def export_requests(limit=500, hours=0):
     """Full request rows for offline analysis — every column, newest first."""
     sql, args = "SELECT * FROM requests", []
@@ -752,6 +1024,7 @@ def export_requests(limit=500, hours=0):
         return [dict(r) for r in _conn().execute(sql, args).fetchall()]
 
 
+@_resilient(default=list)
 def export_accounts():
     """accounts minus `token` — credentials never enter a bundle."""
     cols = ("id,name,email,api_server_url,devin_webapp_host,devin_api_url,"
@@ -763,6 +1036,7 @@ def export_accounts():
             f"SELECT {cols} FROM accounts ORDER BY id").fetchall()]
 
 
+@_resilient(default=list)
 def export_keys():
     """api_keys metadata only — hash/prefix identify a key, none are usable."""
     cols = ("id,name,prefix,tail,created,disabled,last_used,models,"
@@ -772,6 +1046,7 @@ def export_keys():
             f"SELECT {cols} FROM api_keys ORDER BY id").fetchall()]
 
 
+@_resilient(default=dict)
 def export_meta():
     """meta kv minus secrets (master_key; tomb:* are deleted-key hashes)."""
     with _lock:
@@ -780,6 +1055,7 @@ def export_meta():
             if r["k"] != "master_key" and not r["k"].startswith("tomb:")}
 
 
+@_resilient(default=list)
 def export_responses(limit=500):
     with _lock:
         return [dict(r) for r in _conn().execute(
