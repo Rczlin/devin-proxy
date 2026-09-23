@@ -1,0 +1,28 @@
+const $ = s => document.querySelector(s);
+const toast = m => { const t=$('#toast'); t.textContent=m; t.style.display='block'; clearTimeout(t._t); t._t=setTimeout(()=>t.style.display='none',3000) };
+const fmt = n => n==null?'-':(n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n));
+const fmtB = n => n>=1e6?(n/1e6).toFixed(1)+' MB':n>=1e3?(n/1e3).toFixed(1)+' KB':n+' B';
+const fmtT = ts => ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}):'-';
+const fmtDur = s => s>86400?(s/86400).toFixed(1)+' 天':s>3600?(s/3600).toFixed(1)+' 小时':Math.round(s/60)+' 分钟';
+const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// ---------- auth (cookie session from /admin login) ----------
+async function api(path, opts={}){
+  const r = await fetch(path, opts);
+  if (r.status === 401){ location.href='/admin'; throw new Error('unauthorized') }
+  if (!r.ok){ let m; try{m=(await r.json()).detail}catch{} throw new Error(m||('HTTP '+r.status)) }
+  return r;
+}
+async function logout(){
+  await fetch('/admin/api/logout',{method:'POST'}).catch(()=>{});
+  location.href='/admin';
+}
+
+// nav
+document.querySelectorAll('.nav a').forEach(a=>a.onclick=()=>{
+  document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('on'));
+  document.querySelectorAll('.page').forEach(x=>x.classList.remove('on'));
+  a.classList.add('on'); $('#p-'+a.dataset.p).classList.add('on');
+  const fn=({dash:loadDash,reqs:loadReqs,accs:loadAccounts,models:loadModels,play:loadPlayground,keys:loadKeys,conf:loadConf})[a.dataset.p];
+  fn().catch(e=>toast('加载失败: '+e.message));   // one bad page must not break nav
+});

@@ -10,7 +10,7 @@ c = TestClient(app)
 r = c.get("/admin/api/overview")
 assert r.status_code == 401, r.status_code
 # spa assets are behind auth too
-assert c.get("/admin/static/admin.js").status_code == 401
+assert c.get("/admin/static/js/util.js").status_code == 401
 assert c.get("/admin/static/admin.css").status_code == 401
 print("unauth overview + assets -> 401 OK")
 
@@ -32,9 +32,12 @@ assert cookie
 r = c.get("/admin/api/overview", cookies={"dp_admin": cookie})
 assert r.status_code == 200 and "pool" in r.json()
 # authed asset fetch works
-for n in ("admin.css", "admin.js"):
+for n in ("admin.css", "js/util.js", "js/dash.js", "js/conf.js"):
     r2 = c.get("/admin/static/" + n, cookies={"dp_admin": cookie})
-    assert r2.status_code == 200 and len(r2.content) > 1000
+    assert r2.status_code == 200 and len(r2.content) > 500, n
+# traversal blocked
+assert c.get("/admin/static/js/../admin.py",
+             cookies={"dp_admin": cookie}).status_code == 404
 print("login + session + assets OK")
 
 # bearer master key works too
