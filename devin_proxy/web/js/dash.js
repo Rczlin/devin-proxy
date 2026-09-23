@@ -197,11 +197,21 @@ window.addEventListener('resize',(()=>{let t;return()=>{clearTimeout(t);t=setTim
 },180)}})());
 
 // ---------- live feed (WebSocket push; replaces poll for pool state) ----------
-let LIVE={ws:null,retry:0,authRetry:false,dv:null,refreshT:null};
-function connectLive(){
+let LIVE={ws:null,connecting:false,retry:0,authRetry:false,dv:null,refreshT:null};
+async function connectLive(){
   if(LIVE.ws&&(LIVE.ws.readyState===0||LIVE.ws.readyState===1))return;
-  const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')
-    +location.host+'/admin/api/ws');
+  if(LIVE.connecting)return;
+  LIVE.connecting=true;
+  // ticket auth first — immune to proxies that rewrite Host/forwarded
+  // headers; cookie auth on the bare URL stays as the fallback.
+  let url=(location.protocol==='https:'?'wss://':'ws://')
+    +location.host+'/admin/api/ws';
+  try{
+    const t=await (await api('/admin/api/ws-ticket')).json();
+    url+='?t='+encodeURIComponent(t.ticket);
+  }catch(e){}
+  LIVE.connecting=false;
+  const ws=new WebSocket(url);
   LIVE.ws=ws;
   ws.onopen=()=>{LIVE.retry=0;LIVE.authRetry=false;liveDot(true)};
   ws.onmessage=ev=>{

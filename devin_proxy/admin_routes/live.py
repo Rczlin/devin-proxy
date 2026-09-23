@@ -17,6 +17,10 @@ Security model (same bar as the REST routes):
 - frames are memory-only (pool objects + store data_version) — this fires
   on every request start/finish, so no SQL here; heavy stats stay on
   GET /api/overview, which the client refetches when data_v moves
+- alternative auth: a 60s ticket from GET /api/ws-ticket (itself behind
+  the same session cookie) accepted via ?t= — survives proxies that
+  rewrite/ strip every identifying header, and still can't be minted by
+  a cross-site page
 """
 import asyncio
 import hmac
@@ -24,7 +28,7 @@ import json
 import time
 import urllib.parse
 
-from fastapi import WebSocket
+from fastapi import Depends, WebSocket
 
 from .. import store
 from ..admin_ctx import _SESS_COOKIE
@@ -144,26 +148,36 @@ def register(router, ctx, admin_key):
               f"{sorted(c for c in cand if c)}")
         return False
 
+    @router.get("/api/ws-ticket", dependencies=[Depends(admin_key)])
+    def ws_ticket():
+        """Mint a short-lived credential for the ws handshake. The SPA
+        fetches it right before connecting, so expiry only gates entry —
+        the socket itself is not bound by the ticket's ttl."""
+        return {"ticket": ctx.ws_ticket(), "ttl": 60}
+
     @router.websocket("/api/ws")
     async def live_ws(ws: WebSocket):
-        if not _ws_origin_ok(ws):
-            await ws.close(code=4403)
-            return
-        if not _ws_authed(ws):
-            print("admin ws: rejected — bad/missing credential")
-            await ws.close(code=4401)
-            return
+        by_ticket = ctx.ws_ticket_ok(ws.query_params.get("t") or "")
+        if not by_ticket:
+            if not _ws_origin_ok(ws):
+                await ws.close(code=4403)
+                return
+            if not _ws_authed(ws):
+                print("admin ws: rejected — bad/missing credential")
+                await ws.close(code=4401)
+                return
         feed.bind(asyncio.get_running_loop())
         if len(feed._subs) >= _MAX_SUBS:
             await ws.close(code=1013)       # try again later
             return
         await ws.accept()
         deadline = None
-        try:
-            deadline = int(ws.cookies.get(
-                _SESS_COOKIE, "").split(".", 1)[0])
-        except (ValueError, IndexError):
-            pass
+        if not by_ticket:
+            try:
+                deadline = int(ws.cookies.get(
+                    _SESS_COOKIE, "").split(".", 1)[0])
+            except (ValueError, IndexError):
+                pass
         q = feed.subscribe()
         stopped = asyncio.Event()
 
