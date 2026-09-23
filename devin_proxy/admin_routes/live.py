@@ -30,7 +30,9 @@ from .. import store
 from ..admin_ctx import _SESS_COOKIE
 
 _TICK_S = 1.0           # cooldown countdowns tick once a second
-_HEARTBEAT_S = 30.0     # unchanged state is still re-sent this often
+_HEARTBEAT_S = 10.0     # unchanged state is still re-sent this often —
+                        # keeps the conn alive through proxies with
+                        # aggressive idle timeouts (data frames only)
 _MAX_MSG = 2048         # inbound frame cap — the channel is push-only
 _MAX_SUBS = 64          # fd/memory abuse guard
 
@@ -107,15 +109,40 @@ def register(router, ctx, admin_key):
             and hmac.compare_digest(auth[7:], key)
 
     def _ws_origin_ok(ws):
+        """CSWSH check. Browsers always send Origin on the handshake — its
+        hostname must match the host the page was served from. Reverse
+        proxies may rewrite Host (nginx's default $proxy_host), so the
+        client-facing host also comes from X-Forwarded-Host / Forwarded.
+        Compared by hostname only: a port rewrite mid-proxy doesn't turn
+        the page cross-site, and an attacker page can never make its
+        Origin hostname equal ours anyway."""
         origin = ws.headers.get("origin")
         if not origin:
-            return True
+            return True                 # non-browser clients carry no Origin
         try:
-            ohost = urllib.parse.urlparse(origin).netloc
+            ohost = urllib.parse.urlparse(origin).hostname
         except Exception:
             return False
-        return bool(ohost) and hmac.compare_digest(
-            ohost.lower(), ws.headers.get("host", "").lower())
+        if not ohost:
+            return False                # e.g. Origin: null
+        ohost = ohost.lower().rstrip(".")
+        cand = {ws.headers.get("host", "")}
+        for h in ws.headers.get("x-forwarded-host", "").split(","):
+            cand.add(h.strip())
+        for part in ws.headers.get("forwarded", "").replace(",", ";").split(";"):
+            part = part.strip()
+            if part.lower().startswith("host="):
+                cand.add(part[5:].strip('"').strip())
+        for c in cand:
+            try:
+                chost = urllib.parse.urlparse("//" + c).hostname
+            except Exception:
+                continue
+            if chost and hmac.compare_digest(ohost, chost.lower()):
+                return True
+        print(f"admin ws: rejected — origin host {ohost!r} not in "
+              f"{sorted(c for c in cand if c)}")
+        return False
 
     @router.websocket("/api/ws")
     async def live_ws(ws: WebSocket):
@@ -123,6 +150,7 @@ def register(router, ctx, admin_key):
             await ws.close(code=4403)
             return
         if not _ws_authed(ws):
+            print("admin ws: rejected — bad/missing credential")
             await ws.close(code=4401)
             return
         feed.bind(asyncio.get_running_loop())
@@ -154,6 +182,7 @@ def register(router, ctx, admin_key):
 
         reader = asyncio.create_task(_drain())
         last_key, last_sent = None, 0.0
+        t_open = time.time()
         try:
             while not stopped.is_set():
                 if deadline and time.time() >= deadline:
@@ -172,8 +201,9 @@ def register(router, ctx, admin_key):
                     await asyncio.wait_for(q.get(), wait)
                 except asyncio.TimeoutError:
                     pass
-        except Exception:
-            pass                            # send/close raced — drop it
+        except Exception as e:
+            print(f"admin ws: dropped after "
+                  f"{time.time() - t_open:.0f}s — {type(e).__name__}: {e}")
         finally:
             stopped.set()
             reader.cancel()

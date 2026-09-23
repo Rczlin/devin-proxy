@@ -227,6 +227,27 @@ try:
     assert False, "foreign-origin ws connected"
 except Exception:
     pass
+# proxied handshake: proxy rewrote Host, real client host survives in
+# X-Forwarded-Host -> still accepted
+with c.websocket_connect(
+        "/admin/api/ws",
+        headers={"cookie": f"dp_admin={cookie}",
+                 "host": "internal-upstream:8317",
+                 "x-forwarded-host": "public.example.com",
+                 "origin": "https://public.example.com"}) as ws:
+    assert json.loads(ws.receive_text())["type"] == "live"
+# ...but a Host/XFH that doesn't match the Origin is still refused
+try:
+    with c.websocket_connect(
+            "/admin/api/ws",
+            headers={"cookie": f"dp_admin={cookie}",
+                     "host": "internal-upstream:8317",
+                     "x-forwarded-host": "public.example.com",
+                     "origin": "https://attacker.example"}) as ws:
+        ws.receive_text()
+    assert False, "mismatched-origin ws connected"
+except Exception:
+    pass
 # same-origin session -> live frame with pool/in_flight
 with c.websocket_connect(
         "/admin/api/ws",
