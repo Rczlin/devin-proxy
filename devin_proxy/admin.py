@@ -3,7 +3,7 @@
 The console is always locked: /admin serves only a minimal login page,
 POST /admin/api/login trades the master key for an HttpOnly session cookie,
 and /admin/app (the SPA) plus every /admin/api/* endpoint require that
-cookie (or the master key as Bearer / ?key=)."""
+cookie (or the master key as an Authorization: Bearer credential)."""
 import collections
 import gzip
 import hashlib
@@ -152,10 +152,8 @@ def make_router(app):
         if not key:
             return False
         auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], key):
-            return True
-        qp = request.query_params.get("key")
-        return bool(qp) and hmac.compare_digest(qp, key)
+        return auth.startswith("Bearer ") \
+            and hmac.compare_digest(auth[7:], key)
 
     def admin_key(request: Request):
         if not _authed(request):
@@ -180,14 +178,14 @@ def make_router(app):
         _login_hits.pop(ip, None)           # success clears the window
         resp = JSONResponse({"ok": True})
         resp.set_cookie(_SESS_COOKIE, _sess_token(), max_age=_SESS_TTL,
-                        httponly=True, samesite="lax",
+                        path="/admin", httponly=True, samesite="lax",
                         secure=request.url.scheme == "https")
         return resp
 
     @router.post("/api/logout")
     def logout():
         resp = JSONResponse({"ok": True})
-        resp.delete_cookie(_SESS_COOKIE)
+        resp.delete_cookie(_SESS_COOKIE, path="/admin")
         return resp
 
     @router.get("", response_class=HTMLResponse)

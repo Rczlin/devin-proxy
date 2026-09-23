@@ -36,6 +36,13 @@ r = c.get("/admin/api/overview",
 assert r.status_code == 200
 print("bearer auth OK")
 
+# master key in the URL query must NOT authenticate (leak vector).
+# use a fresh client so the session cookie doesn't mask the result.
+c_fresh = TestClient(app)
+r = c_fresh.get("/admin/api/overview?key=sk-test-master")
+assert r.status_code == 401, r.status_code
+print("?key= rejected OK")
+
 # --- rate limit: 5 fails -> 429 ---
 c2 = TestClient(app)   # same app, same IP (testclient)
 for i in range(6):
