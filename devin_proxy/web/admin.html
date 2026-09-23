@@ -66,6 +66,10 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 /* playground */
 .pg-out{background:#0d1117;border:1px solid var(--border);border-radius:6px;padding:12px;min-height:140px;white-space:pre-wrap;font-family:var(--mono);font-size:12.5px;word-break:break-word}
 .pg-out .think{color:var(--dim);font-style:italic}
+.pg-out .msg{margin:8px 0;padding:8px 12px;border-radius:8px;white-space:pre-wrap}
+.pg-out .msg.user{background:#1f6feb18;border:1px solid #1f6feb44}
+.pg-out .msg.asst{background:#161b22;border:1px solid var(--border)}
+.pg-out .msg .who{font-size:11px;color:var(--dim);margin-bottom:4px}
 /* modal */
 .modal{position:fixed;inset:0;background:#000000aa;display:none;align-items:center;justify-content:center;z-index:50}
 .modal.on{display:flex}
@@ -328,9 +332,10 @@ tr:hover td.ops{background:#1a2129}
         <textarea id="pg-in" placeholder="输入消息…（Ctrl+Enter 发送）"></textarea>
         <div class="row" style="margin:10px 0">
           <button class="primary" id="pg-send" onclick="pgSend()">发送</button>
+          <button onclick="pgReset()" title="清空对话历史">🗑 新对话</button>
           <span class="muted" id="pg-meta"></span>
         </div>
-        <div class="pg-out" id="pg-out"><span class="muted">输出会显示在这里（经管理通道调用，无需 API key，仍会计入日志）</span></div>
+        <div class="pg-out" id="pg-out"><span class="muted">输出会显示在这里（经管理通道调用，无需 API key，仍会计入日志）。多轮对话会保留上下文，点「新对话」清空。</span></div>
       </div>
     </section>
 
@@ -1014,12 +1019,27 @@ async function loadPlayground(){
     ?'<optgroup label="别名">'+Object.entries(d.aliases).map(([a,t])=>`<option value="${esc(a)}">${esc(a)} → ${esc(t)}</option>`).join('')+'</optgroup>':'';
   $('#pg-model').innerHTML=(fams+al)||'<option value="default">default</option>';
 }
+let PG_HIST=[];   // [{role,content}] — conversation turns (system excluded)
+function pgReset(){PG_HIST=[];$('#pg-out').innerHTML='<span class="muted">新对话已开始。</span>';$('#pg-meta').textContent='';$('#pg-in').value='';$('#pg-in').focus()}
+function pgBubble(role,text,think){
+  const d=document.createElement('div');d.className='msg '+role;
+  d.innerHTML=`<div class="who">${role==='user'?'你':'助手'}</div>`;
+  if(think){const t=document.createElement('div');t.className='think';t.textContent='[思考] '+think;d.appendChild(t)}
+  d.appendChild(document.createTextNode(text));
+  return d;
+}
 async function pgSend(){
   const btn=$('#pg-send');btn.disabled=true;$('#pg-meta').textContent='';
-  const out=$('#pg-out');out.innerHTML='';
+  const out=$('#pg-out');
+  if(out.querySelector('.muted'))out.innerHTML='';   // clear placeholder
+  const userText=$('#pg-in').value;
+  PG_HIST.push({role:'user',content:userText});
+  out.appendChild(pgBubble('user',userText));
+  const asst=pgBubble('asst','');asst.lastChild.textContent='';out.appendChild(asst);
+  const asstTxt=asst.lastChild;
   const msgs=[];
   if($('#pg-system').value.trim())msgs.push({role:'system',content:$('#pg-system').value});
-  msgs.push({role:'user',content:$('#pg-in').value});
+  msgs.push(...PG_HIST);
   const stream=$('#pg-stream').checked;
   const t0=performance.now();
   const headers={'Content-Type':'application/json'};
@@ -1028,7 +1048,7 @@ async function pgSend(){
       const r=await fetch('/admin/api/playground',{method:'POST',headers,
         body:JSON.stringify({model:$('#pg-model').value,messages:msgs,stream:true,stream_options:{include_usage:true}})});
       if(r.status===401){location.href='/admin';throw new Error('unauthorized')}
-      const rd=r.body.getReader(),dec=new TextDecoder();let buf='',think='';
+      const rd=r.body.getReader(),dec=new TextDecoder();let buf='',think='',reply='';
       for(;;){
         const{done,value}=await rd.read();if(done)break;
         buf+=dec.decode(value,{stream:true});
@@ -1037,26 +1057,31 @@ async function pgSend(){
           if(!line.startsWith('data:'))continue;
           const data=line.slice(5).trim();if(data==='[DONE]')break;
           try{const j=JSON.parse(data);
-            if(j.error){out.appendChild(document.createTextNode('[上游错误] '+j.error.message));continue}
+            if(j.error){asstTxt.textContent+='[上游错误] '+j.error.message;continue}
             const d=j.choices?.[0]?.delta||{};
             if(d.reasoning_content){think+=d.reasoning_content;renderThink()}
-            if(d.content)out.appendChild(document.createTextNode(d.content));
+            if(d.content){reply+=d.content;asstTxt.textContent+=d.content}
             if(j.usage)$('#pg-meta').textContent=`tokens: ${j.usage.prompt_tokens}+${j.usage.completion_tokens}`;
           }catch{}
         }
       }
-      function renderThink(){let el=out.querySelector('.think');if(!el){el=document.createElement('div');el.className='think';out.prepend(el)}el.textContent='[思考] '+think}
+      function renderThink(){let el=asst.querySelector('.think');if(!el){el=document.createElement('div');el.className='think';asst.insertBefore(el,asstTxt)}el.textContent='[思考] '+think}
+      if(reply)PG_HIST.push({role:'assistant',content:reply});
     }else{
       const r=await fetch('/admin/api/playground',{method:'POST',headers,
         body:JSON.stringify({model:$('#pg-model').value,messages:msgs})});
       const j=await r.json();
       const m=j.choices?.[0]?.message||{};
-      if(m.reasoning_content)out.innerHTML=`<div class="think">[思考] ${esc(m.reasoning_content)}</div>`;
-      out.appendChild(document.createTextNode(m.content||JSON.stringify(j,null,1)));
+      if(m.reasoning_content){const t=document.createElement('div');t.className='think';t.textContent='[思考] '+m.reasoning_content;asst.insertBefore(t,asstTxt)}
+      const reply=m.content||JSON.stringify(j,null,1);
+      asstTxt.textContent=reply;
+      if(m.content)PG_HIST.push({role:'assistant',content:m.content});
       if(j.usage)$('#pg-meta').textContent=`tokens: ${j.usage.prompt_tokens}+${j.usage.completion_tokens}`;
     }
     $('#pg-meta').textContent+=' · '+Math.round(performance.now()-t0)+'ms';
-  }catch(e){out.textContent='错误: '+e.message}
+    $('#pg-in').value='';
+    out.scrollTop=out.scrollHeight;
+  }catch(e){asstTxt.textContent='错误: '+e.message}
   btn.disabled=false;
 }
 document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter'&&$('#p-play').classList.contains('on'))pgSend()});
