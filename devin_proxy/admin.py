@@ -102,8 +102,8 @@ def make_router(app):
     # A per-IP rate limit on the login endpoint so the master key can't
     # be brute-forced online. (Security headers are added app-wide by the
     # _stealth middleware in app.py.)
-    _LOGIN_MAX = 5            # attempts allowed per window
-    _LOGIN_WIN = 300          # seconds
+    _LOGIN_MAX = int(os.environ.get("DEVIN_PROXY_LOGIN_MAX", "5"))
+    _LOGIN_WIN = int(os.environ.get("DEVIN_PROXY_LOGIN_WIN", "300"))
     _login_hits = collections.defaultdict(list)
     _login_lock = threading.Lock()
 
