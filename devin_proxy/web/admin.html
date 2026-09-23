@@ -1108,7 +1108,10 @@ async function pgSend(){
   }catch(e){asstTxt.textContent='错误: '+e.message}
   btn.disabled=false;
 }
-document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.key==='Enter'&&$('#p-play').classList.contains('on'))pgSend()});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape')$('#modal').classList.remove('on');
+  if(e.ctrlKey&&e.key==='Enter'&&$('#p-play').classList.contains('on'))pgSend();
+});
 
 // keys
 let KEY_MAP={};
