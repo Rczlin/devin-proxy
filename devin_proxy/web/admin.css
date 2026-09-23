@@ -128,6 +128,7 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 .erow .emsg{color:#ffa198;font-family:var(--mono);font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .erow .eacc{color:var(--dim);font-size:11.5px;flex-shrink:0}
 .livedot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pl 2s infinite;vertical-align:1px}
+.livedot.off{background:var(--red);box-shadow:0 0 6px var(--red);animation:none}
 @keyframes pl{50%{opacity:.35}}
 .fchip{display:inline-flex;align-items:center;gap:6px;background:#1f6feb22;border:1px solid var(--accent);color:var(--accent);border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
 /* request log row ops: sticky right column + compact buttons */
