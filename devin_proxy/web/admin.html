@@ -344,6 +344,7 @@ tr:hover td.ops{background:#1a2129}
       <div class="panel">
         <div class="row" style="margin-bottom:10px">
           <select id="pg-model" style="min-width:240px"></select>
+          <select id="pg-acct" style="max-width:170px" title="固定到某个上游账号（默认池内自动调度）"><option value="">自动调度账号</option></select>
           <label class="muted"><input type="checkbox" id="pg-stream" checked> 流式</label>
         </div>
         <textarea id="pg-system" placeholder="System prompt（可选）" style="min-height:52px;margin-bottom:8px"></textarea>
@@ -1120,6 +1121,11 @@ async function loadPlayground(){
   const al=Object.keys(d.aliases||{}).length
     ?'<optgroup label="别名">'+Object.entries(d.aliases).map(([a,t])=>`<option value="${esc(a)}">${esc(a)} → ${esc(t)}</option>`).join('')+'</optgroup>':'';
   $('#pg-model').innerHTML=(fams+al)||'<option value="default">default</option>';
+  try{
+    const ac=await (await api('/admin/api/accounts')).json();
+    $('#pg-acct').innerHTML='<option value="">自动调度账号</option>'
+      +(ac.accounts||[]).map(a=>`<option value="${a.id}" ${a.disabled?'disabled':''}>${esc(a.label)}${a.disabled?' (禁用)':''}</option>`).join('');
+  }catch{}
 }
 let PG_HIST=[];   // [{role,content}] — conversation turns (system excluded)
 function pgReset(){PG_HIST=[];$('#pg-out').innerHTML='<span class="muted">新对话已开始。</span>';$('#pg-meta').textContent='';$('#pg-in').value='';$('#pg-in').focus()}
@@ -1148,7 +1154,7 @@ async function pgSend(){
   try{
     if(stream){
       const r=await fetch('/admin/api/playground',{method:'POST',headers,
-        body:JSON.stringify({model:$('#pg-model').value,messages:msgs,stream:true,stream_options:{include_usage:true}})});
+        body:JSON.stringify({model:$('#pg-model').value,messages:msgs,stream:true,stream_options:{include_usage:true},account_id:$('#pg-acct').value||undefined})});
       if(r.status===401){location.href='/admin';throw new Error('unauthorized')}
       const rd=r.body.getReader(),dec=new TextDecoder();let buf='',think='',reply='';
       for(;;){
@@ -1171,7 +1177,7 @@ async function pgSend(){
       if(reply)PG_HIST.push({role:'assistant',content:reply});
     }else{
       const r=await fetch('/admin/api/playground',{method:'POST',headers,
-        body:JSON.stringify({model:$('#pg-model').value,messages:msgs})});
+        body:JSON.stringify({model:$('#pg-model').value,messages:msgs,account_id:$('#pg-acct').value||undefined})});
       const j=await r.json();
       const m=j.choices?.[0]?.message||{};
       if(m.reasoning_content){const t=document.createElement('div');t.className='think';t.textContent='[思考] '+m.reasoning_content;asst.insertBefore(t,asstTxt)}
