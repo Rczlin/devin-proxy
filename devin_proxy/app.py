@@ -445,7 +445,7 @@ def create_app(api_key=None):
                 sse_json=rl.sse_dump(),
                 flags=rl.flags_str(),
             )
-            if rl.has_capture():
+            if rid is not None and rl.has_capture():
                 rl.cap["request_id"] = rid
                 rl.cap["ok"] = ok
                 store.save_capture(rid, ok, rl.cap)
