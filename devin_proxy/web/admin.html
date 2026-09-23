@@ -227,6 +227,7 @@ tr:hover td.ops{background:#1a2129}
         <span class="muted" id="rq-page"></span>
         <button id="rq-next" onclick="reqPage(1)">下一页 →</button>
       </div>
+      <div id="rq-errs" style="display:none;margin-bottom:12px"></div>
       <div class="panel" style="padding:0;overflow-x:auto">
         <table><thead><tr>
           <th>#</th><th>时间</th><th>模型</th><th>接口</th><th>流式</th><th>状态</th><th>输入</th><th>输出</th><th>缓存</th><th>延迟</th><th>TTFT</th><th>TPS</th><th>账号</th><th>Key</th><th class="ops">操作</th>
@@ -674,6 +675,18 @@ async function loadReqs(){
     <td>${esc(r.account||'')}</td><td>${esc(r.key_name||'')}</td>
     <td class="ops"><button class="mini" onclick="event.stopPropagation();showReq(${r.id})">详情</button>${r.has_cap?` <button class="mini" onclick="event.stopPropagation();dlCapture(${r.id})" title="导出该请求完整抓包 JSON">📥 抓包</button>`:''}</td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';
   REQ_LAST_CURSOR=d.next_cursor;
+  loadErrRollup();
+}
+async function loadErrRollup(){
+  const d=await (await api('/admin/api/requests/errors?hours=24')).json();
+  const el=$('#rq-errs');
+  if(!d.errors||!d.errors.length){el.style.display='none';return}
+  el.style.display='block';
+  el.innerHTML='<div class="panel" style="padding:10px 14px"><h3 style="margin-bottom:8px">近24h 错误聚合 <span class="muted">点击定位示例请求</span></h3>'
+    +d.errors.map(e=>`<div class="erow" onclick="showReq(${e.example_id})">
+      <span class="tag err">×${e.n}</span>
+      <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.sig)}">${esc(e.sig)}</span>
+      <span class="muted" style="flex-shrink:0">${fmtT(e.last)}</span></div>`).join('')+'</div>';
 }
 function reqPage(d){
   if(d>0){const c=REQ_LAST_CURSOR;if(!c)return;reqHist.push(reqCursor);reqCursor=c}
