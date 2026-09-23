@@ -390,7 +390,7 @@ tr:hover td.ops{background:#1a2129}
   <div class="box" style="width:min(980px,94vw)">
     <h3 style="margin-bottom:10px">请求详情 <span class="muted" id="md-id"></span><span id="md-flags"></span></h3>
     <div class="tabs" id="md-tabs">
-      <a data-t="ov" class="on">概览</a><a data-t="req">请求体</a><a data-t="msg">Messages</a><a data-t="ev">上游事件</a><a data-t="sse">SSE 输出</a>
+      <a data-t="ov" class="on">概览</a><a data-t="req">请求体</a><a data-t="msg">Messages</a><a data-t="ev">上游事件</a><a data-t="sse" id="md-sse-tab">SSE 输出</a>
     </div>
     <div class="pane on" id="md-p-ov"><div class="kv" id="md-kv"></div></div>
     <div class="pane" id="md-p-req"><pre id="md-req"></pre></div>
@@ -783,7 +783,13 @@ async function showReq(id){
   $('#md-msgs').textContent=pretty(r.messages_json)||'(无)';
   renderEvents(r.events_json);
   let sse=[];try{sse=JSON.parse(r.sse_json||'[]')}catch{}
-  $('#md-sse').textContent=sse.length?sse.map(s=>'data: '+s).join('\n\n'):'(无 SSE 记录)';
+  // non-streaming requests store the response object here, not SSE frames —
+  // label + render it accordingly
+  $('#md-sse-tab').textContent=r.stream?'SSE 输出':'响应体';
+  $('#md-sse').textContent=sse.length
+    ?(r.stream?sse.map(s=>'data: '+s).join('\n\n')
+               :sse.map(s=>{try{return JSON.stringify(JSON.parse(s),null,1)}catch{return s}}).join('\n\n'))
+    :'(无记录)';
   document.querySelector('#md-tabs a').click();   // reset to 概览
   $('#modal').classList.add('on');
 }
