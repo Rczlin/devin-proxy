@@ -87,6 +87,13 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 .tabs a.on{background:#1f6feb22;color:var(--accent);border-color:var(--accent)}
 .pane{display:none}.pane.on{display:block}
 .pane pre{max-height:56vh}
+.msgit{padding:8px 12px;border-bottom:1px solid #21262d;font-family:var(--mono);font-size:12px;white-space:pre-wrap;word-break:break-word}
+.msgit .who{color:var(--accent);font-size:11px;text-transform:uppercase;letter-spacing:.4px;margin-bottom:3px}
+.msgit.sys{border-left:3px solid var(--yellow)}
+.msgit.user{border-left:3px solid var(--accent)}
+.msgit.asst{border-left:3px solid var(--green)}
+.msgit.tool{border-left:3px solid var(--dim)}
+.msgit.reason{border-left:3px solid #a371f7;color:var(--dim);font-style:italic}
 .evt{display:flex;gap:10px;padding:4px 8px;border-bottom:1px solid #21262d;font-family:var(--mono);font-size:11.5px;align-items:baseline}
 .evt:hover{background:#1c233055}
 .evt .ms{color:var(--dim);min-width:76px;text-align:right;flex-shrink:0}
@@ -735,6 +742,28 @@ document.querySelectorAll('#md-tabs a').forEach(a=>a.onclick=()=>{
   a.classList.add('on');MD_TAB=a.dataset.t;$('#md-p-'+MD_TAB).classList.add('on');
 });
 const pretty=s=>{if(!s)return'';try{return JSON.stringify(JSON.parse(s),null,1)}catch{return s}};
+function renderMsgs(js){
+  let arr=[];try{arr=JSON.parse(js||'[]')}catch{}
+  if(!Array.isArray(arr)||!arr.length)return '';
+  const txt=v=>typeof v==='string'?v:(v==null?'':(Array.isArray(v)?v.map(c=>c?.text||c?.content||JSON.stringify(c)).join(' '):JSON.stringify(v)));
+  return arr.map(m=>{
+    // chat completions: {role,content[,tool_calls]}
+    if(m.role){
+      const cls={system:'sys',user:'user',assistant:'asst',tool:'tool'}[m.role]||'tool';
+      let body=esc(txt(m.content));
+      if(m.tool_calls)body+='\n🔧 '+m.tool_calls.map(t=>esc(t.function?.name||t.name||'')+' '+esc((t.function?.arguments||t.arguments||'').slice(0,120))).join('\n🔧 ');
+      return `<div class="msgit ${cls}"><div class="who">${esc(m.role)}</div>${body||'<i class=muted>(空)</i>'}</div>`;
+    }
+    // responses input items: {type:message|function_call_output|reasoning|item_reference,...}
+    const t=m.type||'message';
+    if(t==='message')return `<div class="msgit ${m.role==='user'?'user':'asst'}"><div class="who">${esc(m.role||'message')}</div>${esc(txt(m.content))}</div>`;
+    if(t==='function_call_output')return `<div class="msgit tool"><div class="who">tool output · ${esc(m.call_id||'')}</div>${esc(txt(m.output)).slice(0,2000)}</div>`;
+    if(t==='function_call')return `<div class="msgit tool"><div class="who">tool call · ${esc(m.name||'')}</div>${esc(txt(m.arguments)).slice(0,2000)}</div>`;
+    if(t==='reasoning')return `<div class="msgit reason"><div class="who">reasoning</div>${esc(txt(m.summary||m.content)).slice(0,800)}</div>`;
+    if(t==='item_reference')return `<div class="msgit tool"><div class="who">ref → ${esc(m.id||'')}</div></div>`;
+    return `<div class="msgit tool"><div class="who">${esc(t)}</div>${esc(JSON.stringify(m)).slice(0,800)}</div>`;
+  }).join('');
+}
 const EV_LABEL={request:['请求进入',''],parse_error:['解析失败','err'],mapped:['请求映射',''],
   built:['上游请求',''],attempt:['尝试',''],msg:['上游消息',''],upstream_err:['上游错误','err'],
   exception:['连接异常','err'],proxy_exception:['代理异常','err'],build_error:['构建失败','err'],
@@ -780,7 +809,7 @@ async function showReq(id){
     ['上游',esc([r.upstream_model,r.upstream_msg_id,r.upstream_req_id].filter(Boolean).join(' · ')||'-')]]
     .map(([k,v])=>`<div class=k>${k}</div><div>${v}</div>`).join('');
   $('#md-req').textContent=pretty(r.request_json)||'(未记录请求体)';
-  $('#md-msgs').textContent=pretty(r.messages_json)||'(无)';
+  $('#md-msgs').innerHTML=renderMsgs(r.messages_json)||'<span class=muted>(无)</span>';
   renderEvents(r.events_json);
   let sse=[];try{sse=JSON.parse(r.sse_json||'[]')}catch{}
   // non-streaming requests store the response object here, not SSE frames —
