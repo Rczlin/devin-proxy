@@ -222,6 +222,7 @@ tr:hover td.ops{background:#1a2129}
         <select id="rq-ok"><option value="">全部状态</option><option value="1">成功</option><option value="0">失败</option></select>
         <select id="rq-flag"><option value="">全部标记</option><option value="truncated">断流/截断</option><option value="retried">重试恢复</option><option value="no_stop_reason">无 stop</option></select>
         <input id="rq-q" placeholder="搜索 错误/客户端/Key" style="width:180px">
+        <input id="rq-id" placeholder="#ID" type="number" style="width:80px" title="输入请求 ID 直接打开详情">
         <button class="primary" onclick="reqReset();loadReqs()">筛选</button>
         <span id="rq-acct-chip"></span>
         <label class="muted" title="每 5 秒刷新当前页"><input type="checkbox" id="rq-auto"> 自动刷新</label>
@@ -695,6 +696,9 @@ async function loadErrRollup(){
       <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(e.sig)}">${esc(e.sig)}</span>
       <span class="muted" style="flex-shrink:0">${fmtT(e.last)}</span></div>`).join('')+'</div>';
 }
+$('#rq-id').addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&e.target.value)showReq(+e.target.value);
+});
 function reqPage(d){
   if(d>0){const c=REQ_LAST_CURSOR;if(!c)return;reqHist.push(reqCursor);reqCursor=c}
   else{reqCursor=reqHist.pop()??null}
