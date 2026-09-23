@@ -163,12 +163,23 @@ assert c.get("/admin/api/overview?hours=99999999", headers=H).status_code == 400
 assert c.get("/admin/api/overview?hours=24", headers=H).status_code == 200
 assert c.get("/admin/api/requests/export?fmt=xml", headers=H).status_code == 400
 assert c.get("/admin/api/requests/export?fmt=csv", headers=H).status_code == 200
+assert c.post("/admin/api/accounts/bulk",
+              json={"ids": [{}], "disabled": True},
+              headers=H).status_code == 422
+assert c.post("/admin/api/keys",
+              json={"name": "bad-conc", "max_concurrent": -1},
+              headers=H).status_code == 400
+assert c.post("/admin/api/requests/clear?older_than_hours=-1",
+              headers=H).status_code == 400
 print("input validation OK")
 
 # --- bulk account enable/disable ---
 accs = c.get("/admin/api/accounts", headers=H).json()["accounts"]
 if accs:
     ids = [a["id"] for a in accs]
+    r = c.patch(f"/admin/api/accounts/{ids[0]}",
+                json={"max_concurrent": -1}, headers=H)
+    assert r.status_code == 400
     r = c.post("/admin/api/accounts/bulk",
                json={"ids": ids, "disabled": True}, headers=H)
     assert r.json()["updated"] == len(ids)

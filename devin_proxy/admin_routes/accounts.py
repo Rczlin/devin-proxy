@@ -61,6 +61,8 @@ def register(router, ctx, admin_key):
         if body.disabled is not None:
             fields["disabled"] = int(body.disabled)
         if body.max_concurrent is not None:
+            if body.max_concurrent < 0:
+                raise HTTPException(400, "max_concurrent must be >= 0")
             fields["max_concurrent"] = body.max_concurrent
         if body.models is not None:
             fields["models"] = body.models
@@ -68,7 +70,7 @@ def register(router, ctx, admin_key):
         return {"account": ctx.app.state.pool.get(aid).public()}
 
     class BulkAccounts(BaseModel):
-        ids: list
+        ids: list[int]
         disabled: Optional[bool] = None
 
     @router.post("/api/accounts/bulk", dependencies=[Depends(admin_key)])
