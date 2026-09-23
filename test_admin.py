@@ -1,4 +1,4 @@
-import os, tempfile
+import os, tempfile, json
 os.environ["DEVIN_PROXY_DB"] = tempfile.mktemp(suffix=".db")
 from fastapi.testclient import TestClient
 from devin_proxy.app import create_app
@@ -75,6 +75,45 @@ r = c.patch("/admin/api/models/settings",
             cookies={"dp_admin": cookie})
 assert r.status_code == 200
 print("model settings validation OK")
+
+# --- request log: seed, filtered prune, csv/jsonl export ---
+from devin_proxy import store as _st
+for i in range(6):
+    _st.log_request("m-a" if i % 2 else "m-b", "m-a", 0,
+                    0 if i < 2 else 1, 200,
+                    "boom" if i < 2 else None,
+                    0, 0, 5, None, "test", "ci", "[]",
+                    account="acct-1")
+cookie_hdr = {"dp_admin": cookie}
+r = c.get("/admin/api/requests?ok=0", cookies=cookie_hdr)
+assert r.json()["total"] == 2, r.json()["total"]
+
+# export CSV of just the failures
+r = c.get("/admin/api/requests/export?fmt=csv&ok=0", cookies=cookie_hdr)
+assert r.status_code == 200
+assert "text/csv" in r.headers["content-type"]
+lines = [l for l in r.text.strip().splitlines()]
+assert len(lines) == 3          # header + 2 rows
+print("csv export OK")
+
+# jsonl export of everything
+r = c.get("/admin/api/requests/export?fmt=jsonl", cookies=cookie_hdr)
+assert "x-ndjson" in r.headers["content-type"]
+rows = [json.loads(l) for l in r.text.strip().splitlines()]
+assert len(rows) == 6
+print("jsonl export OK")
+
+# filtered prune: delete only the failures
+r = c.post("/admin/api/requests/clear?ok=0", cookies=cookie_hdr)
+assert r.json()["deleted"] == 2, r.json()
+r = c.get("/admin/api/requests", cookies=cookie_hdr)
+assert r.json()["total"] == 4
+# unfiltered clear wipes the rest
+r = c.post("/admin/api/requests/clear", cookies=cookie_hdr)
+assert r.json()["deleted"] == "all"
+r = c.get("/admin/api/requests", cookies=cookie_hdr)
+assert r.json()["total"] == 0
+print("filtered prune + clear OK")
 
 # --- status + ping shape ---
 r = c.get("/admin/api/status", cookies={"dp_admin": cookie})

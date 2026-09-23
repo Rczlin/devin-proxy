@@ -32,6 +32,7 @@ _LOGIN_HTML = os.path.join(os.path.dirname(__file__), "web", "login.html")
 
 _SESS_COOKIE = "dp_admin"
 _SESS_TTL = 7 * 86400
+_MAX_EXPORT = 20000          # row cap for CSV/JSONL log export
 
 # bundled into the diagnostic zip — decodes captures/req-<id>.json
 _DECODER = '''\
@@ -225,6 +226,34 @@ def make_router(app):
                                            account, flag)
         return {"items": items, "total": total}
 
+    @router.get("/api/requests/export", dependencies=[Depends(admin_key)])
+    def requests_export(fmt: str = "jsonl", limit: int = 1000,
+                        model: str = None, ok: int = None, q: str = None,
+                        account: str = None, flag: str = None):
+        """Download the filtered request log as JSONL or CSV (summary
+        columns — no request/response bodies; use /api/export for full
+        fidelity). Same filters as the list endpoint."""
+        import csv
+        items, _ = store.list_requests(max(1, min(limit, _MAX_EXPORT)),
+                                       0, model, ok, q, account, flag)
+        fn = "requests-" + time.strftime("%Y%m%d-%H%M%S")
+        if fmt == "csv":
+            buf = io.StringIO()
+            if items:
+                w = csv.DictWriter(buf, fieldnames=list(items[0].keys()))
+                w.writeheader()
+                w.writerows(items)
+            return Response(
+                buf.getvalue(), media_type="text/csv",
+                headers={"Content-Disposition":
+                         f'attachment; filename="{fn}.csv"'})
+        body = "".join(json.dumps(r, ensure_ascii=False, default=str)
+                       + "\n" for r in items)
+        return Response(
+            body, media_type="application/x-ndjson",
+            headers={"Content-Disposition":
+                     f'attachment; filename="{fn}.jsonl"'})
+
     @router.get("/api/requests/{rid}", dependencies=[Depends(admin_key)])
     def request_detail(rid: int):
         r = store.get_request(rid)
@@ -248,9 +277,21 @@ def make_router(app):
                      f'attachment; filename="req-{rid}-capture.json"'})
 
     @router.post("/api/requests/clear", dependencies=[Depends(admin_key)])
-    def clear_requests():
-        store.clear_requests()
-        return {"ok": True}
+    def clear_requests(model: str = None, ok: int = None, q: str = None,
+                       account: str = None, flag: str = None,
+                       older_than_hours: float = None):
+        """Delete logged requests. With no filters this wipes everything;
+        with filters (same as GET /api/requests plus an age cutoff) it prunes
+        just the matching rows — keeps the useful history intact."""
+        if not any(v is not None for v in
+                   (model, ok, q, account, flag, older_than_hours)):
+            store.clear_requests()
+            return {"ok": True, "deleted": "all"}
+        n = store.prune_requests(
+            model=model, ok=ok, q=q, account=account, flag=flag,
+            before_ts=(time.time() - older_than_hours * 3600
+                       if older_than_hours else None))
+        return {"ok": True, "deleted": n}
 
     def _git_head():
         try:
