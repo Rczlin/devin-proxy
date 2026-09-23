@@ -870,15 +870,19 @@ def create_app(api_key=None):
         return {
             "id": m["uid"], "object": "model", "created": created,
             "owned_by": m["vendor"], "display_name": m["label"],
-            "family": m["family"], "effort": m["effort"],
+            "family": m["family"], "family_label": m["family_label"],
+            "effort": m["effort"], "effort_label": m["effort_label"],
             "context_window": m["context"],
             "max_output_tokens": m["max_output"],
             "credit_cost": m["credit"],
             "cost_summary": m.get("cost_summary"),
+            "pricing": m.get("pricing"),
+            "deployment": m.get("deployment"),
             "alias": m.get("alias"),
             "capabilities": {"vision": bool(m["images"]),
                              "thinking": bool(m["thinking"]),
                              "tools": True},
+            "remote_accounts": m["remote_accounts"],
             "source": ("remote" if m["remote_accounts"]
                        else "url" if m["url"] else "builtin")}
 
@@ -891,14 +895,12 @@ def create_app(api_key=None):
         models_mod.maybe_refresh(app.state.http, pool)
         created = int(models_mod.sync_info()["ts"] or 0)
         full = request.query_params.get("variants") in ("1", "true", "all")
+        by_uid = {e["uid"]: e for e in models_mod.entries()}
         data = []
         for f in models_mod.grouped():
             if allowed is not None and not (
                     {f["prefix"]} | {m["uid"] for m in f["models"]}
             ) & allowed:
-                continue
-            if full:
-                data.extend(_variant_obj(m, created) for m in f["models"])
                 continue
             want = f.get("default") or "medium"
             main = (next((m for m in f["models"]
@@ -906,18 +908,40 @@ def create_app(api_key=None):
                     or next((m for m in f["models"]
                              if m["effort"] == "medium"), None)
                     or f["models"][0])
+            if full:
+                for m in f["models"]:
+                    o = _variant_obj(m, created)
+                    o["description"] = f["desc"]
+                    o["default"] = m["uid"] == main["uid"]
+                    data.append(o)
+                continue
             o = _variant_obj(main, created)
-            o["id"] = f["prefix"]
-            o["display_name"] = f["label"]
-            o["effort"] = None
-            o["default_effort"] = f.get("default")
-            o["efforts"] = [m["effort"] for m in f["models"]
-                            if m["effort"]]
+            o.update({
+                "id": f["prefix"], "family": f["prefix"],
+                "display_name": f["label"], "family_label": f["label"],
+                "description": f["desc"],
+                "effort": None, "effort_label": None,
+                "default_effort": f.get("default"),
+                "default_uid": main["uid"],
+                "efforts": [m["effort"] for m in f["models"]
+                            if m["effort"]],
+                "variants": {m["effort"]: m["uid"]
+                             for m in f["models"] if m["effort"]},
+                "remote_accounts": max(m["remote_accounts"]
+                                       for m in f["models"])})
             data.append(o)
         for a, t in models_mod.aliases().items():
-            if allowed is None or a in allowed:
-                data.append({"id": a, "object": "model", "created": 0,
-                             "owned_by": "proxy", "alias_of": t})
+            if allowed is not None and a not in allowed:
+                continue
+            ent = by_uid.get(t)
+            o = (_variant_obj(ent, created) if ent else
+                 {"id": a, "object": "model", "created": created,
+                  "owned_by": "proxy"})
+            o["id"], o["alias_of"] = a, t
+            eff = models_mod.alias_effort(a)
+            if eff:
+                o["default_effort"] = eff
+            data.append(o)
         return {"object": "list", "data": data}
 
     @app.get("/healthz")

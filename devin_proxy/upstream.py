@@ -122,7 +122,8 @@ def _cost_summary(pricing):
 def fetch_model_configs(client, base_url, api_key, timeout=20):
     """GetCliModelConfigs (the call Devin CLI/Desktop makes at boot)
     -> [{uid, label, context, max_output, family_slug, family_label,
-         alias, images, thinking, credit, pricing, cost_summary}].
+         alias, images, thinking, credit, pricing, cost_summary,
+         deployment}].
     Disabled/uid-less entries are skipped. Raises on transport/parse
     failure — callers catch per account."""
     req = proto.GetCliModelConfigsRequest(
@@ -153,12 +154,16 @@ def fetch_model_configs(client, base_url, api_key, timeout=20):
              "images": bool(c.supports_images)}
         if c.HasField("model_info"):
             mi = c.model_info
+            if not e["context"] and mi.context_tokens:
+                e["context"] = mi.context_tokens
             if mi.max_output_tokens:
                 e["max_output"] = mi.max_output_tokens
             if mi.family:
                 e["family_slug"] = mi.family
             if mi.alias:
                 e["alias"] = mi.alias
+            if (mi.deployment or "").strip():
+                e["deployment"] = mi.deployment.strip()
             if mi.HasField("model_features"):
                 e["thinking"] = bool(mi.model_features.supports_thinking)
         if c.HasField("family") and c.family.label:

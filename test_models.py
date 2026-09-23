@@ -235,13 +235,26 @@ assert one["owned_by"] == "Anthropic" and one["capabilities"]["thinking"]
 assert one["context_window"] == 400000 and one["source"] == "remote"
 assert "medium" in one["efforts"] and "high" in one["efforts"]
 assert one["default_effort"] == "medium"
+# enriched family object
+assert one["default_uid"] == "claude-sonnet-5-medium"
+assert one["variants"] == {"medium": "claude-sonnet-5-medium",
+                           "high": "claude-sonnet-5-high"}
+assert one["description"] and one["family_label"] == "Claude Sonnet 5"
+assert one["remote_accounts"] >= 1          # best-served variant
 al = next(m for m in d["data"] if m["id"] == "sonnet")
 assert al["alias_of"] == "claude-sonnet-5-medium"
+# alias objects now inherit the resolved target's metadata
+assert al["owned_by"] == "Anthropic" and al["family"] == "claude-sonnet-5"
+assert al["created"] == one["created"] and al["capabilities"]["vision"]
 print("/v1/models OK:", len(d["data"]), "entries")
 # ?variants=1 exposes the full uid list
 d = tc.get("/v1/models?variants=1", headers=H).json()
 ids = {m["id"] for m in d["data"]}
 assert "claude-sonnet-5-medium" in ids
+v = next(m for m in d["data"] if m["id"] == "claude-sonnet-5-medium")
+assert v["default"] is True and v["effort_label"] == "中"
+v = next(m for m in d["data"] if m["id"] == "claude-sonnet-5-high")
+assert v["default"] is False and v["remote_accounts"] >= 1
 print("/v1/models?variants=1 OK:", len(d["data"]), "entries")
 
 # settings: default model + default effort + user alias
