@@ -517,6 +517,28 @@ def clear_requests():
         _conn().commit()
 
 
+@_resilient(default=0)
+def prune_requests(model=None, ok=None, q=None, account=None, flag=None,
+                   before_ts=None):
+    """Delete logged requests matching the same filters as list_requests,
+    plus an optional age cutoff. Returns the number of rows removed;
+    captures are deleted for exactly those rows."""
+    where, args = _where(model, ok, q, account, flag)
+    if before_ts:
+        where += " AND ts<?"
+        args.append(before_ts)
+    with _lock:
+        ids = [r["id"] for r in _conn().execute(
+            f"SELECT id FROM requests{where}", args).fetchall()]
+        if ids:
+            ph = ",".join("?" * len(ids))
+            _conn().execute(
+                f"DELETE FROM captures WHERE request_id IN ({ph})", ids)
+            _conn().execute(f"DELETE FROM requests WHERE id IN ({ph})", ids)
+        _conn().commit()
+    return len(ids)
+
+
 def stats_overview(hours=24):
     """Windowed stats for the dashboard — never raises. Falls back to an
     all-zero snapshot if the db can't be read (e.g. mid disk-full)."""
