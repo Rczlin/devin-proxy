@@ -18,6 +18,16 @@ async function logout(){
   location.href='/admin';
 }
 
+// current page's loader — manual refresh buttons call this
+async function refreshPage(btn){
+  const p=document.querySelector('.nav a.on');
+  const fn=p&&({dash:loadDash,reqs:loadReqs,accs:loadAccounts,models:loadModels,play:loadPlayground,keys:loadKeys,conf:loadConf})[p.dataset.p];
+  if(!fn)return;
+  if(btn){btn.disabled=true;btn.classList.add('spinning')}
+  try{await fn()}catch(e){toast('刷新失败: '+e.message)}
+  if(btn){btn.disabled=false;btn.classList.remove('spinning')}
+}
+
 // nav
 document.querySelectorAll('.nav a').forEach(a=>a.onclick=()=>{
   document.querySelectorAll('.nav a').forEach(x=>x.classList.remove('on'));
