@@ -6,8 +6,10 @@ kept on the Account objects in memory. Scheduling policy:
 - sticky: a session_key is pinned to the account that last served it
 - ready pool: enabled accounts not in cooldown, ordered by
   (in_flight, consecutive_fails, last_used) — least-busy first
-- failover: hard failures (auth/quota/5xx/network) cool an account down with
-  exponential backoff; the request is retried on the next account
+- failover: account-scoped failures (auth/quota/rate-limit/network) cool an
+  account down with exponential backoff; provider-side transient and
+  request-scoped errors do not — the request is retried on the next
+  account either way
 """
 import base64
 import hashlib
@@ -115,10 +117,11 @@ def normalize_token(token):
 
 def is_hard_failure(err):
     """True if the upstream error likely means this account can't serve —
-    auth/quota/rate-limit/5xx/network. 4xx request-shape errors are soft."""
+    auth/quota/rate-limit/network. soft (request-shape) and transient
+    (provider-side) errors are not the account's fault."""
     if not isinstance(err, dict):
         return True                       # exceptions: network/protocol
-    if err.get("soft"):
+    if err.get("soft") or err.get("transient"):
         return False
     code = err.get("http_error")
     if code is None:

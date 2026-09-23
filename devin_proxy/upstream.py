@@ -271,26 +271,54 @@ def _connect_frame(body):
 
 
 def _trailer_error(payload):
+    """end-stream payload -> (message, connect_code); (None, None) when the
+    trailer carries no error."""
     try:
         data = json.loads(payload.decode("utf-8", "replace"))
         err = data.get("error")
         if isinstance(err, dict):
-            return err.get("message") or json.dumps(err)
-        return str(err) if err else None
+            return err.get("message") or json.dumps(err), err.get("code")
+        return (str(err) if err else None), None
     except Exception:
-        return None
+        return None, None
 
 
+# Trailer/http errors are scoped by who is at fault:
+#   account   — this credential can't serve (auth/quota/rate-limit): earns
+#               a cooldown. Unknown errors land here (conservative).
+#   soft      — request-scoped (bad input, context overflow): retrying the
+#               same request on another account can't help, but the
+#               account itself is healthy.
+#   transient — the model provider / upstream itself is struggling: not
+#               the account's fault, and cooling it would just shrink the
+#               pool for the duration of a shared outage.
+_ACCT_CODES = frozenset(
+    ("unauthenticated", "permission_denied", "resource_exhausted"))
+_SOFT_CODES = frozenset(
+    ("invalid_argument", "failed_precondition", "out_of_range",
+     "not_found", "already_exists", "unimplemented"))
+_TRANSIENT_CODES = frozenset(
+    ("canceled", "unknown", "deadline_exceeded", "aborted", "internal",
+     "unavailable", "data_loss"))
+_ACCT_HINTS = ("quota", "limit reached", "usage paused", "unauthorized",
+               "forbidden", "not authenticated", "rate limit", "credit")
 _SOFT_HINTS = ("context", "too long", "invalid", "bad request", "maximum",
                "exceed", "malformed", "parse", "too many tokens")
+_TRANSIENT_HINTS = ("not available", "unavailable", "again later",
+                    "experiencing issues", "temporar", "overload",
+                    "internal error")
 
 
-def _is_soft(msg):
-    """Request-scoped upstream errors (context overflow, bad input, …) must
-    not cool the account down — retrying the same request elsewhere won't
-    help, but the account itself is healthy."""
-    m = (msg or "").lower()
-    return any(s in m for s in _SOFT_HINTS)
+def _err_scope(code, text):
+    """Connect error code + message -> 'account' | 'soft' | 'transient'."""
+    t = (text or "").lower()
+    if code in _ACCT_CODES or any(s in t for s in _ACCT_HINTS):
+        return "account"
+    if code in _TRANSIENT_CODES or any(s in t for s in _TRANSIENT_HINTS):
+        return "transient"
+    if code in _SOFT_CODES or any(s in t for s in _SOFT_HINTS):
+        return "soft"
+    return "account"
 
 
 def stream_chat(client, base_url, api_key, request, timeout=None,
@@ -334,11 +362,17 @@ def stream_chat(client, base_url, api_key, request, timeout=None,
         if resp.status_code != 200:
             body = resp.read()
             cap("http_body", body)
+            msg = body.decode("utf-8", "replace")[:2000]
             yield {"kind": "http_error", "http_error": resp.status_code,
+                   # a bare HTTP 5xx is the edge/LB or the service itself
+                   # failing — provider-side trouble, unless the body
+                   # blames the credential (quota/auth)
+                   "transient": resp.status_code >= 500 and not any(
+                       s in msg.lower() for s in _ACCT_HINTS),
                    "resp_headers": {k: v[:200] for k, v in
                                     resp.headers.items()
                                     if k.lower() != "set-cookie"},
-                   "message": body.decode("utf-8", "replace")[:2000]}
+                   "message": msg}
             return
         # iter_bytes(n) asks httpx to repackage the body into n-byte pieces —
         # it buffers internally until n bytes accumulate, so upstream frames
@@ -365,16 +399,17 @@ def stream_chat(client, base_url, api_key, request, timeout=None,
                 if flags & END_STREAM:
                     ended = True
                     cap("trailer", raw)
-                    err = _trailer_error(raw)
+                    err, code = _trailer_error(raw)
                     if err:
                         trailer_txt = raw.decode("utf-8", "replace")[:4000]
+                        # the Connect error code lives only in the trailer —
+                        # soft (request-scoped) and transient (provider-side)
+                        # failures must not cool the account down
+                        scope = _err_scope(code, trailer_txt)
                         yield {"kind": "upstream_error", "message": err,
-                               "trailer": trailer_txt,
-                               # the provider-side error code lives only in
-                               # the trailer (e.g. "invalid_argument" for a
-                               # malformed forwarded request) — request-scoped
-                               # failures must not cool the account down
-                               "soft": _is_soft(err) or _is_soft(trailer_txt)}
+                               "trailer": trailer_txt, "code": code,
+                               "soft": scope == "soft",
+                               "transient": scope == "transient"}
                     continue
                 n_frames += 1
                 cap("frame", raw)
