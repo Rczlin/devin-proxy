@@ -1,5 +1,10 @@
 protobuf>=4.25
 httpx>=0.27
 h2>=4.1
-fastapi>=0.110
-uvicorn>=0.29
+# upper pins: the admin live WebSocket depends on how include_router dispatches
+# websocket routes, which changed across starlette releases — an unbounded floor
+# let a deploy resolve a combo where /admin/api/ws silently 404'd. Pin to the
+# range this code is tested against (see admin_routes/live.py register()).
+fastapi>=0.110,<0.142
+starlette>=0.37,<1.4
+uvicorn>=0.29,<1.0

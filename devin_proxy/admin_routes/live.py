@@ -98,6 +98,15 @@ def _live_frame(ctx):
 
 
 def register(router, ctx, admin_key):
+    """`router` is the /admin APIRouter for HTTP routes; the ws endpoint is
+    registered directly on ctx.app so it never goes through include_router.
+
+    Rationale: under some fastapi/starlette version combinations (the
+    dependency floor is fastapi>=0.110 with no upper pin), a websocket route
+    declared on a router that is then app.include_router()ed is not matched
+    by _IncludedRouter's candidate dispatch — HTTP routes on the same router
+    work, only the ws handshake 404s. Registering on the app itself sidesteps
+    that path entirely and behaves identically across versions."""
     feed = LiveFeed()
     ctx.app.state.live_feed = feed
     ctx.app.state.pool.on_change(feed.notify)
@@ -155,7 +164,9 @@ def register(router, ctx, admin_key):
         the socket itself is not bound by the ticket's ttl."""
         return {"ticket": ctx.ws_ticket(), "ttl": 60}
 
-    @router.websocket("/api/ws")
+    # NOTE: on ctx.app, not `router` — see register() docstring. The path is
+    # spelled in full because there's no /admin prefix on the app.
+    @ctx.app.websocket("/admin/api/ws")
     async def live_ws(ws: WebSocket):
         by_ticket = ctx.ws_ticket_ok(ws.query_params.get("t") or "")
         if not by_ticket:
