@@ -30,7 +30,8 @@
           <a data-h="1">1小时</a><a data-h="24" class="on">24小时</a>
           <a data-h="168">7天</a><a data-h="720">30天</a><a data-h="0">全部</a>
         </div>
-        <label class="muted" title="并发/账号状态经 WebSocket 实时推送；勾选后图表统计随新数据自动刷新"><input type="checkbox" id="dash-auto" checked> 自动刷新</label>
+        <label class="muted" title="并发/账号状态经 WebSocket 实时推送；勾选后图表统计每 15s 并随推送自动刷新"><input type="checkbox" id="dash-auto" checked> 自动刷新</label>
+        <button class="mini" onclick="refreshPage(this)" title="重新加载仪表盘数据">↻ 刷新</button>
         <span style="flex:1"></span>
         <span class="muted"><span class="livedot"></span> <span id="dash-time"></span></span>
       </div>
@@ -83,6 +84,7 @@
         <button class="primary" onclick="reqReset();loadReqs()">筛选</button>
         <span id="rq-acct-chip"></span>
         <label class="muted" title="每 5 秒刷新当前页"><input type="checkbox" id="rq-auto"> 自动刷新</label>
+        <button class="mini" onclick="refreshPage(this)" title="重新加载请求列表">↻ 刷新</button>
         <span class="muted" id="rq-total"></span>
         <span style="flex:1"></span>
         <button onclick="exportReqs()" title="按当前筛选条件导出为 CSV（摘要列，无请求体）">⬇️ 导出 CSV</button>
@@ -102,7 +104,8 @@
 
     <section class="page" id="p-accs">
       <h2>账号池 <span class="muted" id="accs-summary"></span>
-        <span style="float:right"><button onclick="pingAll()" title="并发测试所有启用账号的上游连通性">⚡ 全部测试</button></span></h2>
+        <span style="float:right"><button class="mini" onclick="refreshPage(this)" title="重新加载账号列表">↻ 刷新</button>
+          <button onclick="pingAll()" title="并发测试所有启用账号的上游连通性">⚡ 全部测试</button></span></h2>
       <div class="panel">
         <h3>OAuth 登录（浏览器完成授权 → 粘贴 code）</h3>
         <div class="row">
@@ -159,7 +162,8 @@
     </section>
 
     <section class="page" id="p-models">
-      <h2>模型 <span class="muted" id="model-count"></span></h2>
+      <h2>模型 <span class="muted" id="model-count"></span>
+        <span style="float:right"><button class="mini" onclick="refreshPage(this)" title="重新加载页面数据（不触发上游同步；上游目录用下方「立即同步」）">↻ 刷新</button></span></h2>
       <div class="panel">
         <h3>目录同步 <span class="muted">上游 GetCliModelConfigs · 可选远端 JSON</span></h3>
         <div class="row">
@@ -216,7 +220,8 @@
     </section>
 
     <section class="page" id="p-keys">
-      <h2>API Keys</h2>
+      <h2>API Keys
+        <span style="float:right"><button class="mini" onclick="refreshPage(this)" title="重新加载 Key 列表">↻ 刷新</button></span></h2>
       <div class="panel">
         <h3>创建调用方 Key</h3>
         <div class="row">
@@ -235,7 +240,8 @@
     </section>
 
     <section class="page" id="p-conf">
-      <h2>状态</h2>
+      <h2>状态
+        <span style="float:right"><button class="mini" onclick="refreshPage(this)" title="重新加载状态信息">↻ 刷新</button></span></h2>
       <div class="panel">
         <div class="row" style="margin-bottom:12px">
           <button onclick="pingUp()" id="ping-btn">检测上游连通性</button>
