@@ -561,6 +561,13 @@ def make_router(app):
                 eff = v.rpartition("@")[2].strip().lower()
                 if "@" in v and eff not in models_mod.EFFORT_SUFFIX:
                     raise HTTPException(400, f"{k}: unknown effort @{eff}")
+                # alias names become request-facing model names — keep them
+                # url/token-safe so clients can actually send them
+                if not k.replace("-", "").replace("_", "").replace(".", "").isalnum():
+                    raise HTTPException(
+                        400, f"{k}: alias may only contain letters, digits, '-', '_', '.'")
+                if not v.split("@")[0].strip():
+                    raise HTTPException(400, f"{k}: empty target model")
             store.meta_set("model_aliases", json.dumps(parsed))
         if body.family_efforts is not None:
             cur = models_mod.family_efforts()
