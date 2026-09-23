@@ -561,7 +561,9 @@ def make_router(app):
             try:
                 d = json.loads(txt) if txt.startswith("{") else None
             except Exception:
-                d = None
+                # starts like JSON but won't parse — reject rather than fall
+                # through to line-mode (which would silently wipe aliases)
+                raise HTTPException(400, "invalid aliases JSON")
             if isinstance(d, dict):
                 parsed = {str(k).strip(): str(v).strip()
                           for k, v in d.items()
