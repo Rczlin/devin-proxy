@@ -122,6 +122,16 @@ r = c.get("/admin/api/requests", cookies=cookie_hdr)
 assert r.json()["total"] == 0
 print("filtered prune + clear OK")
 
+# --- error rollup ---
+for i in range(3):
+    _st.log_request("m", "m", 0, 0, 500, f"timeout after {i}.5s",
+                    0, 0, 1, None, "t", "ci", "[]")
+r = c.get("/admin/api/requests/errors?hours=24", cookies=cookie_hdr)
+errs = r.json()["errors"]
+agg = [e for e in errs if e["sig"].startswith("timeout after")]
+assert agg and agg[0]["n"] >= 3 and "#" in agg[0]["sig"], errs
+print("error rollup OK")
+
 # --- keyset pagination ---
 for i in range(5):
     _st.log_request("pg", "pg", 0, 1, 200, None, 0, 0, 1, None, "t", "ci", "[]")

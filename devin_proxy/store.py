@@ -940,6 +940,33 @@ def account_stats():
     return {r["a"]: dict(r) for r in rows}
 
 
+@_resilient(default=list)
+def error_stats(hours=24, limit=12):
+    """Failure rollup for the log page: group errors by a short signature
+    (first 80 chars, digits stripped so 'timeout after 31.4s' and '…29.9s'
+    collapse into one row) -> count + latest ts + an example id."""
+    since = time.time() - hours * 3600 if hours else 0
+    with _lock:
+        rows = _conn().execute(
+            """
+          SELECT substr(error,1,80) sig, COUNT(*) n, MAX(ts) last,
+                 MAX(id) example_id
+          FROM requests
+          WHERE ok=0 AND error IS NOT NULL AND ts>=?
+          GROUP BY sig ORDER BY n DESC LIMIT ?""",
+            (since, max(1, min(limit, 100)))).fetchall()
+    import re
+    out = {}
+    for r in rows:
+        sig = re.sub(r"\d+", "#", r["sig"]).strip() or "(empty)"
+        d = out.setdefault(sig, {"sig": sig, "n": 0,
+                                 "last": 0, "example_id": 0})
+        d["n"] += r["n"]
+        if r["last"] > d["last"]:
+            d["last"], d["example_id"] = r["last"], r["example_id"]
+    return sorted(out.values(), key=lambda x: -x["n"])[:limit]
+
+
 # ---------- session pinning ----------
 
 @_resilient(default=None)

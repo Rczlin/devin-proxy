@@ -264,6 +264,12 @@ def make_router(app):
             headers={"Content-Disposition":
                      f'attachment; filename="{fn}.jsonl"'})
 
+    @router.get("/api/requests/errors", dependencies=[Depends(admin_key)])
+    def request_errors(hours: int = 24):
+        """Error rollup for the log page — failures grouped by a stripped
+        signature so 'timeout after 31.4s' / '…29.9s' count together."""
+        return {"errors": store.error_stats(hours if hours >= 0 else 24)}
+
     @router.get("/api/requests/{rid}", dependencies=[Depends(admin_key)])
     def request_detail(rid: int):
         r = store.get_request(rid)
