@@ -2,6 +2,7 @@
 zip, plus the streaming zip writer used by /admin/api/export."""
 import gzip
 import io
+import os
 
 
 _DECODER = '''\
@@ -61,3 +62,16 @@ class _ZipStreamer(io.RawIOBase):
                 if not chunk:
                     return
                 yield chunk
+
+
+def git_head():
+    """Short git SHA of the running tree, if this is a checkout."""
+    try:
+        import subprocess
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             cwd=here, capture_output=True, timeout=3,
+                             text=True)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
