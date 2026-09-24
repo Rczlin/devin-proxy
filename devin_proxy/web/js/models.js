@@ -121,8 +121,10 @@ async function loadModels(){
   $('#alias-list').innerHTML+=(d.hidden_aliases||[]).map(a=>
     `<button class="muted" style="margin:0 6px 8px 0;text-decoration:line-through;opacity:.6"
       onclick="unhideAlias('${esc(a)}')" title="已隐藏 — 点击恢复">${esc(a)}</button>`).join('');
-  $('#model-stats').innerHTML=(d.stats||[]).map(m=>
-    `<tr><td><span class="tag model">${esc(m.m)}</span></td><td>${m.n}</td><td>${m.errs||0}</td><td>${fmt(m.in_tok)}</td><td>${fmt(m.out_tok)}</td><td>${fmt(m.cached||0)}</td><td>${(m.cached||m.in_tok)?Math.round(100*(m.cached||0)/((m.cached||0)+(m.in_tok||1)))+'%':'-'}</td><td>${m.avg_tps?m.avg_tps.toFixed(1):'-'}</td><td>${Math.round(m.avg_lat)}ms</td><td>${fmtT(m.last_used)}</td></tr>`).join('')||'<tr><td colspan=10 class=muted>暂无使用记录</td></tr>';
+  $('#model-stats').innerHTML=(d.stats||[]).map(m=>{
+    const tot=(m.in_tok||0);
+    const hitPct=tot?Math.round(100*(m.cached||0)/tot)+'%':'-';
+    return `<tr><td><span class="tag model">${esc(m.m)}</span></td><td>${m.n}</td><td>${m.errs||0}</td><td title="含缓存读 ${fmt(m.cached||0)}">${fmt(tot)}</td><td>${fmt(m.out_tok)}</td><td>${fmt(m.cached||0)}</td><td>${hitPct}</td><td>${m.avg_tps?m.avg_tps.toFixed(1):'-'}</td><td>${Math.round(m.avg_lat)}ms</td><td>${fmtT(m.last_used)}</td></tr>`}).join('')||'<tr><td colspan=10 class=muted>暂无使用记录</td></tr>';
   const rq=$('#rq-model'),cur=rq.value;
   rq.innerHTML='<option value="">全部模型</option>'+d.models.map(m=>`<option>${esc(m)}</option>`).join('');
   rq.value=cur;
