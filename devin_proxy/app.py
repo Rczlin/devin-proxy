@@ -983,7 +983,12 @@ def create_app(api_key=None):
             return StreamingResponse(
                 _release_gen(_sse_stream(request, body, model, skey, t0),
                              release),
-                media_type="text/event-stream")
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "Connection": "keep-alive",
+                })
         try:
             resp = await run_in_threadpool(
                 _collect, request, body, model, skey, t0)
@@ -1167,6 +1172,61 @@ def create_app(api_key=None):
             raise HTTPException(429, "key concurrency limit reached")
         return await run_in_threadpool(
             responses_mod.handle, request, body, t0,
+            iter_chat=iter_chat, resolve_model=resolve_model,
+            record=_record, release=release)
+
+    @app.websocket("/v1/responses")
+    async def responses_ws(websocket):
+        """WebSocket transport for /v1/responses. Client sends the request
+        body as the first JSON message; server streams Responses-API events
+        back as JSON messages. Same semantics as POST + SSE."""
+        # auth: same Bearer token check as HTTP — checked before accept so
+        # an unauthenticated handshake gets refused without a frame flowing
+        auth = websocket.headers.get("authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        websocket.state.key_name = None
+        websocket.state.key_row = None
+        authed = False
+        if token and token == app.state.proxy_key:
+            websocket.state.key_name = "master"
+            authed = True
+        elif token:
+            info = store.key_info(token)
+            if info and not info["disabled"]:
+                websocket.state.key_name = info["name"]
+                websocket.state.key_row = info
+                authed = True
+        if not authed:
+            await websocket.close(code=4401)
+            return
+        await websocket.accept()
+        request = websocket
+        t0 = time.perf_counter()
+        try:
+            raw = await websocket.receive_text()
+            body = json.loads(raw)
+        except Exception as e:
+            await websocket.send_json({"error": {"message": f"invalid JSON body: {e}",
+                                                 "type": "invalid_request_error"}})
+            await websocket.close()
+            return
+        if not isinstance(body, dict):
+            await websocket.send_json({"error": {"message": "body must be a JSON object",
+                                                 "type": "invalid_request_error"}})
+            await websocket.close()
+            return
+        reqlog_for(request, body, raw.encode())
+        release = acquire_key_slot(request)
+        if release is None:
+            _record(request, body, resolve_model(body), False, 429,
+                    "key concurrency limit reached", None, t0, None,
+                    endpoint="responses_ws")
+            await websocket.send_json({"error": {"message": "key concurrency limit reached",
+                                                 "type": "rate_limit_error"}})
+            await websocket.close()
+            return
+        await responses_mod.handle_ws(
+            websocket, request, body, t0,
             iter_chat=iter_chat, resolve_model=resolve_model,
             record=_record, release=release)
 
