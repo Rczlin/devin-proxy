@@ -8,10 +8,12 @@ Server-side state: every completed response is persisted (store.responses)
 with its input+output items, so `previous_response_id` chains rebuild full
 context — and inherit the pinned account of the chain.
 """
+import asyncio
 import json
 import time
 import uuid
 
+from fastapi import WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import store, upstream
@@ -376,7 +378,12 @@ def handle(request, body, t0, *, iter_chat, resolve_model, record,
                 _release_wrap(
                     _sse(request, body, chat_body, model, skey, rid, items,
                          iter_chat, record, t0), release),
-                media_type="text/event-stream")
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                    "Connection": "keep-alive",
+                })
             released = True     # generator wrapper owns the slot now
             return resp
         return _collect(request, body, chat_body, model, skey, rid, items,
@@ -673,3 +680,338 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
                account=acct_name, endpoint="responses")
         yield rl.out(em.ev("response.completed", response=resp))
     yield rl.out("data: [DONE]\n\n")
+
+
+# ---------- WebSocket transport ----------
+
+class _WsEmit:
+    """Responses-API event emitter that sends JSON objects over a WebSocket
+    instead of SSE `data:` frames. Same event types, same payload shape —
+    just no SSE envelope."""
+
+    def __init__(self, ws):
+        self.ws = ws
+        self.seq = 0
+
+    async def ev(self, type_, **kw):
+        self.seq += 1
+        await self.ws.send_json(
+            {"type": type_, "sequence_number": self.seq, **kw})
+
+
+async def _ws_stream(ws, request, body, chat_body, model, skey, rid,
+                     items_in, iter_chat, record, t0):
+    """WebSocket variant of _sse — identical event sequence, delivered as
+    JSON messages instead of SSE frames. Runs the sync iter_chat generator
+    in a thread so the event loop stays responsive."""
+    rl = reqlog_for(request, body)
+    em = _WsEmit(ws)
+    custom = custom_tool_names(body)
+    agg, usage, err = ToolAgg(), None, None
+    acct_name, ttft = None, None
+    base = response_object(rid, model, body, [], None, status="in_progress")
+    text_parts, think_parts = [], []
+
+    out_idx = -1
+    open_kind = None
+    msg_id = _iid("msg")
+    rs_id = _iid("rs")
+    fc_open = None
+    fc_items = []
+
+    async def close_open():
+        nonlocal open_kind
+        if open_kind == "reasoning":
+            t = "".join(think_parts)
+            await em.ev("response.reasoning_summary_text.done",
+                        item_id=rs_id, output_index=out_idx,
+                        summary_index=0, text=t)
+            await em.ev("response.reasoning_summary_part.done",
+                        item_id=rs_id, output_index=out_idx,
+                        summary_index=0,
+                        part={"type": "summary_text", "text": t})
+            await em.ev("response.output_item.done", output_index=out_idx,
+                        item={"id": rs_id, "type": "reasoning",
+                              "summary": [{"type": "summary_text",
+                                           "text": t}]})
+        elif open_kind == "message":
+            t = "".join(text_parts)
+            await em.ev("response.output_text.done", item_id=msg_id,
+                        output_index=out_idx, content_index=0, text=t)
+            await em.ev("response.content_part.done", item_id=msg_id,
+                        output_index=out_idx, content_index=0,
+                        part={"type": "output_text", "text": t,
+                              "annotations": []})
+            await em.ev("response.output_item.done", output_index=out_idx,
+                        item={"id": msg_id, "type": "message",
+                              "role": "assistant", "status": "completed",
+                              "content": [{"type": "output_text", "text": t,
+                                           "annotations": []}]})
+        elif open_kind == "fc" and fc_open:
+            c = agg.calls.get(fc_open["call_id"],
+                              {"name": fc_open["name"], "args": ""})
+            if fc_open.get("custom"):
+                inp = _unwrap_input(c["args"])
+                await em.ev("response.custom_tool_call_input.done",
+                            item_id=fc_open["id"], output_index=out_idx,
+                            input=inp)
+                item = {"id": fc_open["id"], "type": "custom_tool_call",
+                        "call_id": fc_open["call_id"], "name": c["name"],
+                        "input": inp, "status": "completed"}
+            else:
+                await em.ev("response.function_call_arguments.done",
+                            item_id=fc_open["id"], output_index=out_idx,
+                            arguments=c["args"])
+                item = {"id": fc_open["id"], "type": "function_call",
+                        "call_id": fc_open["call_id"], "name": c["name"],
+                        "arguments": c["args"], "status": "completed"}
+            fc_items.append(item)
+            await em.ev("response.output_item.done", output_index=out_idx,
+                        item=item)
+        open_kind = None
+
+    async def open_reasoning():
+        nonlocal out_idx, open_kind
+        out_idx += 1
+        open_kind = "reasoning"
+        await em.ev("response.output_item.added", output_index=out_idx,
+                    item={"id": rs_id, "type": "reasoning", "summary": []})
+        await em.ev("response.reasoning_summary_part.added", item_id=rs_id,
+                    output_index=out_idx, summary_index=0,
+                    part={"type": "summary_text", "text": ""})
+
+    async def open_message():
+        nonlocal out_idx, open_kind
+        out_idx += 1
+        open_kind = "message"
+        await em.ev("response.output_item.added", output_index=out_idx,
+                    item={"id": msg_id, "type": "message",
+                          "role": "assistant", "status": "in_progress",
+                          "content": []})
+        await em.ev("response.content_part.added", item_id=msg_id,
+                    output_index=out_idx, content_index=0,
+                    part={"type": "output_text", "text": "",
+                          "annotations": []})
+
+    async def open_fc(call_id, name):
+        nonlocal out_idx, open_kind, fc_open
+        out_idx += 1
+        open_kind = "fc"
+        fc_open = {"id": _iid("fc"), "call_id": call_id, "name": name,
+                   "custom": name in custom}
+        item = {"id": fc_open["id"], "call_id": call_id, "name": name,
+                "status": "in_progress"}
+        if fc_open["custom"]:
+            item.update(type="custom_tool_call", input="")
+        else:
+            item.update(type="function_call", arguments="")
+        await em.ev("response.output_item.added", output_index=out_idx,
+                    item=item)
+
+    await em.ev("response.created", response=base)
+    await em.ev("response.in_progress", response=base)
+
+    # iter_chat is a sync generator that blocks on httpx — run it in a
+    # thread and pump events through an async queue so the ws send loop
+    # stays on the event loop.
+    loop = asyncio.get_running_loop()
+    q = asyncio.Queue()
+    STOP = object()
+
+    def _pump():
+        try:
+            for acct, ev in iter_chat(chat_body, skey, stream=True, log=rl):
+                loop.call_soon_threadsafe(q.put_nowait, (acct, ev))
+        except Exception as e:
+            loop.call_soon_threadsafe(q.put_nowait, (None, e))
+        finally:
+            loop.call_soon_threadsafe(q.put_nowait, (STOP, None))
+
+    pump = asyncio.get_running_loop().run_in_executor(None, _pump)
+    try:
+        while True:
+            acct, ev = await q.get()
+            if acct is STOP:
+                break
+            if acct:
+                acct_name = acct.display()
+            if isinstance(ev, dict):
+                err = ev
+                break
+            if isinstance(ev, Exception):
+                err = {"kind": "proxy_error", "message": str(ev)}
+                break
+            if ttft is None:
+                ttft = int((time.perf_counter() - t0) * 1000)
+            if ev.delta_thinking:
+                if open_kind != "reasoning":
+                    await close_open()
+                    await open_reasoning()
+                think_parts.append(ev.delta_thinking)
+                await em.ev("response.reasoning_summary_text.delta",
+                            item_id=rs_id, output_index=out_idx,
+                            summary_index=0, delta=ev.delta_thinking)
+            if ev.delta_text:
+                if open_kind != "message":
+                    await close_open()
+                    await open_message()
+                text_parts.append(ev.delta_text)
+                await em.ev("response.output_text.delta",
+                            item_id=msg_id, output_index=out_idx,
+                            content_index=0, delta=ev.delta_text)
+            for tc in ev.delta_tool_calls:
+                fed = agg.feed(tc)
+                if not fed:
+                    continue
+                idx, call, new_name, delta = fed
+                if new_name or (fc_open is None and call["id"]):
+                    if not (fc_open and fc_open["call_id"] == call["id"]):
+                        await close_open()
+                        await open_fc(call["id"], call["name"])
+                if delta and fc_open:
+                    await em.ev(
+                        "response.custom_tool_call_input.delta"
+                        if fc_open.get("custom")
+                        else "response.function_call_arguments.delta",
+                        item_id=fc_open["id"], output_index=out_idx,
+                        delta=delta)
+            if len(ev.usage):
+                usage = {**(usage or {}), **upstream.extract_usage(ev)}
+            ui = upstream.upstream_info(ev)
+            if ui:
+                usage = {**(usage or {}), **ui}
+    except GeneratorExit:
+        rl.flag("client_aborted")
+        rl.ev("client_aborted")
+        record(request, body, model, False, 499,
+               "client disconnected mid-stream", usage, t0, ttft,
+               account=acct_name, endpoint="responses_ws")
+        raise
+    except Exception as e:
+        err = {"kind": "proxy_error", "message": str(e)}
+        rl.ev("proxy_exception", error=repr(e)[:800])
+    finally:
+        pump.cancel()
+
+    await close_open()
+
+    if err:
+        status = err.get("http_error", 502)
+        msg = err.get("message", "upstream error")
+        kind = err.get("kind") or "upstream_error"
+        resp = response_object(rid, model, body, [], usage,
+                               status="failed",
+                               err={"code": kind, "message": msg})
+        rl.ev("downstream_error", detail=err)
+        await em.ev("response.failed", response=resp)
+        await em.ev("error", code=kind, message=msg)
+        record(request, body, model, False, status, msg, usage, t0, ttft,
+               account=acct_name, endpoint="responses_ws")
+    else:
+        items_out = output_items("".join(text_parts), "".join(think_parts),
+                                 agg, custom)
+        k = 0
+        for it in items_out:
+            if it["type"] == "reasoning":
+                it["id"] = rs_id
+            elif it["type"] == "message":
+                it["id"] = msg_id
+            elif it["type"] in ("function_call", "custom_tool_call") \
+                    and k < len(fc_items):
+                it.update(fc_items[k])
+                k += 1
+        resp = response_object(rid, model, body, items_out, usage)
+        _persist(body, rid, model, "completed", acct_name, skey,
+                 items_in, items_out, resp)
+        rl.ev("finish", status="completed")
+        record(request, body, model, True, 200, None, usage, t0, ttft,
+               account=acct_name, endpoint="responses_ws")
+        await em.ev("response.completed", response=resp)
+    await ws.send_json({"type": "done"})
+
+
+async def handle_ws(ws, request, body, t0, *, iter_chat, resolve_model,
+                    record, release=None):
+    """WebSocket handler for /v1/responses. Client sends the request body as
+    the first JSON message; server streams Responses-API events back as JSON
+    messages. Mirrors the HTTP POST + SSE path exactly."""
+    released = False
+
+    def done():
+        nonlocal released
+        if release and not released:
+            released = True
+            release()
+    try:
+        try:
+            chat_body, items, chain_skey = to_chat_body(body)
+        except ValueError as e:
+            record(request, body, "", False, 400, str(e), None, t0, None,
+                   endpoint="responses_ws")
+            await ws.send_json({"error": {"message": str(e),
+                                          "type": "invalid_request_error",
+                                          "code": "previous_response_not_found"}})
+            return
+        except Exception as e:
+            record(request, body, "", False, 500,
+                   f"request mapping failed: {e}", None, t0, None,
+                   endpoint="responses_ws")
+            await ws.send_json({"error": {"message": str(e),
+                                          "type": "server_error"}})
+            return
+        rl0 = reqlog_for(request, body)
+        try:
+            sent = {t["function"]["name"] for t in chat_body["tools"]}
+            dropped = [{"name": t.get("name")
+                               or (t.get("function") or {}).get("name"),
+                        "type": t.get("type"),
+                        "n_sub": len(t.get("tools") or []) or None}
+                       for t in (body.get("tools") or [])
+                       if isinstance(t, dict)
+                       and (t.get("name")
+                            or (t.get("function") or {}).get("name"))
+                       not in sent]
+            in_types = {}
+            inp = body.get("input")
+            for it in (inp if isinstance(inp, list) else []):
+                ty = (it.get("type") or ("message" if it.get("role") else "?")
+                      if isinstance(it, dict) else "?")
+                in_types[ty] = in_types.get(ty, 0) + 1
+            rl0.ev("mapped", prev=body.get("previous_response_id"),
+                   n_items=len(items), input_types=in_types or None,
+                   n_msgs=len(chat_body.get("messages") or []),
+                   n_tools=len(chat_body["tools"]),
+                   dropped_tools=dropped[:100] or None,
+                   store=body.get("store"), transport="ws")
+        except Exception:
+            pass
+        model = resolve_model(chat_body)
+        row = getattr(request.state, "key_row", None)
+        allowed = set(row["models"]) if row and row.get("models") else None
+        if (allowed is not None and chat_body.get("model") not in allowed
+                and model not in allowed):
+            record(request, body, model, False, 403,
+                   "model not permitted for this key", None, t0, None,
+                   endpoint="responses_ws")
+            await ws.send_json({"error": {"message": "model not permitted for this key",
+                                          "type": "invalid_request_error",
+                                          "code": "model_not_permitted"}})
+            return
+        conv = body.get("conversation")
+        if isinstance(conv, dict):
+            conv = conv.get("id")
+        skey = (chain_skey
+                or (f"conv:{conv}" if conv else None)
+                or (f"resp:{body['previous_response_id']}"
+                    if body.get("previous_response_id") else None)
+                or _fingerprint(messages_of(chat_body))
+                or (f"u:{u}" if (u := body.get("user")
+                                 or body.get("prompt_cache_key")
+                                 or body.get("safety_identifier"))
+                    else None))
+        rid = _iid("resp")
+        released = True     # _ws_stream owns the slot now
+        await _ws_stream(ws, request, body, chat_body, model, skey, rid,
+                         items, iter_chat, record, t0)
+    finally:
+        done()
