@@ -1,7 +1,8 @@
 const $ = s => document.querySelector(s);
 const toast = m => { const t=$('#toast'); t.textContent=m; t.style.display='block'; clearTimeout(t._t); t._t=setTimeout(()=>t.style.display='none',3000) };
-const fmt = n => n==null?'-':(n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n));
-const fmtB = n => n>=1e6?(n/1e6).toFixed(1)+' MB':n>=1e3?(n/1e3).toFixed(1)+' KB':n+' B';
+const fmt = n => n==null?'-':(n>=1e9?(n/1e9).toFixed(2)+'B':n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'K':String(n));
+const fmtB = n => n==null?'-':n>=1e9?(n/1073741824).toFixed(2)+' GB':n>=1e6?(n/1048576).toFixed(1)+' MB':n>=1e3?(n/1024).toFixed(1)+' KB':n+' B';
+const fmtFull = n => n==null?'-':Number(n).toLocaleString('en-US');
 const fmtT = ts => ts?new Date(ts*1000).toLocaleString('zh-CN',{hour12:false}):'-';
 const fmtDur = s => s>86400?(s/86400).toFixed(1)+' 天':s>3600?(s/3600).toFixed(1)+' 小时':Math.round(s/60)+' 分钟';
 const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));

@@ -25,7 +25,7 @@ h2{font-size:18px;margin-bottom:16px;font-weight:600}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:18px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
 .card .k{font-size:12px;color:var(--dim);margin-bottom:6px}
-.card .v{font-size:22px;font-weight:700;font-family:var(--mono)}
+.card .v{font-size:20px;font-weight:700;font-family:var(--mono);white-space:nowrap}
 .card .v.green{color:var(--green)}.card .v.red{color:var(--red)}.card .v.yellow{color:var(--yellow)}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;margin-bottom:18px}
 .panel h3{font-size:13px;color:var(--dim);font-weight:600;margin-bottom:12px;text-transform:uppercase;letter-spacing:.4px}
@@ -103,7 +103,7 @@ textarea{width:100%;min-height:90px;resize:vertical;font-family:var(--mono);font
 .mchip .tag{margin:2px 2px 0 0}
 /* dashboard v2 */
 .card{cursor:default}
-.card .sub{font-size:11px;color:var(--dim);margin-top:5px;font-family:var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.card .sub{font-size:11px;color:var(--dim);margin-top:5px;font-family:var(--mono);white-space:normal;overflow:hidden;text-overflow:ellipsis;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow-wrap:anywhere}
 .card.link{cursor:pointer}.card.link:hover{border-color:var(--accent)}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 18px}
 @media(max-width:980px){.grid2{grid-template-columns:1fr}}

@@ -33,21 +33,21 @@ function renderDashCards(d){
   const pool=d.pool||{};
   const disk=d.disk||{};
   const cards=[
-    {k:'请求数',v:fmt(d.total),sub:`今日 ${fmt(d.today.requests)} · 累计 ${fmt(d.alltime.requests)}`},
-    {k:'成功率',v:rate==null?'-':rate.toFixed(1)+'%',sub:`错误 ${d.errors}`,cls:rate==null?'':rate>=99?'green':rate>=95?'yellow':'red'},
-    {k:'Tokens',v:fmt(d.input_tokens+d.output_tokens),sub:`入 ${fmt(d.input_tokens)} · 出 ${fmt(d.output_tokens)}（输入含缓存读 ${fmt(d.cached_tokens||0)}）`},
-    {k:'缓存命中',v:(d.cache_hit_pct??0)+'%',sub:`读 ${fmt(d.cached_tokens||0)} · 写 ${fmt(d.cache_creation_tokens||0)}`,cls:d.cache_hit_pct>=50?'green':d.cached_tokens?'yellow':''},
-    {k:'平均延迟',v:d.avg_latency_ms+'ms',sub:`P50 ${d.p50_ms}ms · P95 ${d.p95_ms}ms`},
+    {k:'请求数',v:fmt(d.total),vt:`${fmtFull(d.total)} 请求`,sub:`今日 ${fmt(d.today.requests)} · 累计 ${fmt(d.alltime.requests)}`,st:`今日 ${fmtFull(d.today.requests)} 请求 · 累计 ${fmtFull(d.alltime.requests)} 请求`},
+    {k:'成功率',v:rate==null?'-':rate.toFixed(1)+'%',sub:`错误 ${fmt(d.errors)}`,st:`错误 ${fmtFull(d.errors)} / 共 ${fmtFull(d.total)} 请求`,cls:rate==null?'':rate>=99?'green':rate>=95?'yellow':'red'},
+    {k:'Tokens',v:fmt(d.input_tokens+d.output_tokens),vt:fmtFull(d.input_tokens+d.output_tokens)+' tokens',sub:`入 ${fmt(d.input_tokens)} · 出 ${fmt(d.output_tokens)}`,st:`输入 ${fmtFull(d.input_tokens)}（含缓存读 ${fmtFull(d.cached_tokens||0)}，未缓存 ${fmtFull(d.uncached_tokens||0)}）· 输出 ${fmtFull(d.output_tokens)}`},
+    {k:'缓存命中',v:(d.cache_hit_pct??0)+'%',sub:`读 ${fmt(d.cached_tokens||0)} · 写 ${fmt(d.cache_creation_tokens||0)}`,st:`缓存读 ${fmtFull(d.cached_tokens||0)} · 缓存写 ${fmtFull(d.cache_creation_tokens||0)}`,cls:d.cache_hit_pct>=50?'green':d.cached_tokens?'yellow':''},
+    {k:'平均延迟',v:d.avg_latency_ms+'ms',sub:`P50 ${d.p50_ms}ms · P95 ${d.p95_ms}ms`,st:`P50 ${fmtFull(d.p50_ms)}ms · P95 ${fmtFull(d.p95_ms)}ms · 均值 ${fmtFull(d.avg_latency_ms)}ms`},
     {k:'平均 TPS',v:d.avg_tps||'-',sub:'tok/s 输出速率'},
-    {k:'平均 TTFT',v:d.avg_ttft_ms?d.avg_ttft_ms+'ms':'-',sub:'流式占比 '+(d.total?Math.round(100*d.streams/d.total)+'%':'-')},
-    {k:'每分钟请求',v:d.rpm,sub:`tok/min ${fmt(d.tpm)}`},
+    {k:'平均 TTFT',v:d.avg_ttft_ms?d.avg_ttft_ms+'ms':'-',sub:'流式占比 '+(d.total?Math.round(100*d.streams/d.total)+'%':'-'),st:`流式 ${fmtFull(d.streams||0)} / ${fmtFull(d.total)} 请求`},
+    {k:'每分钟请求',v:d.rpm,sub:`tok/min ${fmt(d.tpm)}`,st:`最近5分钟 ${fmtFull(d.tpm*5)} tokens ≈ ${fmtFull(d.tpm)}/min`},
     {k:'在途请求',v:pool.in_flight||0,sub:`钉扎会话 ${pool.sessions||0}`},
     {k:'账号就绪',v:`${pool.ready||0}/${pool.total||0}`,sub:`冷却 ${pool.cooldown||0} · 启用 ${pool.enabled||0}`,cls:pool.total?(pool.ready?'green':'red'):'',click:'accs'},
     {k:'断流 · 重试',v:`${d.truncated||0} · ${d.retried||0}`,sub:'点击筛选断流日志',cls:d.truncated?'red':'',click:'trunc'},
     ...(disk.total?[{k:'磁盘剩余',v:fmtB(disk.free),sub:`${fmtB((disk.total||0)-(disk.free||0))} 已用 / ${fmtB(disk.total)}`,cls:disk.low?'red':disk.free/disk.total<0.15?'yellow':'',click:'conf'}]:[]),
   ];
   $('#cards').innerHTML=cards.map(c=>
-    `<div class="card${c.click?' link':''}"${c.click?` onclick="cardGo('${c.click}')"`:''}><div class="k">${c.k}</div><div class="v ${c.cls}">${c.v}</div><div class="sub" title="${esc(c.sub)}">${esc(c.sub)}</div></div>`).join('');
+    `<div class="card${c.click?' link':''}"${c.click?` onclick="cardGo('${c.click}')"`:''}><div class="k">${c.k}</div><div class="v ${c.cls}"${c.vt?` title="${esc(c.vt)}"`:''}>${c.v}</div><div class="sub" title="${esc(c.st||c.sub)}">${esc(c.sub)}</div></div>`).join('');
 }
 function cardGo(k){
   if(k==='accs')return goPage('accs');
