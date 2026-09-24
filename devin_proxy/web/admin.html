@@ -52,7 +52,7 @@
       </div>
       <div class="grid2">
         <div class="panel">
-          <h3>Token 用量 <span class="legend"><span><i style="background:#1f6feb"></i>输入</span><span><i style="background:#a371f7"></i>输出</span></span></h3>
+          <h3>Token 用量 <span class="legend"><span><i style="background:#1f6feb"></i>输入</span><span><i style="background:#3fb950"></i>缓存读</span><span><i style="background:#a371f7"></i>输出</span></span></h3>
           <div class="chartbox" id="chart-tok"></div>
         </div>
         <div class="panel">
@@ -63,12 +63,12 @@
       <div class="grid2">
         <div class="panel">
           <h3>账号用量 <span class="muted" style="text-transform:none;letter-spacing:0">点击行筛选该账号日志</span></h3>
-          <table><thead><tr><th>账号</th><th>请求</th><th>错误率</th><th>Tokens</th><th>平均延迟</th><th>最近使用</th></tr></thead>
+          <table><thead><tr><th>账号</th><th>请求</th><th>错误率</th><th>Tokens</th><th>缓存</th><th>平均延迟</th><th>最近使用</th></tr></thead>
           <tbody id="dash-accs"></tbody></table>
         </div>
         <div class="panel">
           <h3>Key 用量</h3>
-          <table><thead><tr><th>Key</th><th>请求</th><th>错误</th><th>Tokens</th><th>最近使用</th></tr></thead>
+          <table><thead><tr><th>Key</th><th>请求</th><th>错误</th><th>Tokens</th><th>缓存</th><th>最近使用</th></tr></thead>
           <tbody id="dash-keys"></tbody></table>
         </div>
       </div>
@@ -107,7 +107,7 @@
       <div id="rq-errs" style="display:none;margin-bottom:12px"></div>
       <div class="panel" style="padding:0;overflow-x:auto">
         <table><thead><tr>
-          <th>#</th><th>时间</th><th>模型</th><th>接口</th><th>流式</th><th>状态</th><th>输入</th><th>输出</th><th>缓存</th><th>延迟</th><th>TTFT</th><th>TPS</th><th>账号</th><th>Key</th><th class="ops">操作</th>
+          <th>#</th><th>时间</th><th>模型</th><th>接口</th><th>流式</th><th>状态</th><th>总输入</th><th>输出</th><th>缓存读</th><th>延迟</th><th>TTFT</th><th>TPS</th><th>账号</th><th>Key</th><th class="ops">操作</th>
         </tr></thead><tbody id="rq-body"></tbody></table>
       </div>
     </section>
@@ -205,7 +205,7 @@
       </div>
       <div class="panel">
         <h3>使用统计</h3>
-        <table><thead><tr><th>模型</th><th>请求</th><th>错误</th><th>输入 tok</th><th>输出 tok</th><th>缓存 tok</th><th>命中率</th><th>平均 TPS</th><th>平均延迟</th><th>最近使用</th></tr></thead>
+        <table><thead><tr><th>模型</th><th>请求</th><th>错误</th><th>总输入</th><th>输出</th><th>缓存读</th><th>命中率</th><th>平均 TPS</th><th>平均延迟</th><th>最近使用</th></tr></thead>
         <tbody id="model-stats"></tbody></table>
       </div>
     </section>

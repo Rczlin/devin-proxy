@@ -35,7 +35,7 @@ function renderDashCards(d){
   const cards=[
     {k:'请求数',v:fmt(d.total),sub:`今日 ${fmt(d.today.requests)} · 累计 ${fmt(d.alltime.requests)}`},
     {k:'成功率',v:rate==null?'-':rate.toFixed(1)+'%',sub:`错误 ${d.errors}`,cls:rate==null?'':rate>=99?'green':rate>=95?'yellow':'red'},
-    {k:'Tokens',v:fmt(d.input_tokens+d.output_tokens+(d.cached_tokens||0)),sub:`入 ${fmt(d.input_tokens)} · 出 ${fmt(d.output_tokens)} · 缓存 ${fmt(d.cached_tokens||0)}`},
+    {k:'Tokens',v:fmt(d.input_tokens+d.output_tokens),sub:`入 ${fmt(d.input_tokens)} · 出 ${fmt(d.output_tokens)}（输入含缓存读 ${fmt(d.cached_tokens||0)}）`},
     {k:'缓存命中',v:(d.cache_hit_pct??0)+'%',sub:`读 ${fmt(d.cached_tokens||0)} · 写 ${fmt(d.cache_creation_tokens||0)}`,cls:d.cache_hit_pct>=50?'green':d.cached_tokens?'yellow':''},
     {k:'平均延迟',v:d.avg_latency_ms+'ms',sub:`P50 ${d.p50_ms}ms · P95 ${d.p95_ms}ms`},
     {k:'平均 TPS',v:d.avg_tps||'-',sub:'tok/s 输出速率'},
@@ -114,7 +114,7 @@ function renderReqChart(d){
   s.forEach((b,i)=>{
     const hz=SE('rect',{x:pl+i*step,y:pt,width:step,height:ih,fill:'transparent'});
     hz.onmousemove=ev=>chartTip(el,ev,
-      `<b>${new Date(b.t*1000).toLocaleString('zh-CN',{hour12:false})}</b><br>${b.n} 请求 · ${b.errs} 错 · ${fmt(b.in_tok+b.out_tok)} tok · 均延 ${fmt(b.avg_lat)}ms`);
+      `<b>${new Date(b.t*1000).toLocaleString('zh-CN',{hour12:false})}</b><br>${b.n} 请求 · ${b.errs} 错 · ${fmt(b.in_tok+b.out_tok+(b.cache_rd||0))} tok · 均延 ${fmt(b.avg_lat)}ms`);
     hz.onmouseenter=ev=>ev.target.setAttribute('fill','#ffffff08');
     hz.onmouseleave=ev=>{ev.target.setAttribute('fill','transparent');hideTip(el)};
     svg.appendChild(hz);
@@ -128,7 +128,7 @@ function renderTokChart(d){
   const W=Math.max(280,el.clientWidth||400),H=180,pl=42,pr=8,pt=12,pb=24;
   const iw=W-pl-pr,ih=H-pt-pb;
   const svg=SE('svg',{width:'100%',height:H,viewBox:`0 0 ${W} ${H}`});
-  const maxT=niceMax(Math.max(...s.map(b=>b.in_tok+b.out_tok)));
+  const maxT=niceMax(Math.max(...s.map(b=>b.in_tok+b.out_tok+(b.cache_rd||0))));
   for(let i=0;i<=3;i++){
     const y=pt+ih-i*ih/3;
     svg.appendChild(SE('line',{x1:pl,y1:y,x2:W-pr,y2:y,stroke:'#21262d'}));
@@ -138,11 +138,15 @@ function renderTokChart(d){
   const step=iw/n,bw=Math.max(2,Math.min(step*0.66,44));
   s.forEach((b,i)=>{
     const cx=pl+i*step+step/2,x=cx-bw/2;
-    const hI=b.in_tok/maxT*ih,hO=b.out_tok/maxT*ih;
-    if(hI>0.4)svg.appendChild(SE('rect',{x,y:pt+ih-hI,width:bw,height:hI,fill:'#1f6feb',rx:1}));
-    if(hO>0.4)svg.appendChild(SE('rect',{x,y:pt+ih-hI-hO,width:bw,height:hO,fill:'#a371f7',rx:1}));
+    const cr=b.cache_rd||0;
+    const hI=b.in_tok/maxT*ih,hC=cr/maxT*ih,hO=b.out_tok/maxT*ih;
+    const yBase=pt+ih;
+    if(hI>0.4)svg.appendChild(SE('rect',{x,y:yBase-hI,width:bw,height:hI,fill:'#1f6feb',rx:1}));
+    if(hC>0.4)svg.appendChild(SE('rect',{x,y:yBase-hI-hC,width:bw,height:hC,fill:'#3fb950',rx:1}));
+    if(hO>0.4)svg.appendChild(SE('rect',{x,y:yBase-hI-hC-hO,width:bw,height:hO,fill:'#a371f7',rx:1}));
     const hz=SE('rect',{x:pl+i*step,y:pt,width:step,height:ih,fill:'transparent'});
-    hz.onmousemove=ev=>chartTip(el,ev,`<b>${new Date(b.t*1000).toLocaleString('zh-CN',{hour12:false})}</b><br>入 ${fmt(b.in_tok)} · 出 ${fmt(b.out_tok)}`);
+    hz.onmousemove=ev=>chartTip(el,ev,
+      `<b>${new Date(b.t*1000).toLocaleString('zh-CN',{hour12:false})}</b><br>入 ${fmt(b.in_tok)}（含缓存 ${fmt(cr)}）· 出 ${fmt(b.out_tok)}`);
     hz.onmouseleave=()=>hideTip(el);
     svg.appendChild(hz);
   });
@@ -174,14 +178,15 @@ function renderDashAccs(d){
       <td>${dot}${esc(a.a)}</td><td>${a.n}</td>
       <td>${rate?`<span style="color:${rate>10?'var(--red)':'var(--yellow)'}">${rate.toFixed(1)}%</span>`:'<span class="muted">0%</span>'}</td>
       <td>${fmt((a.in_tok||0)+(a.out_tok||0))}</td>
+      <td>${a.cached?`<span class="muted" title="缓存读 ${fmt(a.cached)}">${fmt(a.cached)}</span>`:'<span class=muted>-</span>'}</td>
       <td>${Math.round(a.avg_lat)}ms</td><td class="muted">${fmtT(a.last_used)}</td></tr>`;
-  }).join('')||'<tr><td colspan=6 class=muted>窗口内暂无账号流量</td></tr>';
+  }).join('')||'<tr><td colspan=7 class=muted>窗口内暂无账号流量</td></tr>';
 }
 function renderDashKeys(d){
   $('#dash-keys').innerHTML=(d.by_key||[]).map(k=>
     `<tr><td>${esc(k.k||'(master/未记录)')}</td><td>${k.n}</td><td>${k.errs?`<span style="color:var(--red)">${k.errs}</span>`:0}</td>
-     <td>${fmt(k.tok)}</td><td class="muted">${fmtT(k.last_used)}</td></tr>`).join('')
-    ||'<tr><td colspan=5 class=muted>暂无数据</td></tr>';
+     <td>${fmt(k.tok)}</td><td>${k.cached?`<span class="muted" title="缓存读 ${fmt(k.cached)}">${fmt(k.cached)}</span>`:'<span class=muted>-</span>'}</td><td class="muted">${fmtT(k.last_used)}</td></tr>`).join('')
+    ||'<tr><td colspan=6 class=muted>暂无数据</td></tr>';
 }
 function renderDashErrs(d){
   $('#dash-errs').innerHTML=(d.recent_errors||[]).map(r=>

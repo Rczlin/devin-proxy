@@ -7,12 +7,17 @@ function renderAcctChip(){
 const PAGE=50;
 const FLAG_LABELS={truncated:'断流',retried:'重试',retried_partial:'部分重试',retry_same_account:'同号重试',no_stop_reason:'无stop',client_aborted:'客户端断开',protocol_error:'协议错'};
 const flagTags=f=>(f||'').split(',').filter(Boolean).map(x=>` <span class="tag ${x==='truncated'?'err':'off'}">${esc(FLAG_LABELS[x]||x)}</span>`).join('');
+const inTok=r=>(r.prompt_tokens||0)+(r.cached_tokens||0);
+const inTokCell=r=>{
+  const tot=inTok(r),c=r.cached_tokens||0;
+  return c?`<span title="总输入 ${fmt(tot)} = 未缓存 ${fmt(r.prompt_tokens||0)} + 缓存读 ${fmt(c)}">${fmt(tot)}<span class="muted"> (${fmt(c)}↩)</span></span>`
+        :`${fmt(tot)}`};
 const cacheCell=r=>{
-  const c=r.cached_tokens||0,tot=c+(r.prompt_tokens||0);
+  const c=r.cached_tokens||0,tot=inTok(r);
   if(!tot)return '<span class=muted>-</span>';
   const pct=Math.round(100*c/tot);
-  return c?`<span style="color:var(--green)" title="命中 ${c}/${tot}">${fmt(c)}<span class="muted"> ${pct}%</span></span>`
-        :`<span class=muted title="未命中">${pct}%</span>`};
+  return c?`<span style="color:var(--green)" title="缓存读 ${fmt(c)} / 总输入 ${fmt(tot)}">${fmt(c)}<span class="muted"> ${pct}%</span></span>`
+        :`<span class=muted title="无缓存读">${pct}%</span>`};
 function reqFilters(){
   const model=$('#rq-model').value, ok=$('#rq-ok').value, q=$('#rq-q').value.trim(), flag=$('#rq-flag').value;
   return (model?`&model=${encodeURIComponent(model)}`:'')+(ok!==''?`&ok=${ok}`:'')+(q?`&q=${encodeURIComponent(q)}`:'')+(flag?`&flag=${encodeURIComponent(flag)}`:'')+(reqAccount?`&account=${encodeURIComponent(reqAccount)}`:'');
@@ -32,7 +37,7 @@ async function loadReqs(){
     <td class="muted">${esc(r.endpoint||'chat')}</td>
     <td>${r.stream?'✓':''}</td>
     <td><span class="tag ${r.ok?'ok':'err'}">${r.ok?r.status:'ERR'}</span>${flagTags(r.flags)}</td>
-    <td>${r.prompt_tokens}</td><td>${r.completion_tokens}</td><td>${cacheCell(r)}</td>
+    <td>${inTokCell(r)}</td><td>${r.completion_tokens}</td><td>${cacheCell(r)}</td>
     <td>${r.latency_ms}ms</td><td>${r.ttft_ms??'-'}</td><td>${r.tps??'-'}</td>
     <td>${esc(r.account||'')}</td><td>${esc(r.key_name||'')}</td>
     <td class="ops"><button class="mini" onclick="event.stopPropagation();showReq(${r.id})">详情</button>${r.has_cap?` <button class="mini" onclick="event.stopPropagation();dlCapture(${r.id})" title="导出该请求完整抓包 JSON">📥 抓包</button>`:''}</td></tr>`).join('')||'<tr><td colspan=15 class=muted>暂无请求</td></tr>';

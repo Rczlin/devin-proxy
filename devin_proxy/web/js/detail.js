@@ -62,11 +62,12 @@ async function showReq(id){
   MD_REQ=r;
   $('#md-id').textContent='#'+r.id;
   $('#md-flags').innerHTML=flagTags(r.flags);
-  const _cacheTot=(r.cached_tokens||0)+(r.prompt_tokens||0);
+  const _cacheTot=(r.prompt_tokens||0)+(r.cached_tokens||0);   // total input
   const _cachePct=_cacheTot?Math.round(100*(r.cached_tokens||0)/_cacheTot)+'%':'-';
   $('#md-kv').innerHTML=[['时间',fmtT(r.ts)],['模型',`${esc(r.model)} → ${esc(r.resolved_model)}`],
     ['接口',esc(r.endpoint||'chat')],['状态',r.ok?r.status:'ERR'],['错误',esc(r.error||'-')],
-    ['tokens',`${r.prompt_tokens} in / ${r.completion_tokens} out`],
+    ['输入',`${fmt(r.prompt_tokens||0)} 新读 + ${fmt(r.cached_tokens||0)} 缓存读 = ${fmt(_cacheTot)} 总计`],
+    ['输出',`${fmt(r.completion_tokens||0)}`],
     ['缓存',`${fmt(r.cached_tokens||0)} 读 / ${fmt(r.cache_creation_tokens||0)} 写 · 命中率 ${_cachePct}`],
     ['延迟',r.latency_ms+'ms'],['首token',(r.ttft_ms??'-')+'ms'],['生成耗时',(r.gen_ms??'-')+'ms'],['TPS',r.tps??'-'],
     ['客户端',esc(r.client||'-')],['账号',esc(r.account||'-')],['Key',esc(r.key_name||'-')],

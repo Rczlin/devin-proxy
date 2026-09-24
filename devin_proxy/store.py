@@ -755,6 +755,7 @@ def _empty_overview(hours):
     return {
         "hours": hours or 0, "bucket_s": 0, "since": now, "now": now,
         "total": 0, "errors": 0, "streams": 0, "input_tokens": 0,
+        "uncached_tokens": 0,
         "output_tokens": 0, "cached_tokens": 0, "cache_creation_tokens": 0,
         "cache_hit_pct": 0, "avg_tps": 0, "avg_latency_ms": 0,
         "avg_ttft_ms": 0, "p50_ms": 0, "p95_ms": 0, "rpm": 0, "tpm": 0,
@@ -816,7 +817,8 @@ def _stats_overview_impl(hours=24):
         today_row = None
         if since > today:    # window doesn't reach midnight — query it
             today_row = con.execute(
-                "SELECT COUNT(*) n, SUM(prompt_tokens) i,"
+                "SELECT COUNT(*) n,"
+                " SUM(prompt_tokens+cached_tokens) i,"
                 " SUM(completion_tokens) o FROM requests WHERE ts>=?",
                 (today,)).fetchone()
         db_size = _safe_db_size()
@@ -848,7 +850,7 @@ def _stats_overview_impl(hours=24):
     byb = {}
     for r in rows:
         e = byb.setdefault(int((r["ts"] - base) / bucket),
-                           [0, 0, 0, 0, 0.0, 0])
+                           [0, 0, 0, 0, 0.0, 0, 0])
         e[0] += 1
         e[1] += 1 - (r["ok"] or 0)
         e[2] += v(r, "prompt_tokens")
@@ -856,13 +858,15 @@ def _stats_overview_impl(hours=24):
         if r["latency_ms"] is not None:
             e[4] += r["latency_ms"]
             e[5] += 1
+        e[6] += v(r, "cached_tokens")
     nb = max(0, int((now - base) // bucket))
     series = [{"t": base + b * bucket,
                "n": e[0] if e else 0,
                "errs": e[1] if e else 0,
                "in_tok": e[2] if e else 0,
                "out_tok": e[3] if e else 0,
-               "avg_lat": round(e[4] / e[5]) if e and e[5] else 0}
+               "avg_lat": round(e[4] / e[5]) if e and e[5] else 0,
+               "cache_rd": e[6] if e else 0}
               for b in range(nb + 1) for e in [byb.get(b)]]
 
     # group rollups — one dict per key, all measures accumulated together
@@ -876,6 +880,7 @@ def _stats_overview_impl(hours=24):
             if e is None:
                 e = out[k] = {"n": 0, "errs": 0, "in_tok": 0, "out_tok": 0,
                               "lat_s": 0.0, "lat_n": 0, "cached": 0,
+                              "cache_wr": 0,
                               "tps_s": 0.0, "tps_n": 0,
                               "ttft_s": 0.0, "ttft_n": 0, "last": 0}
             e["n"] += 1
@@ -883,6 +888,7 @@ def _stats_overview_impl(hours=24):
             e["in_tok"] += v(r, "prompt_tokens")
             e["out_tok"] += v(r, "completion_tokens")
             e["cached"] += v(r, "cached_tokens")
+            e["cache_wr"] += v(r, "cache_creation_tokens")
             if r["latency_ms"] is not None:
                 e["lat_s"] += r["latency_ms"]
                 e["lat_n"] += 1
@@ -912,12 +918,15 @@ def _stats_overview_impl(hours=24):
     ga = _group(lambda r: r["account"], skip_none=True)
     by_account = [{"a": k, "n": e["n"], "errs": e["errs"],
                    "in_tok": e["in_tok"], "out_tok": e["out_tok"],
+                   "cached": e["cached"],
                    "avg_lat": _avg(e, "lat_s", "lat_n"),
                    "last_used": e["last"]}
                   for k, e in sorted(ga.items(), key=lambda kv: -kv[1]["n"])]
     gk = _group(lambda r: r["key_name"])
     by_key = [{"k": k, "n": e["n"], "errs": e["errs"],
-               "tok": e["in_tok"] + e["out_tok"], "last_used": e["last"]}
+               "tok": e["in_tok"] + e["out_tok"] + e["cached"],
+               "cached": e["cached"],
+               "last_used": e["last"]}
               for k, e in sorted(gk.items(), key=lambda kv: -kv[1]["n"])]
     ge = _group(lambda r: r["endpoint"] or "chat")
     by_endpoint = [{"ep": k, "n": e["n"], "errs": e["errs"]}
@@ -938,7 +947,8 @@ def _stats_overview_impl(hours=24):
     if today_row is None:    # window covers today — reuse the same rows
         tw = [r for r in rows if r["ts"] >= today]
         today_row = {"n": len(tw),
-                     "i": sum(v(r, "prompt_tokens") for r in tw),
+                     "i": sum(v(r, "prompt_tokens") + v(r, "cached_tokens")
+                              for r in tw),
                      "o": sum(v(r, "completion_tokens") for r in tw)}
 
     in_tok = sum(v(r, "prompt_tokens") for r in rows)
@@ -953,7 +963,8 @@ def _stats_overview_impl(hours=24):
         "total": n,
         "errors": n - ok_n,
         "streams": sum(v(r, "stream") for r in rows),
-        "input_tokens": in_tok,
+        "input_tokens": in_tok + cached_tok,
+        "uncached_tokens": in_tok,
         "output_tokens": out_tok,
         "cached_tokens": cached_tok,
         "cache_creation_tokens": cache_wr,
@@ -991,7 +1002,9 @@ def _tz_offset():
 def list_models():
     rows = _q("""
       SELECT COALESCE(resolved_model,model) m, COUNT(*) n,
-             SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
+             SUM(prompt_tokens+cached_tokens) in_tok,
+             SUM(completion_tokens) out_tok,
+             SUM(cached_tokens) cached,
              AVG(latency_ms) avg_lat, MAX(ts) last_used, SUM(1-ok) errs
       FROM requests GROUP BY m ORDER BY n DESC""")
     return [dict(r) for r in rows]
@@ -1185,7 +1198,9 @@ def delete_account(aid):
 def account_stats():
     rows = _q("""
       SELECT account a, COUNT(*) n, SUM(ok) ok_n,
-             SUM(prompt_tokens) in_tok, SUM(completion_tokens) out_tok,
+             SUM(prompt_tokens+cached_tokens) in_tok,
+             SUM(completion_tokens) out_tok,
+             SUM(cached_tokens) cached,
              AVG(latency_ms) avg_lat, MAX(ts) last_used
       FROM requests WHERE account IS NOT NULL GROUP BY a""")
     return {r["a"]: dict(r) for r in rows}
