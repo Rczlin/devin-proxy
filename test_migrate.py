@@ -1,7 +1,11 @@
 import os, tempfile, sqlite3
 
+# Legacy shape: a requests table in the *log* db missing the newer columns.
+# The split layout keeps requests in <db>-logs.db, so point DEVIN_PROXY_DB
+# at the core path and pre-create the log db with the old schema.
 db = tempfile.mktemp(suffix=".db")
-c = sqlite3.connect(db)
+logdb = db[:-3] + "-logs.db"
+c = sqlite3.connect(logdb)
 c.execute("""CREATE TABLE requests (
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, model TEXT,
   resolved_model TEXT, stream INTEGER DEFAULT 0, ok INTEGER DEFAULT 1,
@@ -21,9 +25,9 @@ store.log_request(model="m", resolved_model="m", stream=1, ok=0, status=502,
                   messages_json="[]", request_json="{}", events_json="[1]",
                   sse_json="[2]", flags="truncated")
 row = store.get_request(2)
-assert row["flags"] == "truncated" and row["events_json"] == "[1]"
+assert row["flags"] == "truncated" and row["events_json"] == "[1]", row
 items, total = store.list_requests(10, 0)
-assert total == 2 and items[0]["flags"] == "truncated"
+assert total == 2 and items[0]["flags"] == "truncated", items
 assert store.get_request(1)["flags"] is None        # old row: NULL, fine
 assert "flags" in items[0] and "sse_json" not in items[0]  # list stays light
-print("MIGRATION OK — old schema upgraded, new columns work")
+print("MIGRATION OK — old schema upgraded, blobs in diag db")
