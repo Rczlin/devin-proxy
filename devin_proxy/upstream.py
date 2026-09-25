@@ -275,17 +275,35 @@ def _connect_frame(body):
     return bytes([COMPRESSED]) + len(payload).to_bytes(4, "big") + payload
 
 
-def _trailer_error(payload):
-    """end-stream payload -> (message, connect_code); (None, None) when the
-    trailer carries no error."""
+def _trailer_details(payload):
     try:
         data = json.loads(payload.decode("utf-8", "replace"))
         err = data.get("error")
         if isinstance(err, dict):
-            return err.get("message") or json.dumps(err), err.get("code")
-        return (str(err) if err else None), None
+            message = err.get("message") or json.dumps(err)
+            code = err.get("code")
+        else:
+            message = str(err) if err else None
+            code = None
+        retry_after = None
+        metadata = data.get("metadata")
+        if isinstance(metadata, dict):
+            value = next((v for k, v in metadata.items()
+                          if k.lower() == "retry-after"), None)
+            if isinstance(value, list):
+                value = value[0] if value else None
+            try:
+                retry_after = max(0.0, float(value))
+            except (TypeError, ValueError):
+                pass
+        return message, code, retry_after
     except Exception:
-        return None, None
+        return None, None, None
+
+
+def _trailer_error(payload):
+    message, code, _ = _trailer_details(payload)
+    return message, code
 
 
 # Trailer/http errors are scoped by who is at fault:
@@ -404,17 +422,20 @@ def stream_chat(client, base_url, api_key, request, timeout=None,
                 if flags & END_STREAM:
                     ended = True
                     cap("trailer", raw)
-                    err, code = _trailer_error(raw)
+                    err, code, retry_after = _trailer_details(raw)
                     if err:
                         trailer_txt = raw.decode("utf-8", "replace")[:4000]
                         # the Connect error code lives only in the trailer —
                         # soft (request-scoped) and transient (provider-side)
                         # failures must not cool the account down
                         scope = _err_scope(code, trailer_txt)
-                        yield {"kind": "upstream_error", "message": err,
-                               "trailer": trailer_txt, "code": code,
-                               "soft": scope == "soft",
-                               "transient": scope == "transient"}
+                        detail = {"kind": "upstream_error", "message": err,
+                                  "trailer": trailer_txt, "code": code,
+                                  "soft": scope == "soft",
+                                  "transient": scope == "transient"}
+                        if retry_after is not None:
+                            detail["retry_after"] = retry_after
+                        yield detail
                     continue
                 n_frames += 1
                 cap("frame", raw)

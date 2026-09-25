@@ -10,6 +10,7 @@ context — and inherit the pinned account of the chain.
 """
 import asyncio
 import json
+import threading
 import time
 import uuid
 
@@ -17,7 +18,7 @@ from fastapi import WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import store, upstream
-from .app import ToolAgg, reqlog_for
+from .app import ClientDisconnected, ToolAgg, reqlog_for
 
 
 def _iid(prefix):
@@ -636,7 +637,7 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
             ui = upstream.upstream_info(ev)
             if ui:
                 usage = {**(usage or {}), **ui}
-    except GeneratorExit:
+    except (GeneratorExit, ClientDisconnected):
         rl.flag("client_aborted")
         rl.ev("client_aborted")
         record(request, body, model, False, 499,
@@ -817,10 +818,12 @@ async def _ws_stream(ws, request, body, chat_body, model, skey, rid,
     loop = asyncio.get_running_loop()
     q = asyncio.Queue()
     STOP = object()
+    cancel_event = threading.Event()
 
     def _pump():
         try:
-            for acct, ev in iter_chat(chat_body, skey, stream=True, log=rl):
+            for acct, ev in iter_chat(chat_body, skey, stream=True, log=rl,
+                                      cancel_event=cancel_event):
                 loop.call_soon_threadsafe(q.put_nowait, (acct, ev))
         except Exception as e:
             loop.call_soon_threadsafe(q.put_nowait, (None, e))
@@ -828,16 +831,33 @@ async def _ws_stream(ws, request, body, chat_body, model, skey, rid,
             loop.call_soon_threadsafe(q.put_nowait, (STOP, None))
 
     pump = asyncio.get_running_loop().run_in_executor(None, _pump)
+    queued = asyncio.create_task(q.get())
+    receiver = asyncio.create_task(ws.receive())
     try:
         while True:
-            acct, ev = await q.get()
+            done, _ = await asyncio.wait(
+                (queued, receiver), return_when=asyncio.FIRST_COMPLETED)
+            if receiver in done:
+                try:
+                    incoming = receiver.result()
+                except Exception as e:
+                    raise ClientDisconnected from e
+                if incoming["type"] == "websocket.disconnect":
+                    raise ClientDisconnected
+                receiver = asyncio.create_task(ws.receive())
+            if queued not in done:
+                continue
+            acct, ev = queued.result()
             if acct is STOP:
                 break
+            queued = asyncio.create_task(q.get())
             if acct:
                 acct_name = acct.display()
             if isinstance(ev, dict):
                 err = ev
                 break
+            if isinstance(ev, ClientDisconnected):
+                raise ev
             if isinstance(ev, Exception):
                 err = {"kind": "proxy_error", "message": str(ev)}
                 break
@@ -880,18 +900,22 @@ async def _ws_stream(ws, request, body, chat_body, model, skey, rid,
             ui = upstream.upstream_info(ev)
             if ui:
                 usage = {**(usage or {}), **ui}
-    except GeneratorExit:
+    except (GeneratorExit, ClientDisconnected):
         rl.flag("client_aborted")
         rl.ev("client_aborted")
         record(request, body, model, False, 499,
                "client disconnected mid-stream", usage, t0, ttft,
                account=acct_name, endpoint="responses_ws")
-        raise
+        return
     except Exception as e:
         err = {"kind": "proxy_error", "message": str(e)}
         rl.ev("proxy_exception", error=repr(e)[:800])
     finally:
+        cancel_event.set()
+        queued.cancel()
+        receiver.cancel()
         pump.cancel()
+        await asyncio.gather(queued, receiver, return_exceptions=True)
 
     await close_open()
 
@@ -1010,7 +1034,6 @@ async def handle_ws(ws, request, body, t0, *, iter_chat, resolve_model,
                                  or body.get("safety_identifier"))
                     else None))
         rid = _iid("resp")
-        released = True     # _ws_stream owns the slot now
         await _ws_stream(ws, request, body, chat_body, model, skey, rid,
                          items, iter_chat, record, t0)
     finally:
