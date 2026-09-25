@@ -38,6 +38,8 @@ def register(router, ctx, admin_key):
             "key_required": bool(ctx.app.state.proxy_key) or store.has_keys(),
             "admin_locked": bool(ctx.app.state.proxy_key),
             "db": store._DB_PATH,
+            "log_db": store._LOG_DB,
+            "diag_db": store._DIAG_DB,
             "db_size": ov["db_size"],
             "max_rows": ov["max_rows"],
             "requests_logged": c["requests"],
@@ -48,11 +50,16 @@ def register(router, ctx, admin_key):
         }
 
     @router.post("/api/maintenance/cleanup", dependencies=[Depends(admin_key)])
-    def maintenance_cleanup(aggressive: bool = False):
-        """Manually reclaim disk space: prune old request/capture/response/
-        session history, checkpoint the WAL and VACUUM. Same recovery path
-        used automatically when the disk fills up."""
-        result = store.free_space(aggressive=aggressive, vacuum=True)
+    def maintenance_cleanup(aggressive: bool = False, drop_diag: bool = False,
+                            drop_log: bool = False):
+        """Manually reclaim disk space. aggressive prunes to emergency rows;
+        drop_diag/drop_log delete the whole diagnostic/request-log database
+        files (works even at 0 bytes free — the proxy keeps serving, stats
+        just reset). Same recovery path used automatically at low disk."""
+        result = store.free_space(aggressive=aggressive, vacuum=True,
+                                  drop_diag=drop_diag)
+        if drop_log:
+            result["log_db"] = store.drop_log_db()
         result["disk"] = store.disk_status()
         return result
 

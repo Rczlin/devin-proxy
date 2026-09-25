@@ -259,6 +259,7 @@
         </div>
         <div class="row" style="margin-bottom:12px">
           <button onclick="freeSpace()" id="free-space-btn" title="清理旧请求日志/抓包/会话钉扎，回收 WAL 并 VACUUM 压缩数据库文件">🧹 释放磁盘空间</button>
+          <button onclick="if(confirm('删除整个诊断库文件？抓包/响应体/请求包体将不可恢复（请求列表与统计保留）。磁盘为0时也可用。'))freeSpace(1)" id="nuke-diag-btn" title="满盘兜底：直接删除 devin-proxy-diag.db 文件，立即回收全部诊断数据。配置和请求日志不受影响。" style="color:var(--red)">☢ 删诊断库</button>
           <span class="muted" id="free-space-out"></span>
         </div>
         <div class="kv" id="conf-kv"></div>
