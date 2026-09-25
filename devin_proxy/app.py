@@ -10,7 +10,8 @@ import traceback
 import uuid
 
 import httpx
-from fastapi import Depends, FastAPI, HTTPException, Request
+from anyio import from_thread
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
@@ -35,6 +36,36 @@ _RAW_CAP = 8000          # unparsed-body forensics prefix
 # one request's total captured bytes so a runaway stream can't eat memory.
 _CAPTURE = os.environ.get("DEVIN_PROXY_CAPTURE", "1") not in ("0", "false")
 _CAP_MAX = int(os.environ.get("DEVIN_PROXY_CAP_MAX", str(32 * 1024 * 1024)))
+_RETRY_AFTER_RETRIES = 2
+_RETRY_AFTER_MAX_WAIT = _READ_TIMEOUT
+_RETRY_AFTER_MAX_TOTAL = max(
+    0.0, float(os.environ.get("DEVIN_PROXY_RETRY_MAX_SECONDS", "120")))
+
+
+class ClientDisconnected(Exception):
+    pass
+
+
+def _retry_clock():
+    return time.monotonic()
+
+
+def _backoff_wait(seconds, cancel_event=None):
+    deadline = time.monotonic() + seconds
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ClientDisconnected
+        try:
+            from_thread.check_cancelled()
+        except RuntimeError:
+            pass
+        except BaseException:
+            raise ClientDisconnected
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, 0.25))
+
 
 try:
     import h2  # noqa: F401
@@ -637,7 +668,7 @@ def create_app(api_key=None):
             **conv_ids(skey))
 
     def iter_chat(body, session_key=None, force_account=None, stream=True,
-                  log=None):
+                  log=None, cancel_event=None):
         """Failover driver. Yields (acct, event). Terminal upstream error is
         yielded as (acct_or_None, dict). On success returns quietly.
 
@@ -651,7 +682,10 @@ def create_app(api_key=None):
         force_id = force_account.id if force_account else None
         attempts = 1 if force_account else accounts_mod.MAX_ATTEMPTS
         transient_retries = 0       # 断流/异常允许重试同一账号（连接闪断≠账号坏）
-        for attempt in range(1, attempts + 1):
+        retry_after_retries = attempt = 0
+        retry_started = None
+        while attempt < attempts:
+            attempt += 1
             acct = pool.pick(session_key, exclude=tried, force_id=force_id,
                              models=want,
                              remote=models_mod.served_by(want))
@@ -836,6 +870,49 @@ def create_app(api_key=None):
                 pool.pin(session_key, acct)
                 return
             last_err = terminal
+            retry_after = terminal.get("retry_after")
+            if not got_content and retry_after is not None:
+                wait = min(max(float(retry_after), 0.0),
+                           _RETRY_AFTER_MAX_WAIT)
+                now = _retry_clock()
+                if retry_started is None:
+                    retry_started = now
+                retry_elapsed = now - retry_started
+                remaining = max(0.0, _RETRY_AFTER_MAX_TOTAL - retry_elapsed)
+                if retry_after_retries >= _RETRY_AFTER_RETRIES:
+                    terminal = last_err = {
+                        "kind": "retry_exhausted", "http_error": 503,
+                        "message": "upstream retry attempt limit exhausted"}
+                    attempts = attempt
+                    if log:
+                        log.flag("retry_count_limit")
+                        log.ev("retry_limited", reason="attempts",
+                               retries=retry_after_retries,
+                               elapsed_s=retry_elapsed)
+                elif wait > remaining:
+                    terminal = last_err = {
+                        "kind": "retry_timeout", "http_error": 503,
+                        "message": "upstream retry time budget exhausted"}
+                    attempts = attempt
+                    if log:
+                        log.flag("retry_time_limit")
+                        log.ev("retry_limited", reason="time",
+                               wait_s=wait, remaining_s=remaining,
+                               elapsed_s=retry_elapsed)
+                else:
+                    retry_after_retries += 1
+                    attempts += 1
+                    tried.discard(acct.id)
+                    if force_account:
+                        force_id = acct.id
+                    pool.mark_fail(acct, terminal)
+                    if log:
+                        log.flag("retry_after")
+                        log.ev("retry_after", account=acct.display(),
+                               wait_s=wait, retry=retry_after_retries,
+                               elapsed_s=retry_elapsed)
+                    _backoff_wait(wait, cancel_event)
+                    continue
             if terminal.get("kind") in ("truncated", "exception",
                                         "protocol_error") \
                     and transient_retries < 2 and attempt < attempts:
@@ -1104,7 +1181,7 @@ def create_app(api_key=None):
                 ui = upstream.upstream_info(ev)
                 if ui:
                     usage = {**(usage or {}), **ui}
-        except GeneratorExit:
+        except (GeneratorExit, ClientDisconnected):
             rl.flag("client_aborted")
             rl.ev("client_aborted")
             _record(request, body, model, False, 499,
@@ -1176,7 +1253,7 @@ def create_app(api_key=None):
             record=_record, release=release)
 
     @app.websocket("/v1/responses")
-    async def responses_ws(websocket):
+    async def responses_ws(websocket: WebSocket):
         """WebSocket transport for /v1/responses. Client sends the request
         body as the first JSON message; server streams Responses-API events
         back as JSON messages. Same semantics as POST + SSE."""

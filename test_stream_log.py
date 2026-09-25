@@ -5,11 +5,16 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
+from unittest import mock
 
 os.environ["DEVIN_PROXY_DB"] = tempfile.mktemp(suffix=".db")
 
+import anyio
 import httpx
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 from devin_proxy import app as app_mod
 from devin_proxy import proto, store, upstream
@@ -28,8 +33,10 @@ def msg(**kw):
     return proto.GetChatMessageResponse(**kw).SerializeToString()
 
 
-def trailer(err=None):
+def trailer(err=None, metadata=None):
     d = {"error": err} if err else {}
+    if metadata:
+        d["metadata"] = metadata
     return frame(json.dumps(d).encode(), END, compress=False)
 
 
@@ -251,5 +258,156 @@ rest = [e.delta_text for e in gen if not isinstance(e, dict)]
 assert fed["n"] == 5 and rest == ["part1", "part2", "part3", "part4"], \
     (fed, rest)
 print("8. incremental read    OK  first frame after 1 network chunk")
+
+calls = {"n": 0}
+def rate_limited_once(req):
+    if req.url.path.endswith("GetUserJwt"):
+        return httpx.Response(
+            200, content=proto.GetUserJwtResponse(jwt="x.y.z").SerializeToString())
+    calls["n"] += 1
+    if calls["n"] == 1:
+        return httpx.Response(200, content=iter([trailer(
+            {"code": "resource_exhausted",
+             "message": "Reached free model rate limit. Your limit will "
+                        "reset in 36 seconds."},
+            {"Retry-After": ["37"]})]))
+    return httpx.Response(200, content=iter([
+        frame(msg(message_id="m9", delta_text="after retry", stop_reason=5)),
+        trailer()]))
+app.state.http = httpx.Client(transport=httpx.MockTransport(rate_limited_once))
+reset()
+with mock.patch("devin_proxy.app._backoff_wait") as wait:
+    r = c.post("/v1/responses", json={"model": "claude", "stream": True,
+               "input": "hi"}, headers={"Authorization": "Bearer k"})
+assert calls["n"] == 2, calls
+wait.assert_called_once_with(37.0, None)
+lines = [json.loads(x) for x in sse_lines(r) if x != "[DONE]"]
+assert any(e.get("type") == "response.completed" for e in lines), lines
+assert not any(e.get("type") in ("error", "response.failed") for e in lines), lines
+row = last_req()
+ev = json.loads(row["events_json"])
+assert any(e["t"] == "retry_after" and e["wait_s"] == 37.0 for e in ev), ev
+print("9. Retry-After retry   OK  blocked 37s internally, 2 upstream calls")
+
+calls = {"n": 0}
+def rate_limited_always(req):
+    if req.url.path.endswith("GetUserJwt"):
+        return httpx.Response(
+            200, content=proto.GetUserJwtResponse(jwt="x.y.z").SerializeToString())
+    calls["n"] += 1
+    return httpx.Response(200, content=iter([trailer(
+        {"code": "resource_exhausted", "message": "private upstream detail"},
+        {"Retry-After": ["20"]})]))
+app.state.http = httpx.Client(transport=httpx.MockTransport(rate_limited_always))
+reset()
+with mock.patch.object(app_mod, "_RETRY_AFTER_MAX_TOTAL", 30), \
+        mock.patch("devin_proxy.app._retry_clock", side_effect=[0, 20]), \
+        mock.patch("devin_proxy.app._backoff_wait") as wait:
+    r = c.post("/v1/responses", json={"model": "claude", "stream": True,
+               "input": "hi"}, headers={"Authorization": "Bearer k"})
+assert calls["n"] == 2, calls
+wait.assert_called_once_with(20.0, None)
+lines = [json.loads(x) for x in sse_lines(r) if x != "[DONE]"]
+failed = next(e for e in lines if e.get("type") == "response.failed")
+assert failed["response"]["error"]["code"] == "retry_timeout", failed
+assert "private upstream detail" not in r.text, r.text
+row = last_req()
+assert "retry_time_limit" in (row["flags"] or ""), row["flags"]
+print("10. retry time fuse    OK  cumulative wait budget enforced")
+
+calls["n"] = 0
+reset()
+with mock.patch.object(app_mod, "_RETRY_AFTER_MAX_TOTAL", 120), \
+        mock.patch("devin_proxy.app._backoff_wait") as wait:
+    r = c.post("/v1/responses", json={"model": "claude", "stream": True,
+               "input": "hi"}, headers={"Authorization": "Bearer k"})
+assert calls["n"] == 3, calls
+assert wait.call_count == 2, wait.call_count
+lines = [json.loads(x) for x in sse_lines(r) if x != "[DONE]"]
+failed = next(e for e in lines if e.get("type") == "response.failed")
+assert failed["response"]["error"]["code"] == "retry_exhausted", failed
+assert "private upstream detail" not in r.text, r.text
+row = last_req()
+assert "retry_count_limit" in (row["flags"] or ""), row["flags"]
+print("11. retry count fuse   OK  raw upstream error stayed internal")
+
+cancel = threading.Event()
+cancel.set()
+with mock.patch("devin_proxy.app.time.sleep") as sleep:
+    try:
+        app_mod._backoff_wait(10, cancel)
+        raise AssertionError("cancelled wait returned normally")
+    except app_mod.ClientDisconnected:
+        pass
+sleep.assert_not_called()
+print("12. explicit cancel   OK  wait stopped before sleeping")
+
+async def cancel_worker_wait():
+    stopped = False
+    async def wait():
+        nonlocal stopped
+        try:
+            await anyio.to_thread.run_sync(app_mod._backoff_wait, 2)
+        except app_mod.ClientDisconnected:
+            stopped = True
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(wait)
+        await anyio.sleep(0.05)
+        tg.cancel_scope.cancel()
+    return stopped
+assert anyio.run(cancel_worker_wait)
+print("13. client cancel     OK  worker wait observed task cancellation")
+
+calls = {"n": 0}
+def ws_rate_limited(req):
+    if req.url.path.endswith("GetUserJwt"):
+        return httpx.Response(
+            200, content=proto.GetUserJwtResponse(jwt="x.y.z").SerializeToString())
+    calls["n"] += 1
+    return httpx.Response(200, content=iter([trailer(
+        {"code": "resource_exhausted", "message": "limited"},
+        {"Retry-After": ["2"]})]))
+app.state.http = httpx.Client(transport=httpx.MockTransport(ws_rate_limited))
+ws_key = store.create_key("ws-disconnect", max_concurrent=1)
+ws_kid = store.key_info(ws_key)["id"]
+reset()
+t0 = time.perf_counter()
+try:
+    with c.websocket_connect("/v1/responses",
+                             headers={"Authorization": f"Bearer {ws_key}"}) as ws:
+        ws.send_json({"model": "claude", "input": "hi"})
+        assert ws.receive_json()["type"] == "response.created"
+        assert ws.receive_json()["type"] == "response.in_progress"
+        ws.close()
+except WebSocketDisconnect as e:
+    raise AssertionError((e.code, e.reason)) from e
+assert time.perf_counter() - t0 < 1.5
+for _ in range(20):
+    row = last_req()
+    if "client_aborted" in (row["flags"] or ""):
+        break
+    time.sleep(0.05)
+assert calls["n"] == 1, calls
+assert row["status"] == 499 and "client_aborted" in row["flags"], dict(row)
+assert all(a.in_flight == 0 for a in app.state.pool.accounts())
+assert app.state.key_slots.get(ws_kid, 0) == 0, app.state.key_slots
+print("14. websocket cancel  OK  disconnect stopped pending retry")
+
+SCENARIO["bytes"] = (frame(msg(message_id="m15", delta_text="ws ok",
+                               stop_reason=5)) + trailer())
+app.state.http = httpx.Client(transport=httpx.MockTransport(handler))
+reset()
+with c.websocket_connect("/v1/responses",
+                         headers={"Authorization": f"Bearer {ws_key}"}) as ws:
+    ws.send_json({"model": "claude", "input": "hi"})
+    events = []
+    while True:
+        event = ws.receive_json()
+        events.append(event)
+        if event["type"] == "done":
+            break
+assert any(e["type"] == "response.completed" for e in events), events
+assert app.state.key_slots.get(ws_kid, 0) == 0, app.state.key_slots
+print("15. websocket success OK  normal completion still works")
 
 print("\nAll tests passed.")
