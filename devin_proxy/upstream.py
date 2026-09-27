@@ -119,11 +119,40 @@ def _cost_summary(pricing):
     return " · ".join(out) or None
 
 
+def _traits(family):
+    """ModelFamily.traits -> [{'name': 'Effort'|'Thinking'|'Fast Mode'|…,
+    'text': 'High', 'num': 1}] — capability badges Devin attaches to a
+    family. Best-effort: unknown trait shapes pass through their text."""
+    out = []
+    if not family:
+        return out
+    for t in getattr(family, "traits", []):
+        name = (t.name or "").strip()
+        if not name:
+            continue
+        v = t.value if t.HasField("value") else None
+        out.append({"name": name,
+                    "text": (v.text or "").strip() or None if v else None,
+                    "num": v.num if v and v.num else None})
+    return out
+
+
+def _rate_limit(rl):
+    """ClientModelConfig.rate_limit -> {'reset_ts':…,'cap':…} — the
+    per-model soft quota window some families carry (weekly cap + reset)."""
+    if rl is None:
+        return None
+    w = rl.window if rl.HasField("window") else None
+    if not w or not (w.reset_ts or w.cap):
+        return None
+    return {"reset_ts": w.reset_ts or None, "cap": w.cap or None}
+
+
 def fetch_model_configs(client, base_url, api_key, timeout=20):
     """GetCliModelConfigs (the call Devin CLI/Desktop makes at boot)
     -> [{uid, label, context, max_output, family_slug, family_label,
          alias, images, thinking, credit, pricing, cost_summary,
-         deployment}].
+         deployment, traits, promo, rate_limit, tier}].
     Disabled/uid-less entries are skipped. Raises on transport/parse
     failure — callers catch per account."""
     req = proto.GetCliModelConfigsRequest(
@@ -152,6 +181,13 @@ def fetch_model_configs(client, base_url, api_key, timeout=20):
              "context": c.max_tokens or None,
              "credit": c.credit_cost or None,
              "images": bool(c.supports_images)}
+        if c.promo:
+            e["promo"] = True                    # discounted/promo model
+        if c.tier_a:
+            e["tier"] = c.tier_a                 # 3=anthropic-ish, 2=openai-ish
+        rl = _rate_limit(c.rate_limit if c.HasField("rate_limit") else None)
+        if rl:
+            e["rate_limit"] = rl
         if c.HasField("model_info"):
             mi = c.model_info
             if not e["context"] and mi.context_tokens:
@@ -162,12 +198,20 @@ def fetch_model_configs(client, base_url, api_key, timeout=20):
                 e["family_slug"] = mi.family
             if mi.alias:
                 e["alias"] = mi.alias
+            if (mi.canonical_uid or "").strip() and \
+                    mi.canonical_uid.strip() != uid:
+                e["canonical_uid"] = mi.canonical_uid.strip()
             if (mi.deployment or "").strip():
                 e["deployment"] = mi.deployment.strip()
             if mi.HasField("model_features"):
                 e["thinking"] = bool(mi.model_features.supports_thinking)
-        if c.HasField("family") and c.family.label:
-            e["family_label"] = c.family.label
+        if c.HasField("family"):
+            fam = c.family
+            if fam.label:
+                e["family_label"] = fam.label
+            tr = _traits(fam)
+            if tr:
+                e["traits"] = tr
         if c.pricing:
             e["pricing"] = [{"item": p.item, "price": p.price,
                              "unit": p.unit, "note": p.note or None}

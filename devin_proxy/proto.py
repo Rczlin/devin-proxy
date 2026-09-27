@@ -122,27 +122,69 @@ _fd = descriptor_pb2.FileDescriptorProto(
         _msg("GetUserJwtResponse", [_f("jwt", 1, STR)]),
         _msg("ModelFeatures", [
             _f("supports_thinking", 15, BOOL),
+            # additional capability flags observed on the wire; names are
+            # best-effort — kept so they're preserved/parsed, surfaced as
+            # a raw set rather than silently dropped
+            _f("feat_8", 8, BOOL), _f("feat_11", 11, BOOL),
+            _f("feat_12", 12, BOOL), _f("feat_21", 21, BOOL),
+            _f("feat_24", 24, BOOL), _f("feat_25", 25, BOOL),
+            _f("feat_27", 27, BOOL), _f("feat_28", 28, BOOL),
+            _f("feat_29", 29, BOOL), _f("feat_30", 30, BOOL),
+            _f("feat_31", 31, BOOL), _f("feat_32", 32, BOOL),
+            _f("feat_33", 33, BOOL), _f("feat_20", 20, BOOL),
         ]),
         _msg("ModelInfo", [
+            _f("model_id", 1, I32),            # numeric ordinal (391, 400…)
+            _f("f3", 3, I32),
             _f("context_tokens", 4, I32),
+            _f("tokenizer", 5, STR),           # "LLAMA_WITH_SPECIAL"
             _f("model_features", 6, MSG, type_name=".devin.ModelFeatures"),
             _f("max_output_tokens", 13, I32),
+            _f("canonical_uid", 17, STR),      # f17 — canonical uid
+            _f("server_base", 18, STR),        # f18 — origin host
             _f("deployment", 20, STR),
-            _f("family", 23, STR),
+            _f("family", 23, STR),             # authoritative family slug
             _f("alias", 27, STR),
+        ]),
+        # f30 ModelFamily.trait value payload: {f1 enum, f2 string, f3 int}
+        _msg("TraitValue", [
+            _f("kind", 1, I32), _f("text", 2, STR), _f("num", 3, I32),
+        ]),
+        _msg("FamilyTrait", [
+            _f("name", 1, STR),
+            _f("value", 2, MSG, type_name=".devin.TraitValue"),
         ]),
         _msg("ModelFamily", [
             _f("label", 1, STR),
+            _f("traits", 2, MSG, REP, ".devin.FamilyTrait"),
+        ]),
+        # f19 nested: {f1:{...}, f2:{f1=reset_ts, f2=cap}}
+        _msg("ModelOrdinal", [_f("value", 1, I32)]),
+        _msg("QuotaWindow", [
+            _f("reset_ts", 1, U64), _f("cap", 2, U64),
+        ]),
+        _msg("RateLimit", [
+            _f("policy", 1, MSG, type_name=".devin.QuotaWindow"),
+            _f("window", 2, MSG, type_name=".devin.QuotaWindow"),
         ]),
         _msg("ModelPricing", [
             _f("item", 1, STR), _f("price", 2, FLT), _f("unit", 3, STR),
             _f("note", 7, STR),
         ]),
         _msg("ClientModelConfig", [
-            _f("label", 1, STR), _f("credit_cost", 3, FLT),
-            _f("disabled", 4, BOOL), _f("supports_images", 5, BOOL),
+            _f("label", 1, STR), _f("model_id", 2, MSG,
+               type_name=".devin.ModelOrdinal"),
+            _f("credit_cost", 3, FLT), _f("disabled", 4, BOOL),
+            _f("supports_images", 5, BOOL),
+            _f("f9", 9, BOOL),
+            _f("tier_a", 10, I32), _f("f11", 11, BOOL), _f("f13", 13, I32),
+            _f("promo", 15, BOOL),              # f15 — discounted/promo flag
+            _f("f20", 20, BOOL),
+            _f("rate_limit", 19, MSG, type_name=".devin.RateLimit"),
+            _f("tier_b", 24, I32),
             _f("max_tokens", 18, I32), _f("model_uid", 22, STR),
             _f("model_info", 23, MSG, type_name=".devin.ModelInfo"),
+            _f("f31", 31, BOOL),
             _f("family", 30, MSG, type_name=".devin.ModelFamily"),
             _f("pricing", 32, MSG, REP, ".devin.ModelPricing"),
         ]),
@@ -182,7 +224,12 @@ GetUserJwtRequest = cls("GetUserJwtRequest")
 GetUserJwtResponse = cls("GetUserJwtResponse")
 ModelFeatures = cls("ModelFeatures")
 ModelInfo = cls("ModelInfo")
+TraitValue = cls("TraitValue")
+FamilyTrait = cls("FamilyTrait")
 ModelFamily = cls("ModelFamily")
+ModelOrdinal = cls("ModelOrdinal")
+QuotaWindow = cls("QuotaWindow")
+RateLimit = cls("RateLimit")
 ModelPricing = cls("ModelPricing")
 ClientModelConfig = cls("ClientModelConfig")
 GetCliModelConfigsRequest = cls("GetCliModelConfigsRequest")

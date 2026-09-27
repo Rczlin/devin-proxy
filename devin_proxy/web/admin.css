@@ -35,6 +35,12 @@ table{width:100%;border-collapse:collapse;font-size:13px}
 th{text-align:left;color:var(--dim);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.4px;padding:8px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
 td{padding:7px 8px;border-bottom:1px solid #21262d;font-family:var(--mono);font-size:12px}
 tr:hover td{background:#1c233055}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.num,.num a{white-space:nowrap}
+td code{color:var(--fg)}
+#model-fams table{font-size:12px}
+#model-fams td{vertical-align:middle}
+#model-fams .tag{margin:1px 2px 1px 0}
 .tag{display:inline-block;padding:1px 8px;border-radius:10px;font-size:11px;white-space:nowrap}
 .tag.ok{background:#3fb95022;color:var(--green)}
 .tag.err{background:#f8514922;color:var(--red)}

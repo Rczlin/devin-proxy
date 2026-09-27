@@ -27,13 +27,21 @@ class FakeResp:
 
 
 def cfg(uid, label="", disabled=False, images=False, ctx=200000,
-        thinking=False, credit=0.0, family="", max_out=0):
+        thinking=False, credit=0.0, family="", max_out=0,
+        promo=False, fam_label="", traits=None):
     c = proto.ClientModelConfig(
         label=label, model_uid=uid, disabled=disabled,
-        supports_images=images, max_tokens=ctx, credit_cost=credit)
+        supports_images=images, max_tokens=ctx, credit_cost=credit,
+        promo=promo)
     mi = proto.ModelInfo(max_output_tokens=max_out, family=family)
     mi.model_features.supports_thinking = thinking
     c.model_info.CopyFrom(mi)
+    if fam_label or traits:
+        fam = proto.ModelFamily(label=fam_label or "")
+        for name, text in (traits or []):
+            t = fam.traits.add(); t.name = name
+            t.value.text = text
+        c.family.CopyFrom(fam)
     return c
 
 
@@ -44,7 +52,12 @@ REMOTE_A = proto.GetCliModelConfigsResponse(client_model_configs=[
     cfg("claude-sonnet-5-high", "Claude Sonnet 5 High", images=True,
         ctx=400000, thinking=True, credit=1.5),
     cfg("claude-opus-5-high", "Claude Opus 5 High", ctx=400000,
-        thinking=True, credit=3.0),
+        thinking=True, credit=3.0, family="claude-opus-5"),
+    cfg("claude-opus-5-5-high", "Claude Opus 5.5 High", ctx=1000000,
+        thinking=True, credit=4.0, family="claude-opus-5-5", promo=True,
+        fam_label="Claude Opus 5.5",
+        traits=[("Effort","High"),("Thinking",""),("Fast Mode",""),
+                ("1M Context","")]),
     cfg("swe-2-high", "SWE 2 High", thinking=True),
     cfg("kimi-k3-medium", "Kimi K3", ctx=256000),          # unknown family
     cfg("dead-model", "Dead", disabled=True),               # skipped
@@ -83,6 +96,13 @@ def fake_fetch(client, base_url, api_key, timeout=20):
          "images": bool(c.supports_images),
          "max_output": c.model_info.max_output_tokens or None,
          "family_slug": c.model_info.family or None,
+         "family_label": (c.family.label or None
+                          if c.HasField("family") else None),
+         "promo": bool(c.promo) or None,
+         "traits": ([{"name": t.name, "text": t.value.text or None,
+                      "num": t.value.num or None}
+                     for t in c.family.traits]
+                    if c.HasField("family") and c.family.traits else None),
          "thinking": (bool(c.model_info.model_features.supports_thinking)
                       if c.HasField("model_info")
                       and c.model_info.HasField("model_features") else None)}
@@ -117,10 +137,11 @@ print("fetch_model_configs (gzipped proto) OK:", len(got), "models")
 # ---- catalog merge across two accounts ----
 upstream.fetch_model_configs = fake_fetch
 try:
-    r = M.refresh(httpx.Client(), [FakeAcct(1), FakeAcct(2)], force=True)
+    r = M.refresh(httpx.Client(trust_env=False),
+                  [FakeAcct(1), FakeAcct(2)], force=True)
 finally:
     upstream.fetch_model_configs = real_fetch
-assert r["count"] == 6, r
+assert r["count"] == 7, r
 ents = M.entries()
 by_uid = {e["uid"]: e for e in ents}
 assert by_uid["claude-sonnet-5-medium"]["remote_accounts"] == 2
@@ -128,6 +149,14 @@ assert by_uid["acct-b-only"]["remote_accounts"] == 1
 assert by_uid["kimi-k3-medium"]["family"] == "kimi-k3"
 assert by_uid["claude-sonnet-5-medium"]["family"] == "claude-sonnet-5"
 assert by_uid["swe-2-high"]["effort"] == "high"
+# family_slug is authoritative: 5.5 must NOT merge into 5 (the original bug)
+assert by_uid["claude-opus-5-high"]["family"] == "claude-opus-5"
+assert by_uid["claude-opus-5-5-high"]["family"] == "claude-opus-5-5"
+assert by_uid["claude-opus-5-5-high"]["family_label"] == "Claude Opus 5.5"
+assert by_uid["claude-opus-5-5-high"]["promo"] is True
+assert by_uid["claude-opus-5-5-high"]["traits"][0]["name"] == "Effort"
+_fams = {f["prefix"] for f in M.grouped()}
+assert "claude-opus-5" in _fams and "claude-opus-5-5" in _fams
 print("merged catalog:", [e["uid"] for e in ents])
 
 # ---- resolve / aliases / effort ----
@@ -187,7 +216,7 @@ print("served_by OK:", allowed, known)
 
 # ---- persistence: fresh module state reads meta ----
 snap = json.loads(store.meta_get("model_catalog_v1"))
-assert len(snap["models"]) == 6
+assert len(snap["models"]) == 7
 print("persisted snapshot OK")
 
 # ---- URL source ----

@@ -2,44 +2,96 @@
 const EFF={none:'无思考',low:'低',medium:'中',high:'高',xhigh:'超高',max:'满'};
 const EFFORD=['none','low','medium','high','xhigh','max'];
 let _famEff={};
-function famChip(f,main){
-  const tags=[
-    main.context?`<span class="tag off">${fmt(main.context)} ctx</span>`:'',
-    main.images?'<span class="tag model" title="支持图像输入">👁 图像</span>':'',
-    main.thinking?'<span class="tag model" title="支持思考">🧠 思考</span>':'',
-    main.credit!=null?`<span class="tag off" title="${esc(main.cost_summary||'credit 消耗倍率')}">×${main.credit}</span>`:'',
-    main.effort?`<span class="tag ok" title="默认思考等级：请求未指定 effort 时命中此变体">默认·${esc(EFF[main.effort]||main.effort)}</span>`:'',
-    main.remote_accounts?`<span class="tag ok" title="广告此模型的上游账号数">${main.remote_accounts} 账号</span>`:'',
-  ].filter(Boolean).join('');
-  return `<button class="mchip" onclick="pickModel('${esc(f.prefix)}')" title="${esc(f.prefix)} — 点击在 Playground 试用">
-    <b>${esc(f.label)}</b><br><span class="muted" style="font-size:11px">${esc(f.prefix)}</span>
-    ${tags?'<br>'+tags:''}</button>`;
+
+// ---- helpers -------------------------------------------------------------
+function _price(e){
+  // cost_summary = "$4 / 1M Input · $0.2 / 1M Cached input · $20 / 1M Output"
+  const cs=e.cost_summary||'';
+  const inP=(cs.match(/\$([\d.]+)\s*\/\s*1M Input/i)||[])[1];
+  const outP=(cs.match(/\$([\d.]+)\s*\/\s*1M Output/i)||[])[1];
+  if(inP!=null||outP!=null)return {i:inP,o:outP,raw:cs};
+  return e.credit!=null?{i:null,o:null,raw:`×${e.credit}`}:{i:null,o:null,raw:'—'};
 }
-function modelChip(m,fam,isDef){
-  const tags=[
-    m.effort?`<span class="tag off">${esc(EFF[m.effort]||m.effort)}</span>`:'',
-    m.context?`<span class="tag off">${fmt(m.context)} ctx</span>`:'',
-    m.images?'<span class="tag model" title="支持图像输入">👁 图像</span>':'',
-    m.thinking?'<span class="tag model" title="支持思考">🧠 思考</span>':'',
-    m.alias?`<span class="tag model" title="上游别名">@${esc(m.alias)}</span>`:'',
-    m.credit!=null?`<span class="tag off" title="${esc(m.cost_summary||'credit 消耗倍率')}">×${m.credit}</span>`:'',
-    m.cost_summary?`<span class="tag off" title="${esc(m.cost_summary)}">💲 ${esc(m.cost_summary.split(' · ')[0].replace(/ \/ .*/,''))}/1M</span>`:'',
-    m.remote_accounts?`<span class="tag ok" title="广告此模型的上游账号数">${m.remote_accounts} 账号</span>`:'',
-    m.url?'<span class="tag model">URL</span>':'',
-    isDef?'<span class="tag ok">★ 默认</span>':'',
-  ].filter(Boolean).join('');
-  if(m.hidden)
-    return `<button class="mchip" style="opacity:.45" onclick="unhideModel('${esc(m.uid)}')"
-      title="${esc(m.uid)} — 已隐藏，点击恢复">
-      <b style="text-decoration:line-through">${esc(m.label)}</b><br><span class="muted" style="font-size:11px">${esc(m.uid)}</span>
-      ${tags?'<br>'+tags:''}</button>`;
+function _traits(e){
+  // collect capability names from upstream traits + flags
+  const t=new Set();
+  (e.traits||[]).forEach(x=>{if(x.name)t.add(x.name)});
+  if(e.thinking)t.add('Thinking');
+  if(e.images)t.add('Vision');
+  return t;
+}
+function _badges(e){
+  const t=_traits(e),out=[];
+  if(e.promo)out.push('<span class="tag ok" title="优惠/促销模型 — 上游折扣价">促销</span>');
+  if(/fast/i.test(e.uid)||t.has('Fast Mode'))out.push('<span class="tag model" title="Fast mode 变体">⚡ Fast</span>');
+  if(/-1m\b|1m/i.test(e.uid)||t.has('1M Context'))out.push('<span class="tag model" title="1M context 变体">1M</span>');
+  if(t.has('Thinking'))out.push('<span class="tag model" title="支持思考">🧠</span>');
+  if(t.has('Vision'))out.push('<span class="tag model" title="支持图像输入">👁</span>');
+  return out.join('');
+}
+function _rl(e){
+  const r=e.rate_limit;return r&&r.cap?`<span class="tag off" title="限额窗口 · cap ${fmt(r.cap)}${r.reset_ts?' · 重置 '+fmtT(r.reset_ts):''}">⏳</span>`:'';
+}
+
+// ---- per-variant table row -------------------------------------------------
+function _row(m,fam,isDef){
+  const p=_price(m),h=m.hidden?' style="opacity:.45;text-decoration:line-through"':'';
   const act=m.effort?`setFamDefault('${esc(fam)}','${esc(m.effort)}')`:`pickModel('${esc(m.uid)}')`;
-  const tip=m.effort?'点击设为该家族默认变体':'点击在 Playground 试用';
-  return `<button class="mchip" onclick="${act}" title="${esc(m.uid)} — ${tip}">
-    <b>${esc(m.label)}</b><br><span class="muted" style="font-size:11px">${esc(m.uid)}
-      <span style="cursor:pointer" title="隐藏此变体" onclick="event.stopPropagation();hideModel('${esc(m.uid)}')"> ✕</span></span>
-    ${tags?'<br>'+tags:''}</button>`;
+  const op=m.hidden
+    ?`<a href="javascript:void 0" onclick="unhideModel('${esc(m.uid)}')">恢复</a>`
+    :`<a href="javascript:void 0" title="${m.effort?'设为家族默认变体':'在 Playground 试用'}" onclick="${act}">${m.effort?'设默认':'试用'}</a>
+       <a href="javascript:void 0" class="muted" title="隐藏此变体" onclick="hideModel('${esc(m.uid)}')"> 隐藏</a>`;
+  return `<tr${h}>
+    <td><code>${esc(m.uid)}</code>${m.alias?` <span class="tag off" title="上游别名">@${esc(m.alias)}</span>`:''}</td>
+    <td>${esc(m.label)}${m.effort?` <span class="tag off">${esc(EFF[m.effort]||m.effort)}</span>`:''}
+      ${isDef?'<span class="tag ok">★ 默认</span>':''}</td>
+    <td class="num">${m.context?fmt(m.context):'—'}</td>
+    <td class="num">${m.max_output?fmt(m.max_output):'—'}</td>
+    <td class="num" title="${esc(p.raw)}">${p.i!=null?`$${p.i}`:(p.raw&&p.raw.startsWith('×')?p.raw:'—')}</td>
+    <td class="num" title="${esc(p.raw)}">${p.o!=null?`$${p.o}`:'—'}</td>
+    <td>${_badges(m)} ${_rl(m)}${m.remote_accounts?`<span class="tag ok" title="广告此模型的上游账号数">${m.remote_accounts}账号</span>`:''}${m.url?'<span class="tag model">URL</span>':''}</td>
+    <td style="white-space:nowrap">${op}</td></tr>`;
 }
+
+// ---- family panel: header + variant table ----------------------------------
+function _famPanel(f){
+  const prefer=f.default||'medium';
+  const vis=f.models.filter(m=>!m.hidden);
+  const main=vis.find(m=>m.effort===prefer)||vis.find(m=>m.effort==='medium')||vis[0]||f.models[0];
+  const effs=[...new Set(vis.map(m=>m.effort).filter(Boolean))]
+    .sort((a,b)=>EFFORD.indexOf(a)-EFFORD.indexOf(b));
+  const promo=f.models.some(m=>m.promo);
+  const maxCtx=Math.max(0,...f.models.map(m=>m.context||0));
+  const head=effs.length
+    ?`<span style="float:right;font-weight:400;text-transform:none;letter-spacing:0">默认思考
+      <select style="padding:2px 6px;font-size:12px" title="请求未指定 effort 时该家族改写到哪个变体（自动 = 跟随全局默认/内置偏好）"
+        onchange="setFamDefault('${esc(f.prefix)}',this.value)">
+        <option value="">自动${f.default_override?'':(f.default?`（${esc(EFF[f.default]||f.default)}）`:'')}</option>
+        ${effs.map(e=>`<option value="${esc(e)}"${e===f.default_override?' selected':''}>${esc(EFF[e]||e)}</option>`).join('')}
+      </select> <span class="muted">${f.models.length} 变体</span></span>`
+    :`<span class="muted" style="float:right">${f.models.length} 变体</span>`;
+  const sorted=[...f.models].sort((a,b)=>
+    EFFORD.indexOf(a.effort||'none')-EFFORD.indexOf(b.effort||'none')||a.uid.localeCompare(b.uid));
+  return `<div class="panel">
+    <h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
+      ${promo?'<span class="tag ok" title="该家族含促销/折扣模型">促销</span>':''}
+      ${maxCtx?`<span class="tag off" title="最大上下文">${fmt(maxCtx)} ctx</span>`:''}
+      <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
+      ${head}</h3>
+    <table>
+      <thead><tr><th style="width:24%">模型 ID</th><th style="width:22%">显示名</th>
+        <th class="num">上下文</th><th class="num">输出</th>
+        <th class="num" title="每 1M input tokens">输入</th><th class="num" title="每 1M output tokens">输出价</th>
+        <th style="width:22%">能力</th><th>操作</th></tr></thead>
+      <tbody>${sorted.map(m=>_row(m,f.prefix,m===main)).join('')}</tbody></table>
+    <div class="muted" style="margin-top:6px;font-size:12px">
+      <code style="cursor:pointer" title="点击在 Playground 试用该家族"
+        onclick="pickModel('${esc(f.prefix)}')">${esc(f.prefix)}</code>
+      别名请求 → ${esc(main?main.uid:'')}</div>
+  </div>`;
+}
+
+// ---- actions ---------------------------------------------------------------
 async function hideModel(uid){
   await api('/admin/api/models/entries/'+encodeURIComponent(uid),{method:'DELETE'});
   toast('已隐藏 '+uid);loadModels().catch(()=>{});
@@ -88,29 +140,7 @@ async function loadModels(){
   $('#default-effort').value=d.default_effort||'';
   _famEff=d.family_efforts||{};
   $('#alias-edit').value=Object.entries(d.user_aliases||{}).map(([a,t])=>`${a}=${t}`).join('\n');
-  $('#model-fams').innerHTML=d.families.map(f=>{
-    const prefer=f.default||'medium';
-    const vis=f.models.filter(m=>!m.hidden);
-    const main=vis.find(m=>m.effort===prefer)||vis.find(m=>m.effort==='medium')||vis[0]||f.models[0];
-    const rest=f.models.filter(m=>m!==main);
-    const effs=[...new Set(vis.map(m=>m.effort).filter(Boolean))]
-      .sort((a,b)=>EFFORD.indexOf(a)-EFFORD.indexOf(b));
-    const head=effs.length
-      ?`<span style="float:right;font-weight:400;text-transform:none;letter-spacing:0">默认思考
-        <select style="padding:2px 6px;font-size:12px" title="请求未指定 effort 时该家族改写到哪个变体（自动 = 跟随全局默认/内置偏好）"
-          onchange="setFamDefault('${esc(f.prefix)}',this.value)">
-          <option value="">自动${f.default_override?'':(f.default?`（${esc(EFF[f.default]||f.default)}）`:'')}</option>
-          ${effs.map(e=>`<option value="${esc(e)}"${e===f.default_override?' selected':''}>${esc(EFF[e]||e)}</option>`).join('')}
-        </select> <span class="muted">${f.models.length} 变体</span></span>`
-      :`<span class="muted" style="float:right">${f.models.length} 变体</span>`;
-    return `<div class="panel"><h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
-      <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
-      ${head}</h3>
-      <div class="mgrid">${famChip(f,main)}</div>
-      ${rest.length?`<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:12px">展开 ${rest.length} 个变体（点击设为默认）</summary>
-        <div class="mgrid" style="margin-top:8px">${rest.map(m=>modelChip(m,f.prefix,false)).join('')}</div></details>`:''}
-      </div>`;
-  }).join('')
+  $('#model-fams').innerHTML=d.families.map(_famPanel).join('')
     ||'<div class="panel muted">目录为空 — 点「立即同步」从上游账号拉取（或配置远端目录 URL）</div>';
   const _ua=d.user_aliases||{};
   $('#alias-list').innerHTML=Object.entries(d.aliases||{}).map(([a,t])=>

@@ -107,13 +107,20 @@ def _norm_fam(s):
 
 
 def _family_of(uid, slug=None):
-    """Longest-prefix family match; falls back to the remote family slug
-    or the uid minus its effort suffix."""
-    for i, (pre, label, vendor, desc, dflt) in enumerate(_FAM_SORT):
-        if uid == pre or uid.startswith(pre + "-"):
-            return {"prefix": pre, "label": label, "vendor": vendor,
-                    "desc": desc, "default": dflt, "order": i}
-    fam = _norm_fam(slug) or split_effort(uid)[0] or uid
+    """Family for grouping/display. The upstream family_slug (model_info f23)
+    is authoritative — 'claude-opus-5-5' is a DIFFERENT family from
+    'claude-opus-5', so a FAMILIES prefix must never absorb it. When no slug
+    is present we derive the family from the uid minus its effort suffix,
+    matching a FAMILIES prefix only if it still lines up after that strip."""
+    fam = _norm_fam(slug)
+    if not fam:
+        fam = split_effort(uid)[0] or uid
+    meta = next((x for x in _FAM_SORT
+                 if fam == x[0] or fam.startswith(x[0] + "-")), None)
+    if meta:
+        return {"prefix": fam, "label": meta[1], "vendor": meta[2],
+                "desc": meta[3], "default": meta[4],
+                "order": _FAM_SORT.index(meta)}
     return {"prefix": fam, "label": _title(fam), "vendor": _vendor_of(uid),
             "desc": "", "default": "medium", "order": 999}
 
@@ -143,6 +150,8 @@ def _entry(uid, **kw):
          "context": None, "max_output": None, "credit": None,
          "images": None, "thinking": None, "alias": None,
          "cost_summary": None, "pricing": None, "deployment": None,
+         "traits": None, "promo": None, "rate_limit": None, "tier": None,
+         "canonical_uid": None,
          "remote_accounts": 0, "url": False}
     for k, v in kw.items():
         if k in e and v is not None:
@@ -298,7 +307,8 @@ def entries(include_hidden=False):
                    label=m.get("label"))
         for k in ("context", "max_output", "credit", "images",
                   "thinking", "alias", "cost_summary", "pricing",
-                  "deployment"):
+                  "deployment", "traits", "promo", "rate_limit",
+                  "tier", "canonical_uid"):
             if m.get(k) is not None:
                 e[k] = m[k]
         if m.get("accounts"):

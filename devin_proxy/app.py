@@ -362,6 +362,9 @@ def create_app(api_key=None):
         timeout=httpx.Timeout(connect=15, read=_READ_TIMEOUT, write=60,
                               pool=30),
         http2=_HTTP2,
+        trust_env=False,   # a malformed NO_PROXY/HTTP_PROXY (e.g. '[::1]')
+                           # must not crash the upstream client or route
+                           # Cognition auth through an unrelated local proxy
         limits=httpx.Limits(max_keepalive_connections=20,
                             keepalive_expiry=120))
     app.state.key_slots = {}
