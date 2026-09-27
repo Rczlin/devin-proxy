@@ -53,11 +53,13 @@ function _row(m,fam,isDef){
     <td style="white-space:nowrap">${op}</td></tr>`;
 }
 
-// ---- family panel: header + variant table ----------------------------------
+// ---- family panel: header + main variant; rest collapsed -------------------
 function _famPanel(f){
   const prefer=f.default||'medium';
   const vis=f.models.filter(m=>!m.hidden);
   const main=vis.find(m=>m.effort===prefer)||vis.find(m=>m.effort==='medium')||vis[0]||f.models[0];
+  const rest=[...f.models].filter(m=>m!==main)
+    .sort((a,b)=>EFFORD.indexOf(a.effort||'none')-EFFORD.indexOf(b.effort||'none')||a.uid.localeCompare(b.uid));
   const effs=[...new Set(vis.map(m=>m.effort).filter(Boolean))]
     .sort((a,b)=>EFFORD.indexOf(a)-EFFORD.indexOf(b));
   const promo=f.models.some(m=>m.promo);
@@ -70,20 +72,19 @@ function _famPanel(f){
         ${effs.map(e=>`<option value="${esc(e)}"${e===f.default_override?' selected':''}>${esc(EFF[e]||e)}</option>`).join('')}
       </select> <span class="muted">${f.models.length} 变体</span></span>`
     :`<span class="muted" style="float:right">${f.models.length} 变体</span>`;
-  const sorted=[...f.models].sort((a,b)=>
-    EFFORD.indexOf(a.effort||'none')-EFFORD.indexOf(b.effort||'none')||a.uid.localeCompare(b.uid));
+  const thead=`<thead><tr><th style="width:24%">模型 ID</th><th style="width:22%">显示名</th>
+      <th class="num">上下文</th><th class="num">输出</th>
+      <th class="num" title="每 1M input tokens">输入</th><th class="num" title="每 1M output tokens">输出价</th>
+      <th style="width:22%">能力</th><th>操作</th></tr></thead>`;
   return `<div class="panel">
     <h3>${esc(f.label)} <span class="tag model">${esc(f.vendor)}</span>
       ${promo?'<span class="tag ok" title="该家族含促销/折扣模型">促销</span>':''}
       ${maxCtx?`<span class="tag off" title="最大上下文">${fmt(maxCtx)} ctx</span>`:''}
       <span class="muted" style="text-transform:none;letter-spacing:0">${esc(f.desc||'')}</span>
       ${head}</h3>
-    <table>
-      <thead><tr><th style="width:24%">模型 ID</th><th style="width:22%">显示名</th>
-        <th class="num">上下文</th><th class="num">输出</th>
-        <th class="num" title="每 1M input tokens">输入</th><th class="num" title="每 1M output tokens">输出价</th>
-        <th style="width:22%">能力</th><th>操作</th></tr></thead>
-      <tbody>${sorted.map(m=>_row(m,f.prefix,m===main)).join('')}</tbody></table>
+    <table>${thead}<tbody>${main?_row(main,f.prefix,true):''}</tbody></table>
+    ${rest.length?`<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:12px">展开 ${rest.length} 个变体（点击设默认/隐藏）</summary>
+      <table style="margin-top:6px">${thead}<tbody>${rest.map(m=>_row(m,f.prefix,false)).join('')}</tbody></table></details>`:''}
     <div class="muted" style="margin-top:6px;font-size:12px">
       <code style="cursor:pointer" title="点击在 Playground 试用该家族"
         onclick="pickModel('${esc(f.prefix)}')">${esc(f.prefix)}</code>
