@@ -166,6 +166,8 @@ tr:hover td.ops{background:#1a2129}
 .ifrow{border:1px solid var(--border);border-radius:8px;padding:8px 12px;margin-bottom:6px;cursor:pointer;transition:border-color .15s}
 .ifrow:hover{border-color:var(--accent)}
 .ifrow.on{border-color:var(--accent);background:#1f6feb08}
+.ifrow.done{opacity:.55;pointer-events:auto}
+.ifrow.done:hover{border-color:var(--dim)}
 .ifmain{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px}
 .ifsub{color:var(--dim);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .ifsub b{color:var(--text);font-weight:600}

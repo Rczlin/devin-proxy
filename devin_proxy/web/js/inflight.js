@@ -7,8 +7,9 @@ const IF_PHASE={
   connecting:['等待上游','wait'],
   streaming:['流式输出中','ok'],
   stalled:['停顿中','warn'],
+  done:['已完成','off'],
 };
-const ifAge=s=>s==null?'-':s<60?Math.round(s)+'s':s<3600?Math.floor(s/60)+'m'+Math.round(s%60)+'s':(s/3600).toFixed(1)+'h';
+const ifAge=s=>s==null?'-':s<60?s.toFixed(1)+'s':s<3600?Math.floor(s/60)+'m'+(s%60).toFixed(1)+'s':(s/3600).toFixed(1)+'h';
 
 function openInflight(){
   $('#if-modal').classList.add('on');
@@ -36,7 +37,7 @@ function ifRow(r){
     ['TPS',r.tps==null?'-':r.tps],
     ['停顿',r.stall_s==null?'-':r.stall_s+'s'],
   ].map(([k,v])=>`<span class="ifst"><i>${k}</i>${v}</span>`).join('');
-  return `<div class="ifrow${IF.sel===r.id?' on':''}" onclick="ifSel(${r.id})">
+  return `<div class="ifrow${IF.sel===r.id?' on':''}${r.phase==='done'?' done':''}" onclick="ifSel(${r.id})">
     <div class="ifmain">
       <span class="tag ${cl}">${lb}</span>
       <span class="ifsub">${sub}</span>
@@ -48,7 +49,11 @@ function ifRow(r){
 }
 function renderInflight(){
   const items=IF.items;
-  $('#if-sub').textContent=`共 ${items.length} 个进行中`;
+  const live=items.filter(r=>r.phase!=='done');
+  const done=items.filter(r=>r.phase==='done');
+  $('#if-sub').textContent=live.length
+    ?`共 ${live.length} 个进行中`+(done.length?` · ${done.length} 个最近完成`:'')
+    :done.length?`${done.length} 个最近完成`:'';
   $('#if-list').innerHTML=items.length
     ? items.map(ifRow).join('')
     : '<div class="muted" style="padding:18px;text-align:center">当前没有在途请求</div>';

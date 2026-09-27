@@ -138,24 +138,44 @@ class InflightTracker:
         self._kick()
 
     def finish(self, rid):
+        """Mark done — keep the entry visible for _DONE_TTL_S so the
+        console shows a greyed-out 'finished' row before it disappears."""
         with self._lock:
-            e = self._reqs.pop(rid, None)
+            e = self._reqs.get(rid)
+            if e is not None:
+                e["phase"] = "done"
+                e["done_at"] = time.time()
         self._kick()
+
+    _DONE_TTL_S = 30        # finished requests linger this long
 
     def snapshot(self):
         """-> list of live request dicts, derived metrics computed."""
         now = time.time()
         with self._lock:
+            # purge done entries past TTL
+            expired = [rid for rid, e in self._reqs.items()
+                       if e.get("phase") == "done"
+                       and e.get("done_at")
+                       and now - e["done_at"] > self._DONE_TTL_S]
+            for rid in expired:
+                self._reqs.pop(rid, None)
             entries = [dict(e) for e in self._reqs.values()]
         out = []
         for e in entries:
             t0 = e["t0"]
             ev1 = e["first_ev_at"]
+            is_done = e.get("phase") == "done"
             out_chars = e["text_chars"] + e["think_chars"]
-            # real token count wins once upstream reports usage; ~4 chars/tok
-            # estimate before that
-            out_tok = e["out_tokens"] \
-                if e["out_tokens"] is not None else round(out_chars / 4)
+            # real token count wins once upstream reports usage; calibrated
+            # estimate before that — ~1.5 chars/tok for CJK-heavy traffic,
+            # ~4 for pure English. Blend: use chars/4 as floor, chars/1.5
+            # when the tail preview suggests CJK content.
+            if e["out_tokens"] is not None:
+                out_tok = e["out_tokens"]
+            else:
+                ratio = self._est_ratio(e["tail"])
+                out_tok = round(out_chars / ratio)
             gen_s = (now - ev1) if ev1 else None
             tps = round(out_tok / gen_s, 1) \
                 if out_tok and gen_s and gen_s > 0.05 else None
@@ -163,8 +183,11 @@ class InflightTracker:
             if phase == "streaming" and e["last_ev_at"] \
                     and now - e["last_ev_at"] > 15:
                 phase = "stalled"
+            if is_done:
+                phase = "done"
+            elapsed = (e.get("done_at") or now) - t0
             out.append({
-                "id": e["id"], "t0": t0, "elapsed_s": round(now - t0, 1),
+                "id": e["id"], "t0": t0, "elapsed_s": round(elapsed, 1),
                 "ttft_ms": round((ev1 - t0) * 1000) if ev1 else None,
                 "model": e["model"], "requested_model": e["requested_model"],
                 "endpoint": e["endpoint"], "stream": e["stream"],
@@ -178,11 +201,26 @@ class InflightTracker:
                 "text_chars": e["text_chars"], "think_chars": e["think_chars"],
                 "tool_calls": e["tool_calls"], "tps": tps,
                 "stall_s": round(now - e["last_ev_at"], 1)
-                          if e["last_ev_at"] else None,
+                          if e["last_ev_at"] and not is_done else None,
                 "last_ev": e["last_ev"], "tail": e["tail"][-300:],
             })
         out.sort(key=lambda r: r["t0"])
         return out
+
+    @staticmethod
+    def _est_ratio(tail):
+        """Pick a chars-per-token divisor from the output tail.
+        CJK text tokenizes ~1.2-1.8 chars/tok; pure English ~4.
+        Sample the tail, count CJK chars, blend."""
+        if not tail:
+            return 4.0
+        cjk = sum(1 for c in tail
+                  if '\u4e00' <= c <= '\u9fff'
+                  or '\u3000' <= c <= '\u303f'
+                  or '\uff00' <= c <= '\uffef')
+        frac = cjk / len(tail)
+        # blend between 4.0 (pure EN) and 1.5 (pure CJK)
+        return 4.0 - frac * (4.0 - 1.5)
 
 
 def _retry_clock():
