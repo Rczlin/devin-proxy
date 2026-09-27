@@ -41,7 +41,7 @@ function renderDashCards(d){
     {k:'平均 TPS',v:d.avg_tps||'-',sub:'tok/s 输出速率'},
     {k:'平均 TTFT',v:d.avg_ttft_ms?d.avg_ttft_ms+'ms':'-',sub:'流式占比 '+(d.total?Math.round(100*d.streams/d.total)+'%':'-'),st:`流式 ${fmtFull(d.streams||0)} / ${fmtFull(d.total)} 请求`},
     {k:'每分钟请求',v:d.rpm,sub:`tok/min ${fmt(d.tpm)}`,st:`最近5分钟 ${fmtFull(d.tpm*5)} tokens ≈ ${fmtFull(d.tpm)}/min`},
-    {k:'在途请求',v:pool.in_flight||0,sub:`钉扎会话 ${pool.sessions||0}`},
+    {k:'在途请求',v:pool.in_flight||0,sub:`钉扎会话 ${pool.sessions||0}`,cls:pool.in_flight?'yellow':'',click:'inflight'},
     {k:'账号就绪',v:`${pool.ready||0}/${pool.total||0}`,sub:`冷却 ${pool.cooldown||0} · 启用 ${pool.enabled||0}`,cls:pool.total?(pool.ready?'green':'red'):'',click:'accs'},
     {k:'断流 · 重试',v:`${d.truncated||0} · ${d.retried||0}`,sub:'点击筛选断流日志',cls:d.truncated?'red':'',click:'trunc'},
     ...(disk.total?[{k:'磁盘剩余',v:fmtB(disk.free),sub:`${fmtB((disk.total||0)-(disk.free||0))} 已用 / ${fmtB(disk.total)}`,cls:disk.low?'red':disk.free/disk.total<0.15?'yellow':'',click:'conf'}]:[]),
@@ -52,6 +52,7 @@ function renderDashCards(d){
 function cardGo(k){
   if(k==='accs')return goPage('accs');
   if(k==='conf')return goPage('conf');
+  if(k==='inflight')return openInflight();
   if(k==='trunc'){goPage('reqs');$('#rq-flag').value='truncated';reqReset();loadReqs()}
 }
 function renderPool(d){
@@ -259,6 +260,7 @@ function applyLive(m){
   }
   $('#foot').textContent=`账号 ${p.ready||0}/${p.total||0} 就绪 · 在途 ${p.in_flight||0}`;
   applyLiveAccs(p);
+  applyLiveInflight(m);   // in-flight modal — live request list + detail
 }
 // accs page: patch 状态/在途 cells in place; if the pushed row count no
 // longer matches what's rendered an add/remove happened — the next full

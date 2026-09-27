@@ -426,12 +426,20 @@ def _persist(body, rid, model, status, acct_name, skey, items_in, items_out,
         pass
 
 
+def _track_ctx(request, endpoint):
+    c = getattr(request, "client", None)
+    return {"endpoint": endpoint,
+            "client": getattr(c, "host", None),
+            "key_name": getattr(request.state, "key_name", None)}
+
+
 def _collect(request, body, chat_body, model, skey, rid, items_in,
              iter_chat, record, t0):
     rl = reqlog_for(request, body)
     texts, think, agg = [], [], ToolAgg()
     usage, err, acct_name = None, None, None
-    for acct, ev in iter_chat(chat_body, skey, stream=False, log=rl):
+    for acct, ev in iter_chat(chat_body, skey, stream=False, log=rl,
+                              track=_track_ctx(request, "responses")):
         if acct:
             acct_name = acct.display()
         if isinstance(ev, dict):
@@ -586,7 +594,8 @@ def _sse(request, body, chat_body, model, skey, rid, items_in,
     yield rl.out(em.ev("response.in_progress", response=base))
 
     try:
-        for acct, ev in iter_chat(chat_body, skey, stream=True, log=rl):
+        for acct, ev in iter_chat(chat_body, skey, stream=True, log=rl,
+                                  track=_track_ctx(request, "responses")):
             if acct:
                 acct_name = acct.display()
             if isinstance(ev, dict):
@@ -823,7 +832,9 @@ async def _ws_stream(ws, request, body, chat_body, model, skey, rid,
     def _pump():
         try:
             for acct, ev in iter_chat(chat_body, skey, stream=True, log=rl,
-                                      cancel_event=cancel_event):
+                                      cancel_event=cancel_event,
+                                      track=_track_ctx(request,
+                                                       "responses_ws")):
                 loop.call_soon_threadsafe(q.put_nowait, (acct, ev))
         except Exception as e:
             loop.call_soon_threadsafe(q.put_nowait, (None, e))

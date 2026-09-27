@@ -93,14 +93,19 @@ def _live_frame(ctx):
         "cooldown_s": max(0, round(a.cooldown_until - now)),
         "fails": a.consecutive_fails,
     } for a in accs]
+    fl = getattr(ctx.app.state, "inflight", None)
+    inflight = fl.snapshot() if fl is not None else []
     return {"type": "live", "ts": now, "uptime_s": now - ctx.started,
-            "data_v": store._data_version, "pool": p}
+            "data_v": store._data_version, "pool": p, "inflight": inflight}
 
 
 def register(router, ctx, admin_key):
     feed = LiveFeed()
     ctx.app.state.live_feed = feed
     ctx.app.state.pool.on_change(feed.notify)
+    fl = getattr(ctx.app.state, "inflight", None)
+    if fl is not None:
+        fl.bind(feed)
 
     def _ws_authed(ws):
         if ctx.sess_ok(ws.cookies.get(_SESS_COOKIE, "")):
@@ -203,7 +208,8 @@ def register(router, ctx, admin_key):
                     await ws.close(code=4401)
                     break
                 f = _live_frame(ctx)
-                key = json.dumps({"p": f["pool"], "v": f["data_v"]},
+                key = json.dumps({"p": f["pool"], "v": f["data_v"],
+                                  "f": f["inflight"]},
                                  ensure_ascii=False)
                 if key != last_key or time.time() - last_sent > _HEARTBEAT_S:
                     await ws.send_text(json.dumps(f, ensure_ascii=False))

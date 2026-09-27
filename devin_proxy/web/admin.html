@@ -291,10 +291,23 @@
     </div>
   </div>
 </div>
+<div class="modal" id="if-modal" onclick="if(event.target===this)this.classList.remove('on')">
+  <div class="box" style="width:min(1080px,96vw)">
+    <h3 style="margin-bottom:10px">在途请求 <span class="muted" id="if-sub"></span>
+      <span class="livedot" style="margin-left:8px"></span></h3>
+    <div id="if-list"></div>
+    <div id="if-detail" style="display:none"></div>
+    <div style="display:flex;justify-content:space-between;margin-top:12px">
+      <span class="muted">数据经 WebSocket 每秒推送；token 在收到 usage 前为估值（≈4字符/token）</span>
+      <button onclick="document.getElementById('if-modal').classList.remove('on')">关闭</button>
+    </div>
+  </div>
+</div>
 <div class="toast" id="toast"></div>
 
 <script src="/admin/static/js/util.js"></script>
 <script src="/admin/static/js/dash.js"></script>
+<script src="/admin/static/js/inflight.js"></script>
 <script src="/admin/static/js/reqs.js"></script>
 <script src="/admin/static/js/detail.js"></script>
 <script src="/admin/static/js/accs.js"></script>

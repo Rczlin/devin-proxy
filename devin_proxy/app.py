@@ -46,6 +46,145 @@ class ClientDisconnected(Exception):
     pass
 
 
+class InflightTracker:
+    """Live registry of requests currently flowing through iter_chat.
+
+    One entry per client request (all endpoints funnel through iter_chat).
+    Thread-safe — iter_chat runs in worker threads while the admin ws
+    serializes snapshots on the event loop. Payload fields are computed at
+    snapshot time so workers only store raw counters."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._reqs = {}          # id -> entry dict
+        self._next = 0
+        self._feed = None        # LiveFeed, bound lazily by admin_routes.live
+
+    def bind(self, feed):
+        self._feed = feed
+
+    def _kick(self):
+        f = self._feed
+        if f is not None:
+            f.notify()
+
+    def register(self, model=None, endpoint=None, stream=None,
+                 session_key=None, client=None, key_name=None,
+                 requested_model=None):
+        with self._lock:
+            self._next += 1
+            rid = self._next
+            now = time.time()
+            self._reqs[rid] = {
+                "id": rid, "t0": now, "model": model,
+                "requested_model": requested_model, "endpoint": endpoint,
+                "stream": bool(stream), "session_key": session_key,
+                "client": client, "key_name": key_name,
+                "account": None, "account_id": None,
+                "phase": "connecting",      # connecting|streaming|finishing
+                "attempt": 0, "chunks": 0,
+                "text_chars": 0, "think_chars": 0, "tool_calls": 0,
+                "out_tokens": None, "in_tokens": None,
+                "first_ev_at": None, "last_ev_at": None, "last_ev": None,
+                "tail": "",
+            }
+        self._kick()
+        return rid
+
+    def update(self, rid, **kw):
+        with self._lock:
+            e = self._reqs.get(rid)
+            if e is None:
+                return
+            e.update(kw)
+        self._kick()
+
+    def event(self, rid, ev, account=None):
+        """One upstream frame arrived — bump counters + preview tail."""
+        now = time.time()
+        with self._lock:
+            e = self._reqs.get(rid)
+            if e is None:
+                return
+            if e["first_ev_at"] is None:
+                e["first_ev_at"] = now
+                e["phase"] = "streaming"
+            e["last_ev_at"] = now
+            e["chunks"] += 1
+            if account is not None:
+                e["account"] = account.display()
+                e["account_id"] = account.id
+            if isinstance(ev, dict):
+                e["last_ev"] = "err:" + str(ev.get("kind") or "?")
+                return
+            if ev.delta_text:
+                e["text_chars"] += len(ev.delta_text)
+                e["tail"] = (e["tail"] + ev.delta_text)[-400:]
+                e["last_ev"] = "text"
+            if ev.delta_thinking:
+                e["think_chars"] += len(ev.delta_thinking)
+                e["last_ev"] = "think"
+            if len(ev.delta_tool_calls):
+                e["tool_calls"] += len(ev.delta_tool_calls)
+                e["last_ev"] = "tool_call"
+            if ev.stop_reason:
+                e["last_ev"] = "stop:" + str(int(ev.stop_reason))
+            if len(ev.usage):
+                u = upstream.extract_usage(ev)
+                if u.get("completion_tokens") is not None:
+                    e["out_tokens"] = u["completion_tokens"]
+                if u.get("prompt_tokens") is not None:
+                    e["in_tokens"] = u["prompt_tokens"]
+        self._kick()
+
+    def finish(self, rid):
+        with self._lock:
+            e = self._reqs.pop(rid, None)
+        self._kick()
+
+    def snapshot(self):
+        """-> list of live request dicts, derived metrics computed."""
+        now = time.time()
+        with self._lock:
+            entries = [dict(e) for e in self._reqs.values()]
+        out = []
+        for e in entries:
+            t0 = e["t0"]
+            ev1 = e["first_ev_at"]
+            out_chars = e["text_chars"] + e["think_chars"]
+            # real token count wins once upstream reports usage; ~4 chars/tok
+            # estimate before that
+            out_tok = e["out_tokens"] \
+                if e["out_tokens"] is not None else round(out_chars / 4)
+            gen_s = (now - ev1) if ev1 else None
+            tps = round(out_tok / gen_s, 1) \
+                if out_tok and gen_s and gen_s > 0.05 else None
+            phase = e["phase"]
+            if phase == "streaming" and e["last_ev_at"] \
+                    and now - e["last_ev_at"] > 15:
+                phase = "stalled"
+            out.append({
+                "id": e["id"], "t0": t0, "elapsed_s": round(now - t0, 1),
+                "ttft_ms": round((ev1 - t0) * 1000) if ev1 else None,
+                "model": e["model"], "requested_model": e["requested_model"],
+                "endpoint": e["endpoint"], "stream": e["stream"],
+                "account": e["account"], "account_id": e["account_id"],
+                "client": e["client"], "key_name": e["key_name"],
+                "session_key": e["session_key"],
+                "phase": phase, "attempt": e["attempt"],
+                "chunks": e["chunks"],
+                "out_tokens": out_tok, "out_tokens_est": e["out_tokens"] is None,
+                "in_tokens": e["in_tokens"],
+                "text_chars": e["text_chars"], "think_chars": e["think_chars"],
+                "tool_calls": e["tool_calls"], "tps": tps,
+                "stall_s": round(now - e["last_ev_at"], 1)
+                          if e["last_ev_at"] else None,
+                "last_ev": e["last_ev"], "tail": e["tail"][-300:],
+            })
+        out.sort(key=lambda r: r["t0"])
+        return out
+
+
 def _retry_clock():
     return time.monotonic()
 
@@ -369,6 +508,7 @@ def create_app(api_key=None):
                             keepalive_expiry=120))
     app.state.key_slots = {}
     app.state.slot_lock = threading.Lock()
+    app.state.inflight = InflightTracker()
     if imported:
         print(f"accounts: imported {imported} detected credential(s)")
     if not pool.accounts():
@@ -670,14 +810,18 @@ def create_app(api_key=None):
             temperature=body.get("temperature"), top_p=body.get("top_p"),
             **conv_ids(skey))
 
-    def iter_chat(body, session_key=None, force_account=None, stream=True,
-                  log=None, cancel_event=None):
+    def _iter_chat(body, session_key=None, force_account=None, stream=True,
+                   log=None, cancel_event=None, fl=None, fl_id=None):
         """Failover driver. Yields (acct, event). Terminal upstream error is
         yielded as (acct_or_None, dict). On success returns quietly.
 
         stream=False buffers each attempt's events instead of forwarding them
         live, so a mid-stream failure can be retried on the next account —
-        safe because nothing has reached the client yet."""
+        safe because nothing has reached the client yet.
+
+        fl/fl_id wire the request into the in-flight tracker (see iter_chat
+        wrapper): every upstream event updates live counters so the admin
+        console can watch streams in real time."""
         model = resolve_model(body)
         want = {m for m in (body.get("model"), model) if m}
         tried, last_err = set(), {"message": "no accounts configured",
@@ -700,6 +844,9 @@ def create_app(api_key=None):
                 break
             tried.add(acct.id)
             force_id = None
+            if fl is not None:
+                fl.update(fl_id, attempt=attempt,
+                          account=acct.display(), account_id=acct.id)
             if log:
                 log.ev("attempt", n=attempt, account=acct.display(),
                        account_id=acct.id)
@@ -784,6 +931,8 @@ def create_app(api_key=None):
                             req,
                             capture=(lambda k, d: log.cap_frame(cap_att, k, d))
                             if cap_att is not None else None):
+                        if fl is not None:
+                            fl.event(fl_id, ev, acct)
                         if isinstance(ev, dict):
                             if log:
                                 if ev.get("kind") == "truncated":
@@ -931,6 +1080,39 @@ def create_app(api_key=None):
         if log:
             log.ev("failed", detail=last_err)
         yield None, last_err
+
+    def iter_chat(body, session_key=None, force_account=None, stream=True,
+                  log=None, cancel_event=None, track=None):
+        """Public entry: registers the request in the in-flight tracker so
+        the admin console can watch it live, then delegates to _iter_chat.
+        `track` carries per-endpoint context (_track_ctx) the driver can't
+        see itself — endpoint name, client host, key name."""
+        fl = getattr(app.state, "inflight", None)
+        fl_id = None
+        if fl is not None:
+            t = track or {}
+            try:
+                fl_id = fl.register(
+                    model=resolve_model(body),
+                    requested_model=body.get("model"),
+                    endpoint=t.get("endpoint"), stream=stream,
+                    session_key=session_key, client=t.get("client"),
+                    key_name=t.get("key_name"))
+            except Exception:
+                fl_id = None
+        try:
+            yield from _iter_chat(body, session_key, force_account, stream,
+                                  log, cancel_event, fl, fl_id)
+        finally:
+            if fl is not None and fl_id is not None:
+                fl.finish(fl_id)
+
+    def _track_ctx(request, endpoint):
+        """In-flight display context: who called, through which endpoint."""
+        c = getattr(request, "client", None)
+        return {"endpoint": endpoint,
+                "client": getattr(c, "host", None),
+                "key_name": getattr(request.state, "key_name", None)}
 
     def oai_usage(u):
         # upstream input_tokens is the UNCACHED count; OpenAI semantics put
@@ -1082,7 +1264,7 @@ def create_app(api_key=None):
         finish, usage, rid = "stop", None, f"chatcmpl-{uuid.uuid4().hex[:24]}"
         err, acct_name = None, None
         for acct, ev in iter_chat(body, skey, force_account, stream=False,
-                                  log=rl):
+                                  log=rl, track=_track_ctx(request, "chat")):
             if acct:
                 acct_name = acct.display()
             if isinstance(ev, dict):
@@ -1148,7 +1330,8 @@ def create_app(api_key=None):
 
         try:
             for acct, ev in iter_chat(body, skey, force_account, stream=True,
-                                      log=rl):
+                                      log=rl,
+                                      track=_track_ctx(request, "chat")):
                 if acct:
                     acct_name = acct.display()
                 if not started:

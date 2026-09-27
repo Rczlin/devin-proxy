@@ -56,6 +56,14 @@ def register(router, ctx, admin_key):
             headers={"Content-Disposition":
                      f'attachment; filename="{fn}.jsonl"'})
 
+    @router.get("/api/inflight", dependencies=[Depends(admin_key)])
+    def inflight():
+        """Snapshot of requests currently streaming through the proxy —
+        same data the ws live frame carries, for clients that prefer poll."""
+        fl = getattr(ctx.app.state, "inflight", None)
+        return {"items": fl.snapshot() if fl is not None else [],
+                "ts": time.time()}
+
     @router.get("/api/requests/errors", dependencies=[Depends(admin_key)])
     def request_errors(hours: int = 24):
         """Error rollup for the log page — failures grouped by a stripped
