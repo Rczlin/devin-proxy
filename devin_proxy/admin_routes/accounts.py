@@ -1,4 +1,5 @@
 """Upstream-account admin routes: pool CRUD, test/refresh, import, bulk."""
+import json
 import time
 
 from fastapi import Depends, HTTPException
@@ -22,6 +23,7 @@ def register(router, ctx, admin_key):
         disabled: Optional[bool] = None
         max_concurrent: Optional[int] = None
         models: Optional[str] = None        # "" clears the allowlist
+        quota_limit_pct: Optional[int] = None  # soft weekly-limit %, 0 = unset
 
     @router.get("/api/accounts", dependencies=[Depends(admin_key)])
     def list_accounts():
@@ -66,6 +68,10 @@ def register(router, ctx, admin_key):
             fields["max_concurrent"] = body.max_concurrent
         if body.models is not None:
             fields["models"] = body.models
+        if body.quota_limit_pct is not None:
+            if not (0 <= body.quota_limit_pct <= 100):
+                raise HTTPException(400, "quota_limit_pct must be 0-100")
+            fields["quota_limit_pct"] = body.quota_limit_pct
         ctx.app.state.pool.update(aid, **fields)
         return {"account": ctx.app.state.pool.get(aid).public()}
 
@@ -122,8 +128,38 @@ def register(router, ctx, admin_key):
             raise HTTPException(502, "identity fetch failed")
         a.email = info.get("email") or a.email
         a.plan = info.get("plan") or a.plan
+        if info.get("quota"):
+            a.quota_json = json.dumps(info["quota"], separators=(",", ":"))
+            a.quota_fetched = time.time()
         a.persist()
         return {"account": a.public(), "identity": info}
+
+    @router.post("/api/accounts/quota-all", dependencies=[Depends(admin_key)])
+    def refresh_quota_all():
+        """Refresh upstream quota for every enabled account; a per-account
+        failure is reported but doesn't abort the batch."""
+        out = []
+        for a in ctx.app.state.pool.accounts():
+            if a.disabled:
+                continue
+            try:
+                q = accounts_mod.fetch_quota(ctx.app.state.http, a)
+                out.append({"id": a.id, "ok": q is not None})
+            except Exception as e:
+                out.append({"id": a.id, "ok": False, "error": str(e)[:200]})
+        return {"results": out,
+                "accounts": [x.public() for x in ctx.app.state.pool.accounts()]}
+
+    @router.post("/api/accounts/{aid}/quota", dependencies=[Depends(admin_key)])
+    def refresh_quota(aid: int):
+        """Force-refresh one account's upstream quota snapshot."""
+        a = ctx.app.state.pool.get(aid)
+        if not a:
+            raise HTTPException(404, "not found")
+        q = accounts_mod.fetch_quota(ctx.app.state.http, a)
+        if q is None:
+            raise HTTPException(502, "no quota data (plan may not expose it)")
+        return {"account": a.public(), "quota": q}
 
     @router.post("/api/accounts/import", dependencies=[Depends(admin_key)])
     def import_detected():

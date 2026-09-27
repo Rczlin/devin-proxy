@@ -203,6 +203,10 @@ def _init_all():
     _add_columns("accounts", {
         "max_concurrent": "INTEGER DEFAULT 0",
         "models": "TEXT",
+        # upstream quota snapshot (GetUserStatus.plan_status) + soft-limit flag
+        "quota_json": "TEXT",
+        "quota_fetched": "REAL",
+        "quota_limit_pct": "INTEGER DEFAULT 0",
     })
     _con.commit()
 
@@ -1601,13 +1605,14 @@ def update_account(aid, **fields):
     cols = {"name", "email", "api_server_url", "devin_webapp_host",
             "devin_api_url", "plan", "disabled", "fail_count",
             "consecutive_fails", "cooldown_until", "last_error",
-            "last_used", "last_ok", "req_count", "max_concurrent", "models"}
+            "last_used", "last_ok", "req_count", "max_concurrent", "models",
+            "quota_json", "quota_fetched", "quota_limit_pct"}
     sets, args = [], []
     for k, v in fields.items():
         if k in cols:
             if k == "models":
                 v = _models_text(v)
-            elif k == "max_concurrent":
+            elif k in ("max_concurrent", "quota_limit_pct"):
                 v = int(v or 0)
             sets.append(f"{k}=?")
             args.append(v)

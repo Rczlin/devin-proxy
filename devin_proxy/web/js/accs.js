@@ -1,5 +1,49 @@
 // accounts
 let OA_FID=null, ACC_MAP={};
+// --- quota column -----------------------------------------------------------
+// `rem` is a *remaining* percent (0-100) from upstream planStatus.
+function _quotaBar(rem){
+  if(rem==null)return '';
+  const used=Math.max(0,Math.min(100,100-rem));
+  const cls=rem>50?'ok':rem>20?'warn':'err';
+  return `<div class="qbar"><div class="qfill ${cls}" style="width:${used}%"></div>`+
+    `<span class="qnum">${Math.round(rem)}%</span></div>`;
+}
+function quotaCell(a){
+  const q=a.quota;
+  if(!q)return `<td class="muted" title="无上游配额数据（手动 token 账号或 plan 未开放）">-</td>`;
+  const parts=[];
+  if(q.daily_pct!=null)parts.push(`<div class="qrow"><span class="qlab">日</span>${_quotaBar(q.daily_pct)}</div>`);
+  if(q.weekly_pct!=null)parts.push(`<div class="qrow"><span class="qlab">周</span>${_quotaBar(q.weekly_pct)}</div>`);
+  if(!parts.length&&q.acu_used!=null)
+    parts.push(`<div class="qrow"><span class="qlab">ACU</span><span class="qnum">${q.acu_used}${q.acu_limit?'/'+q.acu_limit:''}</span></div>`);
+  if(!parts.length)return `<td class="muted" title="plan 未暴露配额百分比">·</td>`;
+  const tip=[];
+  if(q.plan_name)tip.push(q.plan_name);
+  if(q.acu_used!=null)tip.push(`ACU ${q.acu_used}${q.acu_limit?'/'+q.acu_limit:''}`);
+  if(q.weekly_reset)tip.push('周重置 '+fmtT(q.weekly_reset));
+  if(q.daily_reset)tip.push('日重置 '+fmtT(q.daily_reset));
+  if(q.plan_end)tip.push('周期止 '+String(q.plan_end).slice(0,10));
+  const over=a.quota_over_limit?`<div class="qrow"><span class="tag err" title="已达软上限（仅提醒，不影响调度）">超限</span></div>`:'';
+  return `<td class="qcell" title="${esc(tip.join(' · '))}">${parts.join('')}${over}</td>`;
+}
+async function quotaAll(){
+  toast('拉取配额中…');
+  try{
+    const d=await (await api('/admin/api/accounts/quota-all',{method:'POST'})).json();
+    const bad=(d.results||[]).filter(r=>!r.ok);
+    toast(bad.length?`已刷新，${bad.length} 个账号无配额数据`:`✓ 已刷新 ${d.results.length} 个账号配额`);
+  }catch(e){toast('配额拉取失败: '+e.message)}
+  loadAccounts();
+}
+async function quotaOne(id){
+  toast('拉取配额中…');
+  try{
+    const d=await (await api('/admin/api/accounts/'+id+'/quota',{method:'POST'})).json();
+    toast('✓ 配额已更新');
+  }catch(e){toast('无配额数据: '+e.message)}
+  loadAccounts();
+}
 async function loadAccounts(){
   const d=await (await api('/admin/api/accounts')).json();
   const p=d.pool||{};
@@ -12,7 +56,7 @@ async function loadAccounts(){
     const u=a.usage||{};
     return `<tr><td><input type="checkbox" class="acc-cb" data-id="${a.id}" onclick="accSelChanged()"></td><td>${a.id}</td>
       <td><b>${esc(a.label)}</b>${a.email?`<br><span class="muted">${esc(a.email)}</span>`:''}${a.last_error?`<br><span class="muted" style="color:var(--red)" title="${esc(a.last_error)}">${esc(a.last_error.slice(0,60))}</span>`:''}</td>
-      <td>${esc(a.plan||'-')}</td><td class="muted">${esc(a.source||'-')}</td>
+      <td>${esc(a.plan||'-')}</td>${quotaCell(a)}<td class="muted">${esc(a.source||'-')}</td>
       <td>${st}</td><td>${u.n||0}</td>
       <td>${a.in_flight}/${a.max_concurrent||'∞'}</td>
       <td class="muted">${a.models&&a.models.length?esc(a.models.join(',')):'全部'}</td>
@@ -20,11 +64,12 @@ async function loadAccounts(){
       <td>${fmtT(a.last_used)}</td><td class="muted">…${esc(a.token_tail)}</td>
       <td style="white-space:nowrap">
         <button onclick="testAccount(${a.id})">测试</button>
+        <button onclick="quotaOne(${a.id})" title="拉取上游最新配额">配额</button>
         <button onclick="refreshAccount(${a.id})">刷新</button>
         <button onclick="editAccLimits(${a.id})">限制</button>
         <button onclick="toggleAccount(${a.id},${a.disabled?0:1})">${a.disabled?'启用':'禁用'}</button>
         <button class="danger" onclick="delAccount(${a.id},'${esc(a.label)}')">删除</button>
-      </td></tr>`}).join('')||'<tr><td colspan=13 class=muted>暂无账号 — 用上方 OAuth 登录或手动添加</td></tr>';
+      </td></tr>`}).join('')||'<tr><td colspan=14 class=muted>暂无账号 — 用上方 OAuth 登录或手动添加</td></tr>';
   const s=await (await api('/admin/api/sessions')).json();
   $('#sess-body').innerHTML=(s.sessions||[]).map(x=>{
     const left=x.expires_in_s;
@@ -113,8 +158,10 @@ async function editAccLimits(id){
   if(mc===null)return;
   const models=prompt('该账号可服务的模型（逗号分隔 uid/别名，留空 = 全部）',(a.models||[]).join(','));
   if(models===null)return;
+  const qp=prompt('周配额软上限 %：周用量达到该值时该行标红提醒（0 = 不提醒，仅显示）',a.quota_limit_pct||0);
+  if(qp===null)return;
   await api('/admin/api/accounts/'+id,{method:'PATCH',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({max_concurrent:parseInt(mc)||0,models})});
+    body:JSON.stringify({max_concurrent:parseInt(mc)||0,models,quota_limit_pct:parseInt(qp)||0})});
   toast('已更新');loadAccounts();
 }
 async function delAccount(id,name){

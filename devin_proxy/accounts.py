@@ -13,6 +13,7 @@ kept on the Account objects in memory. Scheduling policy:
 """
 import base64
 import hashlib
+import json
 import secrets
 import threading
 import time
@@ -38,7 +39,8 @@ class Account:
                  "api_url", "source", "plan", "created", "disabled",
                  "fail_count", "consecutive_fails", "cooldown_until",
                  "last_error", "last_used", "last_ok", "req_count",
-                 "max_concurrent", "models", "in_flight")
+                 "max_concurrent", "models", "in_flight",
+                 "quota_json", "quota_fetched", "quota_limit_pct")
 
     @classmethod
     def from_row(cls, r):
@@ -63,8 +65,29 @@ class Account:
         a.req_count = r["req_count"] or 0
         a.max_concurrent = r["max_concurrent"] or 0
         a.models = {m for m in (r["models"] or "").split(",") if m}
+        a.quota_json = r["quota_json"]
+        a.quota_fetched = r["quota_fetched"] or 0
+        a.quota_limit_pct = r["quota_limit_pct"] or 0
         a.in_flight = 0
         return a
+
+    def quota(self):
+        """Parsed upstream quota snapshot (plan_status) or None."""
+        if not self.quota_json:
+            return None
+        try:
+            return json.loads(self.quota_json)
+        except Exception:
+            return None
+
+    def quota_over_limit(self):
+        """True when a soft weekly-limit % is set and remaining usage has
+        crossed it. Purely a display flag — never blocks scheduling."""
+        q = self.quota()
+        if not (self.quota_limit_pct and q):
+            return False
+        rem = q.get("weekly_pct")
+        return rem is not None and (100 - rem) >= self.quota_limit_pct
 
     def display(self):
         return self.name or self.email or f"acct-{self.id}"
@@ -93,6 +116,10 @@ class Account:
                 "last_ok": self.last_ok, "req_count": self.req_count,
                 "max_concurrent": self.max_concurrent,
                 "models": sorted(self.models),
+                "quota": self.quota(),
+                "quota_fetched": self.quota_fetched,
+                "quota_limit_pct": self.quota_limit_pct,
+                "quota_over_limit": self.quota_over_limit(),
                 "in_flight": self.in_flight, "created": self.created}
 
     def persist(self):
@@ -103,7 +130,9 @@ class Account:
             cooldown_until=self.cooldown_until, last_error=self.last_error,
             last_used=self.last_used, last_ok=self.last_ok,
             req_count=self.req_count, max_concurrent=self.max_concurrent,
-            models=",".join(sorted(self.models)) or None)
+            models=",".join(sorted(self.models)) or None,
+            quota_json=self.quota_json, quota_fetched=self.quota_fetched,
+            quota_limit_pct=self.quota_limit_pct)
 
 
 def normalize_token(token):
@@ -520,12 +549,84 @@ def fetch_identity(client, api_server_url, token):
         d = r.json()
         us = d.get("userStatus") or d.get("user_status") or {}
         pi = d.get("planInfo") or d.get("plan_info") or {}
+        ps = us.get("planStatus") or us.get("plan_status") or {}
         return {
             "email": us.get("email"),
             "user_id": us.get("userId") or us.get("user_id"),
             "team_id": us.get("teamId") or us.get("team_id"),
             "plan": pi.get("planName") or pi.get("plan_name"),
             "tier": pi.get("teamsTier") or pi.get("teams_tier"),
+            "quota": _quota_from_plan_status(ps, pi),
         }
     except Exception:
         return None
+
+
+def _num(d, *keys):
+    """First numeric value among camel/snake keys (handles str/int/float)."""
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            try:
+                return float(v) if ("." in v or "e" in v.lower()) else int(v)
+            except ValueError:
+                continue
+    return None
+
+
+def _quota_from_plan_status(ps, pi):
+    """Normalize GetUserStatus.userStatus.planStatus into a compact quota
+    snapshot for the admin UI. Returns {} when nothing quota-like is present."""
+    if not isinstance(ps, dict) or not ps:
+        return {}
+    q = {
+        "plan_name": pi.get("planName") or pi.get("plan_name"),
+        "tier": pi.get("teamsTier") or pi.get("teams_tier"),
+        "billing": pi.get("billingStrategy") or pi.get("billing_strategy"),
+        "daily_pct": _num(ps, "dailyQuotaRemainingPercent",
+                          "daily_quota_remaining_percent"),
+        "weekly_pct": _num(ps, "weeklyQuotaRemainingPercent",
+                           "weekly_quota_remaining_percent"),
+        "acu_used": _num(ps, "acuConsumed", "acu_consumed"),
+        "acu_limit": _num(ps, "acuLimit", "acu_limit"),
+        "daily_reset": _num(ps, "dailyQuotaResetAtUnix",
+                            "daily_quota_reset_at_unix"),
+        "weekly_reset": _num(ps, "weeklyQuotaResetAtUnix",
+                             "weekly_quota_reset_at_unix"),
+        "plan_start": ps.get("planStart") or ps.get("plan_start"),
+        "plan_end": ps.get("planEnd") or ps.get("plan_end"),
+        "avail_prompt_credits": _num(
+            ps, "availablePromptCredits", "available_prompt_credits"),
+        "used_prompt_credits": _num(
+            ps, "usedPromptCredits", "used_prompt_credits"),
+        "avail_flow_credits": _num(
+            ps, "availableFlowCredits", "available_flow_credits"),
+        "used_flow_credits": _num(
+            ps, "usedFlowCredits", "used_flow_credits"),
+        "avail_flex_credits": _num(
+            ps, "availableFlexCredits", "available_flex_credits"),
+        "used_flex_credits": _num(
+            ps, "usedFlexCredits", "used_flex_credits"),
+        "overage_micros": _num(
+            ps, "overageBalanceMicros", "overage_balance_micros"),
+        "grace": ps.get("gracePeriodStatus") or ps.get("grace_period_status"),
+    }
+    # drop keys with no data so the UI only renders real fields
+    return {k: v for k, v in q.items() if v is not None}
+
+
+def fetch_quota(client, acct):
+    """Pull the account's upstream quota via GetUserStatus and cache it on the
+    account row. -> normalized quota dict or None (auth plan w/o quota)."""
+    info = fetch_identity(client, acct.api_server_url, acct.token)
+    q = (info or {}).get("quota")
+    if not q:
+        return None
+    acct.quota_json = json.dumps(q, separators=(",", ":"))
+    acct.quota_fetched = time.time()
+    if info.get("plan"):
+        acct.plan = info["plan"]
+    acct.persist()
+    return q

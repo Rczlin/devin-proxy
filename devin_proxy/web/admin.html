@@ -115,6 +115,7 @@
     <section class="page" id="p-accs">
       <h2>账号池 <span class="muted" id="accs-summary"></span>
         <span style="float:right"><button class="mini" onclick="refreshPage(this)" title="重新加载账号列表">↻ 刷新</button>
+          <button onclick="quotaAll()" title="从上游拉取所有启用账号的最新配额">▦ 刷新配额</button>
           <button onclick="pingAll()" title="并发测试所有启用账号的上游连通性">⚡ 全部测试</button></span></h2>
       <div class="panel">
         <h3>OAuth 登录（浏览器完成授权 → 粘贴 code）</h3>
@@ -160,7 +161,7 @@
           <button onclick="accBulk(1)">批量禁用</button>
         </div>
         <table><thead><tr>
-          <th></th><th>ID</th><th>账号</th><th>Plan</th><th>来源</th><th>状态</th><th>请求</th><th>在途/上限</th><th>模型限制</th><th>失败</th><th>最近使用</th><th>Token</th><th></th>
+          <th></th><th>ID</th><th>账号</th><th>Plan</th><th>用量</th><th>来源</th><th>状态</th><th>请求</th><th>在途/上限</th><th>模型限制</th><th>失败</th><th>最近使用</th><th>Token</th><th></th>
         </tr></thead><tbody id="acc-body"></tbody></table>
       </div>
       <div class="panel">
