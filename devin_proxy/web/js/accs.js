@@ -56,7 +56,7 @@ async function loadAccounts(){
     const u=a.usage||{};
     return `<tr><td><input type="checkbox" class="acc-cb" data-id="${a.id}" onclick="accSelChanged()"></td><td>${a.id}</td>
       <td><b>${esc(a.label)}</b>${a.email?`<br><span class="muted">${esc(a.email)}</span>`:''}${a.last_error?`<br><span class="muted" style="color:var(--red)" title="${esc(a.last_error)}">${esc(a.last_error.slice(0,60))}</span>`:''}</td>
-      <td>${esc(a.plan||'-')}</td>${quotaCell(a)}<td class="muted">${esc(a.source||'-')}</td>
+      <td>${esc(a.plan||'-')}</td>${quotaCell(a)}<td class="muted" title="${esc(a.source||'')}">${esc((a.source||'-').split(':')[0])}</td>
       <td>${st}</td><td>${u.n||0}</td>
       <td>${a.in_flight}/${a.max_concurrent||'∞'}</td>
       <td class="muted">${a.models&&a.models.length?esc(a.models.join(',')):'全部'}</td>
@@ -77,7 +77,7 @@ async function loadAccounts(){
       :left<3600?`<span style="color:var(--yellow)">${Math.round(left/60)}分钟</span>`
       :`<span class="muted">${(left/3600).toFixed(1)}小时</span>`;
     return `<tr>
-    <td class="muted">${esc(x.session_key)}</td><td>${esc(x.aname||x.email||('#'+x.account_id))}</td>
+    <td class="muted" title="${esc(x.session_key)}">${esc(x.session_key.slice(0,18))}…</td><td>${esc(x.aname||x.email||('#'+x.account_id))}</td>
     <td class="muted">${x.idle_s!=null?fmtDur(x.idle_s)+'前':'-'}</td><td>${leftTxt}</td>
     <td>${fmtT(x.updated)}</td>
     <td><a onclick="unpinSess('${esc(x.session_key)}')">解绑</a></td></tr>`}).join('')
