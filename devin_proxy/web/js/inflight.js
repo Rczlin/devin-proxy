@@ -27,9 +27,10 @@ function openInflight(){
   $('#if-modal').classList.add('on');
   IF.sel=null;
   renderInflight();
-  // tick every 500ms so elapsed/stall update between ws pushes
+  // tick every 100ms so elapsed/stall update between ws pushes —
+  // matches the 0.1s display precision of ifAge()
   clearInterval(IF.tickId);
-  IF.tickId=setInterval(()=>{IF.dirty=true;scheduleRender()},500);
+  IF.tickId=setInterval(()=>{IF.dirty=true;scheduleRender()},100);
   // REST fallback — if the ws feed is dead we still show a snapshot,
   // otherwise the next live frame repaints over it instantly.
   api('/admin/api/inflight').then(r=>r.json()).then(d=>{
