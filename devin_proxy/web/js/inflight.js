@@ -54,9 +54,14 @@ function renderInflight(){
   $('#if-sub').textContent=live.length
     ?`共 ${live.length} 个进行中`+(done.length?` · ${done.length} 个最近完成`:'')
     :done.length?`${done.length} 个最近完成`:'';
+  const scroller=$('#if-modal .box');
+  // auto-scroll: if the user is near the bottom, keep them pinned there
+  // as new rows arrive; if they scrolled up, leave them alone.
+  const wasNearBottom=scroller.scrollTop+scroller.clientHeight>=scroller.scrollHeight-50;
   $('#if-list').innerHTML=items.length
     ? items.map(ifRow).join('')
     : '<div class="muted" style="padding:18px;text-align:center">当前没有在途请求</div>';
+  if(wasNearBottom)scroller.scrollTop=scroller.scrollHeight;
   if(IF.sel!=null){
     const r=items.find(x=>x.id===IF.sel);
     if(r)renderIfDetail(r);
