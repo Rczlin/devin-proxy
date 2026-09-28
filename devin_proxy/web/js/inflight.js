@@ -25,6 +25,7 @@ function bindInflightOnce(){
 function openInflight(){
   bindInflightOnce();
   $('#if-modal').classList.add('on');
+  ifSubscribe();              // ask the ws feed to include inflight frames
   IF.sel=null;
   renderInflight();
   // tick every 100ms so elapsed/stall update between ws pushes —
@@ -188,6 +189,31 @@ function renderIfDetail(r){
 }
 // hooked by applyLive() in dash.js — refreshes the modal when open
 function applyLiveInflight(f){
+  if(f.inflight==null)return;   // unsubscribed frames carry no inflight
   IF.items=f.inflight||[];IF.lastPush=Date.now();IF.dirty=true;
   scheduleRender();
 }
+
+// ---------- inflight subscription over the live ws ----------
+// Server pushes the inflight array only while at least one subscriber
+// asks for it — the modal sends sub/unsub so the feed can skip the
+// per-second snapshot when nobody is looking.
+let IF_OBS=null;
+function ifSubscribe(){
+  const ws=LIVE.ws;
+  if(ws&&ws.readyState===1)ws.send('{"sub":"inflight"}');
+}
+function ifUnsubscribe(){
+  const ws=LIVE.ws;
+  if(ws&&ws.readyState===1)ws.send('{"unsub":"inflight"}');
+}
+function bindInflightSub(){
+  if(IF_OBS)return;
+  const modal=$('#if-modal');
+  if(!modal)return;
+  IF_OBS=new MutationObserver(()=>{
+    if(!modal.classList.contains('on'))ifUnsubscribe();
+  });
+  IF_OBS.observe(modal,{attributes:true,attributeFilter:['class']});
+}
+bindInflightSub();

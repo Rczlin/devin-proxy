@@ -78,7 +78,7 @@ class LiveFeed:
         self._subs.discard(q)
 
 
-def _live_frame(ctx):
+def _live_frame(ctx, include_inflight=True):
     pool = ctx.app.state.pool
     accs = pool.accounts()
     now = time.time()
@@ -93,10 +93,12 @@ def _live_frame(ctx):
         "cooldown_s": max(0, round(a.cooldown_until - now)),
         "fails": a.consecutive_fails,
     } for a in accs]
-    fl = getattr(ctx.app.state, "inflight", None)
-    inflight = fl.snapshot() if fl is not None else []
-    return {"type": "live", "ts": now, "uptime_s": now - ctx.started,
-            "data_v": store._data_version, "pool": p, "inflight": inflight}
+    f = {"type": "live", "ts": now, "uptime_s": now - ctx.started,
+         "data_v": store._data_version, "pool": p}
+    if include_inflight:
+        fl = getattr(ctx.app.state, "inflight", None)
+        f["inflight"] = fl.snapshot() if fl is not None else []
+    return f
 
 
 def register(router, ctx, admin_key):
@@ -185,8 +187,14 @@ def register(router, ctx, admin_key):
                 pass
         q = feed.subscribe()
         stopped = asyncio.Event()
+        # inflight payload is opt-in: the in-flight modal sends
+        # {"sub":"inflight"} on open and {"unsub":"inflight"} on close.
+        # Without it the per-second snapshot would fire a push on every
+        # elapsed_s tick even when nobody is watching.
+        want_inflight = False
 
         async def _drain():
+            nonlocal want_inflight
             try:
                 while True:
                     m = await ws.receive()
@@ -195,6 +203,22 @@ def register(router, ctx, admin_key):
                     data = m.get("text") or m.get("bytes") or ""
                     if len(data) > _MAX_MSG:
                         break
+                    # push-only channel — the only inbound frames we act on
+                    # are subscription declarations; anything else drains.
+                    if isinstance(data, bytes):
+                        try:
+                            data = data.decode()
+                        except Exception:
+                            continue
+                    try:
+                        d = json.loads(data)
+                    except Exception:
+                        continue
+                    if d.get("sub") == "inflight":
+                        want_inflight = True
+                        q.put_nowait(None)      # push a fresh frame now
+                    elif d.get("unsub") == "inflight":
+                        want_inflight = False
             except Exception:
                 pass
             stopped.set()
@@ -207,10 +231,11 @@ def register(router, ctx, admin_key):
                 if deadline and time.time() >= deadline:
                     await ws.close(code=4401)
                     break
-                f = _live_frame(ctx)
-                key = json.dumps({"p": f["pool"], "v": f["data_v"],
-                                  "f": f["inflight"]},
-                                 ensure_ascii=False)
+                f = _live_frame(ctx, include_inflight=want_inflight)
+                kd = {"p": f["pool"], "v": f["data_v"]}
+                if want_inflight:
+                    kd["f"] = f["inflight"]
+                key = json.dumps(kd, ensure_ascii=False)
                 if key != last_key or time.time() - last_sent > _HEARTBEAT_S:
                     await ws.send_text(json.dumps(f, ensure_ascii=False))
                     last_key, last_sent = key, time.time()

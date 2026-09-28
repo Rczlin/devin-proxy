@@ -219,7 +219,11 @@ async function connectLive(){
   LIVE.connecting=false;
   const ws=new WebSocket(url);
   LIVE.ws=ws;
-  ws.onopen=()=>{LIVE.retry=0;LIVE.authRetry=false;liveDot(true)};
+  ws.onopen=()=>{LIVE.retry=0;LIVE.authRetry=false;liveDot(true);
+    // re-declare the inflight subscription after a reconnect — the
+    // server treats it as per-connection state.
+    if($('#if-modal').classList.contains('on'))ws.send('{"sub":"inflight"}');
+  };
   ws.onmessage=ev=>{
     let m;try{m=JSON.parse(ev.data)}catch(e){return}
     if(m.type!=='live')return;
