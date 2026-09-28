@@ -203,6 +203,7 @@ class InflightTracker:
                 "stall_s": round(now - e["last_ev_at"], 1)
                           if e["last_ev_at"] and not is_done else None,
                 "last_ev": e["last_ev"], "tail": e["tail"][-300:],
+                "done_at": e.get("done_at"),
             })
         out.sort(key=lambda r: r["t0"])
         return out
