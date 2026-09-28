@@ -176,7 +176,7 @@ class InflightTracker:
             else:
                 ratio = self._est_ratio(e["tail"])
                 out_tok = round(out_chars / ratio)
-            gen_s = (now - ev1) if ev1 else None
+            gen_s = ((e.get("done_at") or now) - ev1) if ev1 else None
             tps = round(out_tok / gen_s, 1) \
                 if out_tok and gen_s and gen_s > 0.05 else None
             phase = e["phase"]
