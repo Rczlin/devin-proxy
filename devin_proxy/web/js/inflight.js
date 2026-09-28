@@ -24,6 +24,19 @@ function openInflight(){
     if(!IF.items.length){IF.items=d.items||[];IF.dirty=true;scheduleRender()}
   }).catch(()=>{});
 }
+const IF_EV_LABEL={
+  text:'文本',think:'思考',tool_call:'工具调用',
+  'stop:0':'正常结束','stop:1':'长度截断','stop:2':'内容过滤',
+  'stop:3':'异常终止','stop:4':'上游断开',
+};
+const ifEvLabel=s=>{
+  if(!s)return '-';
+  if(IF_EV_LABEL[s])return IF_EV_LABEL[s];
+  if(s.startsWith('stop:'))return 'stop:'+s.slice(5);
+  if(s.startsWith('err:'))return '⚠ '+s.slice(4);
+  return s;
+};
+
 function ifElapsed(r){
   // done: use the frozen elapsed from the server
   if(r.phase==='done')return r.elapsed_s;
@@ -106,7 +119,7 @@ function renderIfDetail(r){
     ['正文/思考字符',`${fmt(r.text_chars)} / ${fmt(r.think_chars)}`],
     ['上游帧数',r.chunks],['工具调用',r.tool_calls],['尝试次数',r.attempt],
     ['实时 TPS',r.tps==null?'-':r.tps+' tok/s'],
-    ['距上帧',r.stall_s==null?'-':r.stall_s+'s'],['最近事件',esc(r.last_ev||'-')]]
+    ['距上帧',r.stall_s==null?'-':r.stall_s+'s'],['最近事件',esc(ifEvLabel(r.last_ev))]]
     .map(([k,v])=>`<div class=k>${k}</div><div>${v}</div>`).join('');
   $('#if-detail').innerHTML=
     `<div class="ifdetail"><div class="ifkv">${kv}</div>`+

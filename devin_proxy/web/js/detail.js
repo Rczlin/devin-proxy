@@ -32,7 +32,9 @@ const EV_LABEL={request:['请求进入',''],parse_error:['解析失败','err'],m
   built:['上游请求',''],attempt:['尝试',''],msg:['上游消息',''],upstream_err:['上游错误','err'],
   exception:['连接异常','err'],proxy_exception:['代理异常','err'],build_error:['构建失败','err'],
   failover:['切换账号','warn'],end:['流结束',''],finish:['完成',''],failed:['最终失败','err'],
-  downstream_error:['下游报错','err'],log_cap:['日志截断','warn']};
+  downstream_error:['下游报错','err'],log_cap:['日志截断','warn'],
+  mcp_retry:['MCP重试','warn'],retry_limited:['重试受限','warn'],
+  retry_after:['等待重试','warn'],client_aborted:['客户端断开','warn']};
 function evSummary(e){
   const d={...e};delete d.i;delete d.t;delete d.ms;
   if(e.t==='msg'){
