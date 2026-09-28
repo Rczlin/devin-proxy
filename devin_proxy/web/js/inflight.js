@@ -109,7 +109,7 @@ function renderInflight(){
   if(!items.length){
     if(!list._empty){list.innerHTML='<div class="muted" style="padding:18px;text-align:center">当前没有在途请求</div>';list._empty=true;list._rows={}}
   }else{
-    list._empty=false;
+    if(list._empty){list.innerHTML='';list._empty=false}
     list._rows=list._rows||{};
     const seen=new Set();
     // Walk items in order; for each, ensure its node sits at DOM index i.
@@ -155,6 +155,9 @@ function scheduleRender(){
 function ifSel(id){
   IF.sel=IF.sel===id?null:id;
   $('#if-detail').style.display=IF.sel==null?'none':'block';
+  // tail preview is a separate subscription — only pay for it while a
+  // detail row is actually expanded.
+  if(IF.sel!=null)ifTailSubscribe();else ifTailUnsubscribe();
   scheduleRender();
 }
 function renderIfDetail(r){
@@ -173,10 +176,12 @@ function renderIfDetail(r){
     ['距上帧',r.stall_s==null?'-':r.stall_s+'s'],['最近事件',esc(ifEvLabel(r.last_ev))]]
     .map(([k,v])=>`<div class=k>${k}</div><div>${v}</div>`).join('');
   const el=$('#if-detail');
+  const tailHtml=r.tail
+    ?`<div class="iftail-wrap"><div class="muted" style="margin-bottom:4px">输出预览（末尾 ${r.tail.length} 字符）</div><pre class="iftail">${esc(r.tail)}</pre></div>`
+    :'';
   const html=
     `<div class="ifdetail"><div class="ifkv">${kv}</div>`+
-    (r.tail?`<div class="iftail-wrap"><div class="muted" style="margin-bottom:4px">输出预览（末尾 ${r.tail.length} 字符）</div><pre class="iftail">${esc(r.tail)}</pre></div>`:'')+
-    `</div>`;
+    tailHtml+`</div>`;
   // keep the expanded detail stable: only rewrite when content changed,
   // so text doesn't flicker / lose selection every refresh tick.
   const tail=el.querySelector('.iftail');
@@ -207,12 +212,23 @@ function ifUnsubscribe(){
   const ws=LIVE.ws;
   if(ws&&ws.readyState===1)ws.send('{"unsub":"inflight"}');
 }
+function ifTailSubscribe(){
+  const ws=LIVE.ws;
+  if(ws&&ws.readyState===1)ws.send('{"sub":"inflight:tail"}');
+}
+function ifTailUnsubscribe(){
+  const ws=LIVE.ws;
+  if(ws&&ws.readyState===1)ws.send('{"unsub":"inflight:tail"}');
+}
 function bindInflightSub(){
   if(IF_OBS)return;
   const modal=$('#if-modal');
   if(!modal)return;
   IF_OBS=new MutationObserver(()=>{
-    if(!modal.classList.contains('on'))ifUnsubscribe();
+    if(!modal.classList.contains('on')){
+      ifUnsubscribe();
+      if(IF.sel!=null){IF.sel=null;ifTailUnsubscribe()}
+    }
   });
   IF_OBS.observe(modal,{attributes:true,attributeFilter:['class']});
 }

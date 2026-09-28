@@ -168,8 +168,10 @@ class InflightTracker:
 
     _DONE_TTL_S = 30        # finished requests linger this long
 
-    def snapshot(self):
-        """-> list of live request dicts, derived metrics computed."""
+    def snapshot(self, include_tail=True):
+        """-> list of live request dicts, derived metrics computed.
+        include_tail=False strips the output-preview `tail` field —
+        used when the subscriber only wants the list view."""
         now = time.time()
         with self._lock:
             # purge done entries past TTL
@@ -226,7 +228,7 @@ class InflightTracker:
                 "tool_calls": e["tool_calls"], "tps": tps,
                 "stall_s": round(now - e["last_ev_at"], 1)
                           if e["last_ev_at"] and not is_done else None,
-                "last_ev": e["last_ev"], "tail": e["tail"][-300:],
+                "last_ev": e["last_ev"], "tail": e["tail"][-300:] if include_tail else None,
                 "done_at": e.get("done_at"),
             })
         out.sort(key=lambda r: r["t0"])

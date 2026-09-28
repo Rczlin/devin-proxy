@@ -78,7 +78,7 @@ class LiveFeed:
         self._subs.discard(q)
 
 
-def _live_frame(ctx, include_inflight=True):
+def _live_frame(ctx, include_inflight=True, include_tail=True):
     pool = ctx.app.state.pool
     accs = pool.accounts()
     now = time.time()
@@ -97,7 +97,8 @@ def _live_frame(ctx, include_inflight=True):
          "data_v": store._data_version, "pool": p}
     if include_inflight:
         fl = getattr(ctx.app.state, "inflight", None)
-        f["inflight"] = fl.snapshot() if fl is not None else []
+        f["inflight"] = fl.snapshot(include_tail=include_tail) \
+            if fl is not None else []
     return f
 
 
@@ -191,10 +192,13 @@ def register(router, ctx, admin_key):
         # {"sub":"inflight"} on open and {"unsub":"inflight"} on close.
         # Without it the per-second snapshot would fire a push on every
         # elapsed_s tick even when nobody is watching.
+        # "inflight:tail" is a further opt-in for the output-preview tail
+        # — only needed while a detail row is expanded.
         want_inflight = False
+        want_tail = False
 
         async def _drain():
-            nonlocal want_inflight
+            nonlocal want_inflight, want_tail
             try:
                 while True:
                     m = await ws.receive()
@@ -214,11 +218,19 @@ def register(router, ctx, admin_key):
                         d = json.loads(data)
                     except Exception:
                         continue
-                    if d.get("sub") == "inflight":
+                    sub = d.get("sub")
+                    unsub = d.get("unsub")
+                    if sub == "inflight":
                         want_inflight = True
                         q.put_nowait(None)      # push a fresh frame now
-                    elif d.get("unsub") == "inflight":
+                    elif unsub == "inflight":
                         want_inflight = False
+                        want_tail = False       # tail dies with the modal
+                    elif sub == "inflight:tail":
+                        want_tail = True
+                        q.put_nowait(None)
+                    elif unsub == "inflight:tail":
+                        want_tail = False
             except Exception:
                 pass
             stopped.set()
@@ -231,7 +243,8 @@ def register(router, ctx, admin_key):
                 if deadline and time.time() >= deadline:
                     await ws.close(code=4401)
                     break
-                f = _live_frame(ctx, include_inflight=want_inflight)
+                f = _live_frame(ctx, include_inflight=want_inflight,
+                                include_tail=want_tail)
                 kd = {"p": f["pool"], "v": f["data_v"]}
                 if want_inflight:
                     kd["f"] = f["inflight"]
