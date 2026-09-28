@@ -21,7 +21,7 @@ function openInflight(){
   // REST fallback — if the ws feed is dead we still show a snapshot,
   // otherwise the next live frame repaints over it instantly.
   api('/admin/api/inflight').then(r=>r.json()).then(d=>{
-    if(!IF.items.length){IF.items=d.items||[];IF.dirty=true;scheduleRender()}
+    if(!IF.items.length){IF.items=d.items||[];IF.lastPush=Date.now();IF.dirty=true;scheduleRender()}
   }).catch(()=>{});
 }
 const IF_EV_LABEL={
@@ -40,8 +40,10 @@ const ifEvLabel=s=>{
 function ifElapsed(r){
   // done: use the frozen elapsed from the server
   if(r.phase==='done')return r.elapsed_s;
-  // live: compute client-side so it ticks smoothly between pushes
-  return Date.now()/1000-r.t0;
+  // live: anchor to last server-computed elapsed_s, add client-side
+  // delta since that push — avoids Date.now() vs server-clock skew
+  const pushAge=(Date.now()-IF.lastPush)/1000;
+  return r.elapsed_s+pushAge;
 }
 function ifRow(r){
   const [lb,cl]=IF_PHASE[r.phase]||[r.phase,''];
