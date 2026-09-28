@@ -84,6 +84,7 @@ class InflightTracker:
                 "phase": "connecting",      # connecting|streaming|finishing
                 "attempt": 0, "chunks": 0,
                 "text_chars": 0, "think_chars": 0, "tool_calls": 0,
+                "tool_chars": 0, "tool_agg": ToolAgg(),
                 "out_tokens": None, "in_tokens": None,
                 "first_ev_at": None, "last_ev_at": None, "last_ev": None,
                 "tail": "",
@@ -123,10 +124,28 @@ class InflightTracker:
                 e["last_ev"] = "text"
             if ev.delta_thinking:
                 e["think_chars"] += len(ev.delta_thinking)
+                e["tail"] = (e["tail"] + ev.delta_thinking)[-400:]
                 e["last_ev"] = "think"
             if len(ev.delta_tool_calls):
                 e["tool_calls"] += len(ev.delta_tool_calls)
                 e["last_ev"] = "tool_call"
+                # arguments arrive as a cumulative snapshot per call id;
+                # ToolAgg.feed returns only the newly-appended slice (delta),
+                # so count/add that — never len(arguments) outright, or
+                # cumulative frames would multiply the same text.
+                agg = e["tool_agg"]
+                for tcall in ev.delta_tool_calls:
+                    fed = agg.feed(tcall)
+                    if not fed:
+                        continue
+                    _idx, call, new_name, delta = fed
+                    if new_name and call["name"]:
+                        e["tool_chars"] += len(call["name"])
+                        e["tail"] = (e["tail"] + "\n🔧 "
+                                     + call["name"] + " ")[-400:]
+                    if delta:
+                        e["tool_chars"] += len(delta)
+                        e["tail"] = (e["tail"] + delta)[-400:]
             if ev.stop_reason:
                 e["last_ev"] = "stop:" + str(int(ev.stop_reason))
             if len(ev.usage):
@@ -160,13 +179,17 @@ class InflightTracker:
                        and now - e["done_at"] > self._DONE_TTL_S]
             for rid in expired:
                 self._reqs.pop(rid, None)
-            entries = [dict(e) for e in self._reqs.values()]
+            # copy minus the ToolAgg handle — it's aggregation state, not
+            # payload, and isn't JSON-serializable for the ws frame
+            entries = [{k: v for k, v in e.items() if k != "tool_agg"}
+                       for e in self._reqs.values()]
         out = []
         for e in entries:
             t0 = e["t0"]
             ev1 = e["first_ev_at"]
             is_done = e.get("phase") == "done"
-            out_chars = e["text_chars"] + e["think_chars"]
+            out_chars = (e["text_chars"] + e["think_chars"]
+                         + e.get("tool_chars", 0))
             # real token count wins once upstream reports usage; calibrated
             # estimate before that — ~1.5 chars/tok for CJK-heavy traffic,
             # ~4 for pure English. Blend: use chars/4 as floor, chars/1.5
@@ -199,6 +222,7 @@ class InflightTracker:
                 "out_tokens": out_tok, "out_tokens_est": e["out_tokens"] is None,
                 "in_tokens": e["in_tokens"],
                 "text_chars": e["text_chars"], "think_chars": e["think_chars"],
+                "tool_chars": e.get("tool_chars", 0),
                 "tool_calls": e["tool_calls"], "tps": tps,
                 "stall_s": round(now - e["last_ev_at"], 1)
                           if e["last_ev_at"] and not is_done else None,

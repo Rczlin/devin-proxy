@@ -11,7 +11,19 @@ const IF_PHASE={
 };
 const ifAge=s=>s==null?'-':s<60?s.toFixed(1)+'s':s<3600?Math.floor(s/60)+'m'+(s%60).toFixed(1)+'s':(s/3600).toFixed(1)+'h';
 
+// one delegated click handler on the list — survives DOM updates and
+// doesn't depend on inline onclick surviving a re-render.
+let IF_DELEGATE=false;
+function bindInflightOnce(){
+  if(IF_DELEGATE)return;
+  IF_DELEGATE=true;
+  $('#if-list').addEventListener('click',e=>{
+    const row=e.target.closest('.ifrow');
+    if(row)ifSel(+row.dataset.id);
+  });
+}
 function openInflight(){
+  bindInflightOnce();
   $('#if-modal').classList.add('on');
   IF.sel=null;
   renderInflight();
@@ -45,7 +57,10 @@ function ifElapsed(r){
   const pushAge=(Date.now()-IF.lastPush)/1000;
   return r.elapsed_s+pushAge;
 }
-function ifRow(r){
+// Build/update one row's inner content (everything except the row root's
+// own data-id / click wiring, which are stable per id). Reused by both the
+// keyed update path and the initial build.
+function ifRowHTML(r){
   const [lb,cl]=IF_PHASE[r.phase]||[r.phase,''];
   const tok=r.out_tokens==null?'-':fmt(r.out_tokens)+(r.out_tokens_est?'~':'');
   const sub=[
@@ -61,15 +76,21 @@ function ifRow(r){
     ['TPS',r.tps==null?'-':r.tps],
     ['停顿',r.stall_s==null?'-':r.stall_s+'s'],
   ].map(([k,v])=>`<span class="ifst"><i>${k}</i>${v}</span>`).join('');
-  return `<div class="ifrow${IF.sel===r.id?' on':''}${r.phase==='done'?' done':''}" onclick="ifSel(${r.id})">
-    <div class="ifmain">
+  return `<div class="ifmain">
       <span class="tag ${cl}">${lb}</span>
       <span class="ifsub">${sub}</span>
       ${r.tool_calls?`<span class="tag model">🔧${r.tool_calls}</span>`:''}
       ${r.attempt>1?`<span class="tag warn">试${r.attempt}</span>`:''}
     </div>
-    <div class="ifstats">${stats}<span class="muted">#${r.id} · ${r.chunks}帧</span></div>
-  </div>`;
+    <div class="ifstats">${stats}<span class="muted">#${r.id} · ${r.chunks}帧</span></div>`;
+}
+// apply one item's state to an existing row node: refresh inner HTML only
+// when it actually changed, then sync the state classes on the root.
+function patchIfRow(node,r){
+  const html=ifRowHTML(r);
+  if(node._h!==html){node.innerHTML=html;node._h=html}
+  node.classList.toggle('on',IF.sel===r.id);
+  node.classList.toggle('done',r.phase==='done');
 }
 function renderInflight(){
   const items=IF.items;
@@ -82,9 +103,35 @@ function renderInflight(){
   // auto-scroll: if the user is near the bottom, keep them pinned there
   // as new rows arrive; if they scrolled up, leave them alone.
   const wasNearBottom=scroller.scrollTop+scroller.clientHeight>=scroller.scrollHeight-50;
-  $('#if-list').innerHTML=items.length
-    ? items.map(ifRow).join('')
-    : '<div class="muted" style="padding:18px;text-align:center">当前没有在途请求</div>';
+  const list=$('#if-list');
+  if(!items.length){
+    if(!list._empty){list.innerHTML='<div class="muted" style="padding:18px;text-align:center">当前没有在途请求</div>';list._empty=true;list._rows={}}
+  }else{
+    list._empty=false;
+    list._rows=list._rows||{};
+    const seen=new Set();
+    // Walk items in order; for each, ensure its node sits at DOM index i.
+    // Existing nodes are moved (not recreated), new ids get a fresh node —
+    // so a live row keeps its DOM element, its click target, and any
+    // in-progress text selection while its numbers update.
+    items.forEach((r,i)=>{
+      seen.add(r.id);
+      let node=list._rows[r.id];
+      if(!node){
+        node=document.createElement('div');
+        node.className='ifrow';node.dataset.id=r.id;node._h=null;
+        list._rows[r.id]=node;
+      }
+      patchIfRow(node,r);
+      // node should be the i-th child; insertBefore moves it there (a
+      // no-op move when it's already correctly positioned is avoided).
+      if(list.children[i]!==node)list.insertBefore(node,list.children[i]||null);
+    });
+    // drop rows that disappeared from the feed
+    for(const id in list._rows){
+      if(!seen.has(+id)){list._rows[id].remove();delete list._rows[id]}
+    }
+  }
   if(wasNearBottom)scroller.scrollTop=scroller.scrollHeight;
   if(IF.sel!=null){
     const r=items.find(x=>x.id===IF.sel);
@@ -123,10 +170,20 @@ function renderIfDetail(r){
     ['实时 TPS',r.tps==null?'-':r.tps+' tok/s'],
     ['距上帧',r.stall_s==null?'-':r.stall_s+'s'],['最近事件',esc(ifEvLabel(r.last_ev))]]
     .map(([k,v])=>`<div class=k>${k}</div><div>${v}</div>`).join('');
-  $('#if-detail').innerHTML=
+  const el=$('#if-detail');
+  const html=
     `<div class="ifdetail"><div class="ifkv">${kv}</div>`+
     (r.tail?`<div class="iftail-wrap"><div class="muted" style="margin-bottom:4px">输出预览（末尾 ${r.tail.length} 字符）</div><pre class="iftail">${esc(r.tail)}</pre></div>`:'')+
     `</div>`;
+  // keep the expanded detail stable: only rewrite when content changed,
+  // so text doesn't flicker / lose selection every refresh tick.
+  const tail=el.querySelector('.iftail');
+  const tailAtBottom=tail&&(tail.scrollTop+tail.clientHeight>=tail.scrollHeight-8);
+  if(el._h!==html){
+    el.innerHTML=html;el._h=html;
+    const nt=el.querySelector('.iftail');
+    if(nt&&tailAtBottom)nt.scrollTop=nt.scrollHeight;
+  }
 }
 // hooked by applyLive() in dash.js — refreshes the modal when open
 function applyLiveInflight(f){
